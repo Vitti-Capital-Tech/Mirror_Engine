@@ -1,0 +1,60 @@
+'use client';
+import React, { useState, useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { useAlerts, useClearAlerts } from '@/hooks/useAlerts';
+import { useSocket } from '@/hooks/useSocket';
+import { AlertsFeed } from '@/components/alerts/AlertsFeed';
+import { Trash2 } from 'lucide-react';
+
+export default function AlertsPage() {
+  const queryClient = useQueryClient();
+  const [level, setLevel] = useState<string>('');
+  
+  const { data: alerts = [], isLoading } = useAlerts({ level: level || undefined });
+  const clearAlerts = useClearAlerts();
+  const { latestAlert } = useSocket();
+
+  // WS alert event refresh
+  useEffect(() => {
+    if (latestAlert) {
+      queryClient.invalidateQueries({ queryKey: ['alerts'] });
+    }
+  }, [latestAlert, queryClient]);
+
+  const resolvedAlerts = alerts.filter(a => a.is_resolved);
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-bg-border/50 pb-4 select-none">
+        <div className="flex items-center gap-4">
+          <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">System Alert Feed</h2>
+          <select
+            value={level}
+            onChange={(e) => setLevel(e.target.value)}
+            className="bg-bg-panel border border-bg-border rounded-lg px-2.5 py-1 text-xs text-text-primary outline-none focus:border-blue-500 cursor-pointer"
+          >
+            <option value="">All Levels</option>
+            <option value="info">Info</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+            <option value="critical">Critical</option>
+          </select>
+        </div>
+
+        {resolvedAlerts.length > 0 && (
+          <button
+            onClick={() => clearAlerts.mutate()}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs font-semibold rounded-lg transition-all"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            Clear Resolved ({resolvedAlerts.length})
+          </button>
+        )}
+      </div>
+
+      {/* Alerts Feed */}
+      <AlertsFeed alerts={alerts} isLoading={isLoading} />
+    </div>
+  );
+}

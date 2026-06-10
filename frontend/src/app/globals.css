@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Light Mode Variables */
+  --bg-primary: #f8fafc;
+  --bg-secondary: #f1f5f9;
+  --bg-panel: #ffffff;
+  --bg-border: #e2e8f0;
+  
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+}
+
+.dark {
+  /* Dark Mode Variables (Default) */
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #111118;
+  --bg-panel: #16161f;
+  --bg-border: #1e1e2e;
+  
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #475569;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Custom premium scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track { 
+  background: var(--bg-secondary); 
+}
+::-webkit-scrollbar-thumb { 
+  background: var(--bg-border); 
+  border-radius: 3px; 
+}
+::-webkit-scrollbar-thumb:hover { 
+  background: #3b82f6; 
+}
+
+/* Neon glow classes */
+.glow-blue { 
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.15); 
+}
+.glow-green { 
+  box-shadow: 0 0 20px rgba(16, 185, 129, 0.15); 
+}
+.glow-red { 
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.15); 
+}
+.glow-yellow { 
+  box-shadow: 0 0 20px rgba(245, 158, 11, 0.15); 
+}
+.glow-purple { 
+  box-shadow: 0 0 20px rgba(139, 92, 246, 0.15); 
+}
