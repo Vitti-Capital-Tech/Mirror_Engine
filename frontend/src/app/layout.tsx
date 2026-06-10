@@ -3,6 +3,7 @@ import { Inter } from 'next/font/google';
 import './globals.css';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { TopBar } from '@/components/layout/TopBar';
+import { LogsConsole } from '@/components/layout/LogsConsole';
 import Providers from './providers';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -43,6 +44,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <main className="flex-1 overflow-auto p-6 bg-bg-primary">
                 {children}
               </main>
+              <LogsConsole />
             </div>
           </div>
         </Providers>
