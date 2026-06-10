@@ -4,7 +4,7 @@ An institutional-grade, low-latency copy trading platform designed for Delta Exc
 
 The platform monitors trade executions on a primary Master account and replicates them concurrently across multiple Follower accounts in real-time. It handles order scaling, margin validation, position tracking, and slippage controls to ensure institutional reliability.
 
-For deep technical insights, review the High-Level Design at [docs/hld.md](file:///d:/Work/Projects/trades_copy/docs/hld.md) and Low-Level Design specifications at [docs/lld.md](file:///d:/Work/Projects/trades_copy/docs/lld.md).
+For deep technical insights, review the High-Level Design at [docs/hld.md](docs/hld.md) and Low-Level Design specifications at [docs/lld.md](docs/lld.md).
 
 ---
 
@@ -46,25 +46,25 @@ Mirror Engine acts as an automated bridge:
 Below is the directory map linking to the core files that make up the copy trading engine:
 
 ### Infrastructure & Configuration
-* [LICENSE](file:///d:/Work/Projects/trades_copy/LICENSE): Software copyright and proprietary terms.
-* [.gitignore](file:///d:/Work/Projects/trades_copy/.gitignore): Repository file ignore rules.
-* [docker-compose.yml](file:///d:/Work/Projects/trades_copy/docker-compose.yml): Multi-container services configuration.
+* [LICENSE](LICENSE): Software copyright and proprietary terms.
+* [.gitignore](.gitignore): Repository file ignore rules.
+* [docker-compose.yml](docker-compose.yml): Multi-container services configuration.
 
 ### Backend Core Services
-* [database/supabase_schema.sql](file:///d:/Work/Projects/trades_copy/backend/database/supabase_schema.sql): PostgreSQL tables schema for accounts, copies, and audits.
-* [core/trade_listener.py](file:///d:/Work/Projects/trades_copy/backend/app/core/trade_listener.py): Real-time handler listening to the master account WebSocket.
-* [core/copy_engine.py](file:///d:/Work/Projects/trades_copy/backend/app/core/copy_engine.py): Broker loop processing trade events off Redis queue.
-* [core/risk_engine.py](file:///d:/Work/Projects/trades_copy/backend/app/core/risk_engine.py): Account check limits and size calculations.
-* [core/order_executor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/order_executor.py): Asynchronous multi-account execution engine and circuit breaker.
-* [core/position_monitor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/position_monitor.py): Periodic auditor checking size drift.
-* [core/slippage_tracker.py](file:///d:/Work/Projects/trades_copy/backend/app/core/slippage_tracker.py): Accuracy calculator flagging price differences.
-* [services/delta_client.py](file:///d:/Work/Projects/trades_copy/backend/app/services/delta_client.py): Delta Exchange REST API client with signed HMAC authentication.
+* [backend/database/supabase_schema.sql](backend/database/supabase_schema.sql): PostgreSQL tables schema for accounts, copies, and audits.
+* [backend/app/core/trade_listener.py](backend/app/core/trade_listener.py): Real-time handler listening to the master account WebSocket.
+* [backend/app/core/copy_engine.py](backend/app/core/copy_engine.py): Broker loop processing trade events off Redis queue.
+* [backend/app/core/risk_engine.py](backend/app/core/risk_engine.py): Account check limits and size calculations.
+* [backend/app/core/order_executor.py](backend/app/core/order_executor.py): Asynchronous multi-account execution engine and circuit breaker.
+* [backend/app/core/position_monitor.py](backend/app/core/position_monitor.py): Periodic auditor checking size drift.
+* [backend/app/core/slippage_tracker.py](backend/app/core/slippage_tracker.py): Accuracy calculator flagging price differences.
+* [backend/app/services/delta_client.py](backend/app/services/delta_client.py): Delta Exchange REST API client with signed HMAC authentication.
 
 ### Frontend Dashboard Components
-* [src/app/layout.tsx](file:///d:/Work/Projects/trades_copy/frontend/src/app/layout.tsx): Root layout with custom theme styles.
-* [src/app/page.tsx](file:///d:/Work/Projects/trades_copy/frontend/src/app/page.tsx): Main dashboard control panel and chart grids.
-* [src/app/accounts/page.tsx](file:///d:/Work/Projects/trades_copy/frontend/src/app/accounts/page.tsx): Account addition and monitoring table page.
-* [src/components/layout/TopBar.tsx](file:///d:/Work/Projects/trades_copy/frontend/src/components/layout/TopBar.tsx): Top header bar showing live WebSocket status and theme toggle controls.
+* [frontend/src/app/layout.tsx](frontend/src/app/layout.tsx): Root layout with custom theme styles.
+* [frontend/src/app/page.tsx](frontend/src/app/page.tsx): Main dashboard control panel and chart grids.
+* [frontend/src/app/accounts/page.tsx](frontend/src/app/accounts/page.tsx): Account addition and monitoring table page.
+* [frontend/src/components/layout/TopBar.tsx](frontend/src/components/layout/TopBar.tsx): Top header bar showing live WebSocket status and theme toggle controls.
 
 ---
 
