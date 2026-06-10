@@ -17,8 +17,10 @@ export function Sidebar() {
   return (
     <aside className="w-64 bg-bg-secondary border-r border-bg-border flex flex-col h-full select-none">
       {/* Top logo */}
-      <div className="p-6 border-b border-bg-border flex items-center">
-        <span className="font-bold text-lg bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent tracking-wide">
+      {/* Top logo */}
+      <div className="p-5 border-b border-bg-border flex items-center gap-3">
+        <img src="/logo.jpg" alt="Mirror Engine Logo" className="w-8 h-8 rounded-lg object-cover border border-bg-border" />
+        <span className="font-bold text-base bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent tracking-wide">
           Mirror Engine
         </span>
       </div>

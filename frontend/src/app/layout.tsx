@@ -10,6 +10,9 @@ const inter = Inter({ subsets: ['latin'] });
 export const metadata: Metadata = {
   title: 'Mirror Engine | Delta Exchange',
   description: 'Institutional copy trading platform for Delta Exchange India',
+  icons: {
+    icon: '/logo.jpg',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
