@@ -88,20 +88,65 @@ class OrderExecutor:
 
         for attempt in range(MAX_RETRIES + 1):
             try:
-                # Place market order (copying is market_order for lowest execution slippage)
-                order_response = await client.place_order(
+                # 1. Place limit order at master's entry price first
+                logger.info(f"Placing limit order for {account_name} on {symbol} at price {master_price} for size {order_size}")
+                limit_response = await client.place_order(
                     symbol=symbol,
                     side=side.lower(),
                     size=order_size,
-                    order_type='market_order'
+                    order_type='limit_order',
+                    limit_price=master_price
                 )
                 
-                # Check response. We expect result structure or id.
-                if order_response and (order_response.get("result") or order_response.get("id") or "product_symbol" in order_response):
-                    order_success = True
-                    break
+                order_id = limit_response.get("id") or limit_response.get("result", {}).get("id")
+                
+                if order_id:
+                    # Wait 100ms for limit order to fill
+                    await asyncio.sleep(0.10)
+                    
+                    # Fetch current order fill state
+                    order_status = await client.get_order(order_id)
+                    result_data = order_status.get("result", order_status)
+                    state = result_data.get("state")
+                    filled_size = int(result_data.get("filled_size", 0))
+                    
+                    if state == "filled":
+                        logger.info(f"Limit order {order_id} fully filled at {master_price}")
+                        order_success = True
+                        order_response = order_status
+                        break
+                    else:
+                        # Cancel partial limit order
+                        logger.warning(f"Limit order {order_id} is {state} (filled {filled_size}/{order_size}). Cancelling and sweeping remainder via market order.")
+                        try:
+                            await client.cancel_order(order_id)
+                        except Exception as ce:
+                            logger.warning(f"Limit cancel error (might have filled during cancel call): {ce}")
+                            
+                        # Confirm final filled size
+                        final_status = await client.get_order(order_id)
+                        final_result = final_status.get("result", final_status)
+                        final_filled = int(final_result.get("filled_size", 0))
+                        
+                        remaining_size = order_size - final_filled
+                        if remaining_size <= 0:
+                            logger.info(f"Limit order fully filled during cancellation.")
+                            order_success = True
+                            order_response = final_status
+                            break
+                        else:
+                            logger.info(f"Limit partially filled ({final_filled}/{order_size}). Punching market order for remainder {remaining_size}.")
+                            market_response = await client.place_order(
+                                symbol=symbol,
+                                side=side.lower(),
+                                size=remaining_size,
+                                order_type='market_order'
+                            )
+                            order_success = True
+                            order_response = market_response
+                            break
                 else:
-                    last_error = f"Invalid API response: {order_response}"
+                    last_error = f"Invalid API response on limit placement: {limit_response}"
             except Exception as e:
                 last_error = str(e)
                 logger.warning(f"Attempt {attempt + 1} failed for {account_name} on {symbol}: {last_error}")
