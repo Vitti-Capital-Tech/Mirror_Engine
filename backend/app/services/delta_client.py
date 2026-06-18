@@ -173,7 +173,7 @@ class DeltaClient:
         retry_delay = 5
         while self._running:
             try:
-                ws_endpoint = f"{self.ws_url}/live"
+                ws_endpoint = self.ws_url
                 logger.info("Connecting to Delta WS: %s", ws_endpoint)
 
                 async with websockets.connect(
@@ -231,7 +231,7 @@ class DeltaClient:
     async def _ws_authenticate(self, ws: websockets.WebSocketClientProtocol) -> None:
         """Send key-auth frame and wait for confirmation."""
         timestamp = str(int(time.time()))
-        sig_msg = "GET" + timestamp + "/live"
+        sig_msg = "GET" + timestamp + "/"
         sig = hmac.new(
             self.api_secret.encode(), sig_msg.encode(), hashlib.sha256
         ).hexdigest()

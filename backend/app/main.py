@@ -140,6 +140,5 @@ async def health():
     return {"status": "ok", "service": "delta-copy-trader"}
 
 # Wrap FastAPI with the Socket.IO ASGI application
-final_app = sio.handle_request  # wait, Socket.IO ASGIApp can wrap FastAPI directly:
 import socketio
-final_app = socketio.ASGIApp(sio, other_asgi_app=app)
+app = socketio.ASGIApp(sio, other_asgi_app=app)
