@@ -1,10 +1,12 @@
 'use client';
 import React, { useState } from 'react';
-import { useCreateAccount } from '@/hooks/useAccounts';
+import { useCreateAccount, useAccounts } from '@/hooks/useAccounts';
 import { X, Eye, EyeOff, ShieldCheck, RefreshCw } from 'lucide-react';
 
 export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount();
+  const { data: accounts = [] } = useAccounts();
+  const hasMaster = accounts.some((a: any) => a.is_master);
 
   // Form states
   const [name, setName] = useState('');
@@ -147,7 +149,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                 className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
               >
                 <option value="follower">Follower</option>
-                <option value="master">Master</option>
+                {!hasMaster && <option value="master">Master</option>}
               </select>
             </div>
 
