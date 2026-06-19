@@ -85,7 +85,7 @@ export function RecentTrades({ trades = [], isLoading }: { trades?: any[]; isLoa
                   .map((c: any) => Number(c.slippage_pct) * 100);
                 
                 const avgSlippage = slippages.length > 0
-                  ? slippages.reduce((sum, val) => sum + val, 0) / slippages.length
+                  ? slippages.reduce((sum: number, val: number) => sum + val, 0) / slippages.length
                   : 0.0;
 
                 const isBuy = trade.side?.toLowerCase() === 'buy';

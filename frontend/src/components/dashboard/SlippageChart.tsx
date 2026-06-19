@@ -23,7 +23,7 @@ export function SlippageChart({ trades = [] }: { trades?: any[] }) {
 
       const avgSlippage =
         validSlippages.length > 0
-          ? validSlippages.reduce((sum, val) => sum + val, 0) / validSlippages.length
+          ? validSlippages.reduce((sum: number, val: number) => sum + val, 0) / validSlippages.length
           : 0;
 
       const dateObj = new Date(t.created_at);
