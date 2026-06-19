@@ -11,8 +11,11 @@ RUN npm install --legacy-peer-deps
 # Copy application files
 COPY . .
 
+# Build the Next.js application for production
+RUN npm run build
+
 # Expose Next.js port
 EXPOSE 3000
 
-# Start Next.js development server
-CMD ["npm", "run", "dev"]
+# Start Next.js production server
+CMD ["npm", "run", "start"]
