@@ -38,6 +38,9 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://13.232.100.56:8000
+        - NEXT_PUBLIC_WS_URL=http://13.232.100.56:8000
     container_name: copytrade_frontend
     ports:
       - "3000:3000"
