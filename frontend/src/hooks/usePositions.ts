@@ -9,3 +9,7 @@ export function usePositions() {
 export function useSyncStatus() {
   return useQuery({ queryKey: ['positions-sync'], queryFn: api.positions.syncStatus, refetchInterval: 10000 });
 }
+
+export function useMasterOpenOrders() {
+  return useQuery({ queryKey: ['master-open-orders'], queryFn: api.positions.masterOpenOrders, refetchInterval: 10000 });
+}

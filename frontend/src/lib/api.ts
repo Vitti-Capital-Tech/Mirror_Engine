@@ -35,6 +35,8 @@ export const api = {
     list: () => fetchAPI<any[]>('/api/positions'),
     byAccount: (accountId: string) => fetchAPI<any[]>(`/api/positions/${accountId}`),
     syncStatus: () => fetchAPI<any>('/api/positions/sync-status'),
+    syncLive: () => fetchAPI<any>('/api/positions/sync-live', { method: 'POST' }),
+    masterOpenOrders: () => fetchAPI<any[]>('/api/positions/master/open-orders'),
   },
   alerts: {
     list: (params?: Record<string, any>) => {

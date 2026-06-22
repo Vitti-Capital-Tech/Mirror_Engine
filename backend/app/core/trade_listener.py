@@ -102,7 +102,14 @@ class TradeListener:
             logger.error(f"Error handling master order fill callback: {e}", exc_info=True)
 
     async def on_position_update(self, position_data: dict) -> None:
-        logger.debug(f"Master position update received: {position_data}")
+        logger.info(f"Master position update received: {position_data}")
+        if self.master_account:
+            from app.core.position_monitor import position_monitor
+            await position_monitor.on_position_update(
+                self.master_account["id"],
+                self.master_account["name"],
+                position_data
+            )
 
 
 trade_listener = TradeListener()
