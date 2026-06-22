@@ -81,12 +81,32 @@ class DeltaClient:
         return resp.json()
 
     async def get_positions(self) -> list:
-        """Fetch all open margined positions."""
-        path = "/v2/positions/margined"
-        headers = self._get_headers("GET", path)
-        resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("result", [])
+        """Fetch all open positions — both futures (margined) and options."""
+        all_positions = []
+
+        # 1. Futures / margined positions
+        try:
+            path = "/v2/positions/margined"
+            headers = self._get_headers("GET", path)
+            resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
+            if resp.status_code == 200:
+                all_positions.extend(resp.json().get("result", []))
+        except Exception as e:
+            logger.warning(f"Could not fetch margined positions: {e}")
+
+        # 2. Options positions
+        try:
+            path = "/v2/positions?product_types=put_options,call_options"
+            headers = self._get_headers("GET", path)
+            resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                opts = data.get("result", []) if isinstance(data, dict) else data
+                all_positions.extend(opts)
+        except Exception as e:
+            logger.warning(f"Could not fetch options positions: {e}")
+
+        return all_positions
 
     async def place_order(
         self,
