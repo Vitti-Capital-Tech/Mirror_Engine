@@ -19,6 +19,9 @@ RUN npm install --legacy-peer-deps
 # Copy application files
 COPY . .
 
+# Remove any local env files to force Next.js to use Docker build args
+RUN rm -f .env .env.local .env.production .env.development
+
 # Build the Next.js application for production
 RUN npm run build
 
