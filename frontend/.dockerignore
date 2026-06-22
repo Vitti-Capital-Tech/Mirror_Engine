@@ -1,0 +1,13 @@
+.next
+node_modules
+.env
+.env.local
+.env.production
+.env.development
+out
+build
+dist
+.cache
+.git
+.gitignore
+README.md
