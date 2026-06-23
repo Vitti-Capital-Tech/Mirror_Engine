@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     DELTA_ENV: str = "demo"  # 'demo' or 'live'
 
     # Delta Exchange Demo (Testnet) endpoints
-    DELTA_DEMO_REST_URL: str = "https://cdn-ind.testnet.deltaex.org"
+    DELTA_DEMO_REST_URL: str = "https://api-ind.testnet.deltaex.org"
     DELTA_DEMO_WS_URL: str = "wss://socket-ind.testnet.deltaex.org"
 
     # Delta Exchange Live (Production) endpoints
