@@ -59,13 +59,18 @@ class PositionMonitor:
             entry_price = float(position_data.get("entry_price") or 0.0)
             current_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
             
+            # Options contracts have a multiplier (e.g. 0.001 BTC per contract).
+            # Look for 'contract_value' in the API payload. If missing, check symbol format.
+            multiplier = float(position_data.get("contract_value") or (0.001 if ("-C-" in symbol or "-P-" in symbol or symbol.startswith("C-") or symbol.startswith("P-")) else 1.0))
+            
             # Calculate Unrealized PnL manually to ensure direction and options calculations are correct
-            # Long: (Current Price - Entry Price) * Quantity
-            # Short: (Entry Price - Current Price) * Quantity
+            # PnL = (Price Diff) * Quantity * Multiplier
             if side == "long":
-                unrealized_pnl = (current_price - entry_price) * raw_qty
+                unrealized_pnl = (current_price - entry_price) * raw_qty * multiplier
             else:
-                unrealized_pnl = (entry_price - current_price) * raw_qty
+                unrealized_pnl = (entry_price - current_price) * raw_qty * multiplier
+            
+            logger.info(f"Unrealized PnL manual calculation for {symbol}: qty={raw_qty}, multiplier={multiplier}, side={side}, pnl={unrealized_pnl:.4f}")
 
             realized_pnl = float(position_data.get("realized_pnl") or 0.0)
             
