@@ -54,7 +54,7 @@ class RiskEngine:
             return False, f"Invalid quantity: {quantity}"
 
         # 4. Margin check
-        leverage_limit: int = account.get("leverage_limit", 10) or 10
+        leverage_limit: int = account.get("leverage_limit", 50) or 50
         estimated_margin = (quantity * entry_price) / leverage_limit
         available_margin: float = account.get("available_margin") or _FALLBACK_MAX_MARGIN_USD
 
@@ -91,7 +91,7 @@ class RiskEngine:
         allocation_mode: str = account.get("allocation_mode") or "multiplier"
         allocation_value: float = account.get("allocation_value") or 1.0
         available_margin: float = account.get("available_margin") or 0.0
-        leverage_limit: int = account.get("leverage_limit", 10) or 10
+        leverage_limit: int = account.get("leverage_limit", 50) or 50
 
         if allocation_mode == "fixed":
             qty = allocation_value

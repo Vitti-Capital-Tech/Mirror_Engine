@@ -17,7 +17,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [allocationMode, setAllocationMode] = useState<'fixed' | 'multiplier' | 'capital_pct' | 'auto_ratio'>('auto_ratio');
   const [allocationValue, setAllocationValue] = useState<string>('1.0');
   const [maxPositionSize, setMaxPositionSize] = useState<string>('');
-  const [leverageLimit, setLeverageLimit] = useState<number>(10);
+  const [leverageLimit, setLeverageLimit] = useState<string>('');
 
   // UI States
   const [showKey, setShowKey] = useState(false);
@@ -39,8 +39,11 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
         api_secret: apiSecret,
         is_master: isMaster,
         environment,
-        leverage_limit: leverageLimit,
       };
+
+      if (leverageLimit) {
+        payload.leverage_limit = parseInt(leverageLimit);
+      }
 
       if (!isMaster) {
         payload.allocation_mode = allocationMode;
@@ -228,9 +231,9 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                     type="number"
                     min="1"
                     max="100"
-                    required
+                    placeholder="e.g. 10 (optional)"
                     value={leverageLimit}
-                    onChange={(e) => setLeverageLimit(parseInt(e.target.value) || 10)}
+                    onChange={(e) => setLeverageLimit(e.target.value)}
                     className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
                   />
                 </div>
