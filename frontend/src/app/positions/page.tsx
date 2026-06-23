@@ -51,8 +51,7 @@ export default function PositionsPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b border-bg-border/50 pb-4 gap-4 select-none">
         <div>
-          <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">Positions Mirror Audit</h2>
-          <p className="text-text-muted text-[10px] mt-0.5">Real-time status comparison between master and follower positions.</p>
+          {/* Header empty space left after removing old titles */}
         </div>
         
         {/* Actions & Sync Summary */}
@@ -93,13 +92,17 @@ export default function PositionsPage() {
 
       {/* Positions Table Section */}
       <div className="space-y-3">
-        <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-wider select-none">Open Positions</h3>
+        <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-wider select-none">
+          Open Positions ({positions.length})
+        </h3>
         <PositionsTable positions={positions} isLoading={isLoading} />
       </div>
 
       {/* Master Open Orders Section */}
       <div className="space-y-3">
-        <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-wider select-none">Master Account Open Orders</h3>
+        <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-wider select-none">
+          Master Account Open Orders ({masterOrders.length})
+        </h3>
         <MasterOpenOrdersTable orders={masterOrders} isLoading={masterOrdersLoading} />
       </div>
     </div>
