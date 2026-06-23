@@ -177,7 +177,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5 col-span-2 sm:col-span-1">
                   <label className="text-text-muted uppercase tracking-wider text-[9px]">Copy Mode</label>
                   <select
                     value={allocationMode}
@@ -192,13 +192,11 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                   >
                     <option value="auto_ratio">Auto Balance Ratio (Recommended)</option>
                     <option value="multiplier">Multiplier (x Size)</option>
-                    <option value="fixed">Fixed Contracts</option>
-                    <option value="capital_pct">Margin % of Balance</option>
                   </select>
                 </div>
 
                 {allocationMode !== 'auto_ratio' && (
-                  <div className="flex flex-col gap-1.5">
+                  <div className="flex flex-col gap-1.5 col-span-2 sm:col-span-1 animate-slide-in">
                     <label className="text-text-muted uppercase tracking-wider text-[9px]">Value</label>
                     <input
                       type="number"
@@ -211,32 +209,6 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                     />
                   </div>
                 )}
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-text-muted uppercase tracking-wider text-[9px]">Max Position Limit</label>
-                  <input
-                    type="number"
-                    placeholder="e.g. 50 (optional)"
-                    value={maxPositionSize}
-                    onChange={(e) => setMaxPositionSize(e.target.value)}
-                    className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
-                  />
-                </div>
-
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-text-muted uppercase tracking-wider text-[9px]">Leverage Limit</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="100"
-                    placeholder="e.g. 10 (optional)"
-                    value={leverageLimit}
-                    onChange={(e) => setLeverageLimit(e.target.value)}
-                    className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
-                  />
-                </div>
               </div>
             </div>
           )}
