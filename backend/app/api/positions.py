@@ -116,6 +116,30 @@ async def sync_live_positions():
                 environment=acc.get("environment", "demo")
             )
             try:
+                # 1. Fetch and update live wallet balance for the account
+                try:
+                    wallet = await client.get_wallet()
+                    # Parse balances: Delta API returns a list of balances per asset (e.g. USDT, BTC)
+                    # We will sum them or fetch the main margin asset (USDT).
+                    balances_list = wallet.get("result", wallet) if isinstance(wallet, dict) else wallet
+                    if isinstance(balances_list, list):
+                        # Find USDT or first available balance
+                        usdt_bal = next((b for b in balances_list if b.get("asset") == "USDT"), None)
+                        if not usdt_bal and len(balances_list) > 0:
+                            usdt_bal = balances_list[0]
+                        
+                        if usdt_bal:
+                            balance_val = float(usdt_bal.get("balance") or 0.0)
+                            avail_margin = float(usdt_bal.get("available_margin") or balance_val)
+                            # Update account table in Supabase
+                            db.table("accounts").update({
+                                "balance": balance_val,
+                                "available_margin": avail_margin
+                            }).eq("id", acc["id"]).execute()
+                            logger.info(f"Updated live balance for {acc['name']}: bal={balance_val}, margin={avail_margin}")
+                except Exception as bal_err:
+                    logger.warning(f"Failed to fetch wallet balance for {acc['name']}: {bal_err}")
+
                 live_positions = await client.get_positions()
                 
                 db_pos_res = db.table("positions").select("symbol").eq("account_id", acc["id"]).execute()
