@@ -62,6 +62,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
     if (acc.is_master) return 'N/A (Master)';
     const mode = acc.allocation_mode;
     const val = Number(acc.allocation_value || 0);
+    if (mode === 'auto_ratio') return 'Auto Balance Ratio';
     if (mode === 'fixed') return `Fixed: ${val} Contract${val > 1 ? 's' : ''}`;
     if (mode === 'multiplier') return `Multiplier: ${val}x`;
     if (mode === 'capital_pct') return `Capital: ${val}%`;

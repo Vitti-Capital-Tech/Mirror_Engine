@@ -16,11 +16,8 @@ export default function AccountsPage() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-bg-border/50 pb-4 select-none">
-        <div>
-          <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">Configure API Credentials</h2>
-        </div>
+      {/* Header Action Row */}
+      <div className="flex items-center justify-end pb-2 select-none">
         <button
           onClick={() => setIsAddModalOpen(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold rounded-lg transition-all duration-200 shadow-md hover:shadow-blue-500/10"
