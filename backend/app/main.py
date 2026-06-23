@@ -21,10 +21,11 @@ logger = logging.getLogger(__name__)
 redis_client = None
 copy_engine = None
 redis_consumer_task = None
+position_poller_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, copy_engine, redis_consumer_task
+    global redis_client, copy_engine, redis_consumer_task, position_poller_task
     logger.info("Starting Copy Trading Backend...")
     
     # 1. Connect to Redis
@@ -91,15 +92,26 @@ async def lifespan(app: FastAPI):
             logger.error(f"Failed automatic startup live positions sync: {sync_err}")
 
     asyncio.create_task(startup_sync())
+
+    # 7. Start live position and PnL polling background loop (runs every 4 seconds)
+    position_poller_task = asyncio.create_task(position_poller())
+    logger.info("Background live position poller started.")
     
     yield
     
-    # 6. Shutdown cleanups
+    # 8. Shutdown cleanups
     logger.info("Shutting down backend...")
     if redis_consumer_task:
         redis_consumer_task.cancel()
         try:
             await redis_consumer_task
+        except asyncio.CancelledError:
+            pass
+
+    if position_poller_task:
+        position_poller_task.cancel()
+        try:
+            await position_poller_task
         except asyncio.CancelledError:
             pass
             
@@ -124,6 +136,21 @@ async def redis_consumer():
         except Exception as e:
             logger.error(f"Error in Redis consumer loop: {e}")
             await asyncio.sleep(0.1)
+
+async def position_poller():
+    """Background loop polling Delta Exchange for live positions (Mark Price, Unrealized PnL) every 4 seconds."""
+    logger.info("Live position / PnL polling loop started.")
+    # Wait for startup sync to finish first
+    await asyncio.sleep(5)
+    while True:
+        try:
+            from app.api.positions import sync_live_positions
+            await sync_live_positions()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in live position poller loop: {e}")
+        await asyncio.sleep(4.0)
 
 app = FastAPI(
     title="Mirror Engine API",
