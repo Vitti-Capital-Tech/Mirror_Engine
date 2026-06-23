@@ -93,8 +93,18 @@ class CopyEngine:
             return
 
         # 3. Create execution tasks for each follower
+        master_balance = 0.0
+        try:
+            master_acc = self.db.table("accounts").select("available_margin, balance").eq("is_master", True).execute()
+            if master_acc.data:
+                master_balance = float(master_acc.data[0].get("available_margin") or master_acc.data[0].get("balance") or 0.0)
+        except Exception as e:
+            logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
+
         tasks = []
         for follower in followers:
+            # Inject master balance context
+            follower["master_balance"] = master_balance
             follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower)
             
             client = self.connection_manager.get_client(follower["id"])

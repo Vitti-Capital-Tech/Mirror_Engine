@@ -14,7 +14,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [apiSecret, setApiSecret] = useState('');
   const [isMaster, setIsMaster] = useState(false);
   const [environment, setEnvironment] = useState<'demo' | 'live'>('demo');
-  const [allocationMode, setAllocationMode] = useState<'fixed' | 'multiplier' | 'capital_pct'>('multiplier');
+  const [allocationMode, setAllocationMode] = useState<'fixed' | 'multiplier' | 'capital_pct' | 'auto_ratio'>('auto_ratio');
   const [allocationValue, setAllocationValue] = useState<string>('1.0');
   const [maxPositionSize, setMaxPositionSize] = useState<string>('');
   const [leverageLimit, setLeverageLimit] = useState<number>(10);
@@ -178,27 +178,36 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                   <label className="text-text-muted uppercase tracking-wider text-[9px]">Copy Mode</label>
                   <select
                     value={allocationMode}
-                    onChange={(e) => setAllocationMode(e.target.value as any)}
+                    onChange={(e) => {
+                      const mode = e.target.value as any;
+                      setAllocationMode(mode);
+                      if (mode === 'auto_ratio') {
+                        setAllocationValue('1.0'); // default fallback value
+                      }
+                    }}
                     className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
                   >
+                    <option value="auto_ratio">Auto Balance Ratio (Recommended)</option>
                     <option value="multiplier">Multiplier (x Size)</option>
                     <option value="fixed">Fixed Contracts</option>
                     <option value="capital_pct">Margin % of Balance</option>
                   </select>
                 </div>
 
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-text-muted uppercase tracking-wider text-[9px]">Value</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    required
-                    value={allocationValue}
-                    onChange={(e) => setAllocationValue(e.target.value)}
-                    className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
-                  />
-                </div>
+                {allocationMode !== 'auto_ratio' && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-text-muted uppercase tracking-wider text-[9px]">Value</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      required
+                      value={allocationValue}
+                      onChange={(e) => setAllocationValue(e.target.value)}
+                      className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
+                    />
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">

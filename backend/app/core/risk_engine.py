@@ -105,6 +105,20 @@ class RiskEngine:
             notional_per_lot = master_price / leverage_limit
             qty = budget / notional_per_lot if notional_per_lot > 0 else 0
 
+        elif allocation_mode == "auto_ratio":
+            # Dynamic balance ratio (follower balance / master balance)
+            master_balance = float(account.get("master_balance") or 0.0)
+            follower_balance = float(account.get("available_margin") or account.get("balance") or 0.0)
+            
+            if master_balance > 0 and follower_balance > 0:
+                ratio = follower_balance / master_balance
+                qty = master_quantity * ratio
+                logger.info(f"Auto Balance Ratio: follower_bal={follower_balance}, master_bal={master_balance}, ratio={ratio:.6f}, calculated_qty={qty:.4f}")
+            else:
+                # Fallback to 1:1 if balances are missing
+                logger.warning(f"Auto Ratio fallback to 1:1. Follower Balance: {follower_balance}, Master Balance: {master_balance}")
+                qty = master_quantity
+
         else:
             qty = master_quantity  # fallback: mirror exactly
 

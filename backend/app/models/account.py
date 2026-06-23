@@ -20,6 +20,7 @@ class AllocationMode(str, Enum):
     fixed = "fixed"           # fixed lot size per trade
     multiplier = "multiplier" # master qty * multiplier
     capital_pct = "capital_pct"  # % of follower capital
+    auto_ratio = "auto_ratio"   # dynamic ratio (follower balance / master balance)
 
 
 class AccountCreate(BaseModel):

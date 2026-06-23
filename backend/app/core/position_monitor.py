@@ -176,6 +176,17 @@ class PositionMonitor:
                 return "unknown"
             follower_account = follower_acc_res.data[0]
 
+            # Fetch master balance for expected quantity calculation
+            master_balance = 0.0
+            try:
+                master_balance_res = self.db.table("accounts").select("available_margin, balance").eq("is_master", True).execute()
+                if master_balance_res.data:
+                    master_balance = float(master_balance_res.data[0].get("available_margin") or master_balance_res.data[0].get("balance") or 0.0)
+            except Exception as e:
+                logger.error(f"Failed to fetch master balance for expected sync calculation: {e}")
+            
+            follower_account["master_balance"] = master_balance
+
             # 4. Calculate expected qty
             expected_qty = self.risk_engine.calculate_follower_quantity(master_qty, follower_price, follower_account)
             if master_qty == 0:
