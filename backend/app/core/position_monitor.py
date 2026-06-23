@@ -58,7 +58,15 @@ class PositionMonitor:
             
             entry_price = float(position_data.get("entry_price") or 0.0)
             current_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
-            unrealized_pnl = float(position_data.get("unrealized_pnl") or 0.0)
+            
+            # Calculate Unrealized PnL manually to ensure direction and options calculations are correct
+            # Long: (Current Price - Entry Price) * Quantity
+            # Short: (Entry Price - Current Price) * Quantity
+            if side == "long":
+                unrealized_pnl = (current_price - entry_price) * raw_qty
+            else:
+                unrealized_pnl = (entry_price - current_price) * raw_qty
+
             realized_pnl = float(position_data.get("realized_pnl") or 0.0)
             
             sl_price = float(position_data.get("stop_loss_price")) if position_data.get("stop_loss_price") else None
