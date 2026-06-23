@@ -80,18 +80,14 @@ export default function PositionsPage() {
             )}
           </button>
 
-          <div className="flex gap-2 text-xs font-bold font-mono">
-            <div className="bg-bg-panel border border-bg-border px-3 py-1.5 rounded-lg flex items-center gap-2">
-              <span className="text-text-secondary">Synced:</span>
-              <span className="text-emerald-400">{synced} / {total}</span>
-            </div>
-            {outOfSync > 0 && (
+          {outOfSync > 0 && (
+            <div className="flex gap-2 text-xs font-bold font-mono">
               <div className="bg-red-500/10 border border-red-500/20 px-3 py-1.5 rounded-lg flex items-center gap-2 animate-pulse">
                 <span className="text-red-400">Out of Sync:</span>
                 <span className="text-red-400 font-extrabold">{outOfSync}</span>
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
 

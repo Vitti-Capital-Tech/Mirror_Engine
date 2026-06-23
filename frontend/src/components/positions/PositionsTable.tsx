@@ -43,7 +43,6 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                 <th className="text-right">Unrealized PNL</th>
                 <th className="text-right">Stop Loss</th>
                 <th className="text-right">Take Profit</th>
-                <th className="text-center py-3">Sync Status</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-bg-border/50 font-medium">
@@ -66,8 +65,8 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                     <td className="select-none">
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                         isLong 
-                          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
-                          : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                           ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
+                           : 'bg-red-500/10 text-red-400 border border-red-500/20'
                       }`}>
                         {pos.side?.toUpperCase()}
                       </span>
@@ -89,9 +88,6 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                     </td>
                     <td className="text-right font-mono text-text-secondary">
                       {pos.tp_price ? Number(pos.tp_price).toFixed(2) : '-'}
-                    </td>
-                    <td className="text-center py-3.5 select-none">
-                      <SyncBadge syncStatus={pos.sync_status} />
                     </td>
                   </tr>
                 );
