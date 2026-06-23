@@ -11,10 +11,13 @@ router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 @router.get("", response_model=List[PositionResponse])
 async def list_positions():
-    """List open positions across all accounts with joined account name."""
+    """List open positions across all accounts with joined account name, strictly ordered."""
     try:
-        res = db.table("positions").select("*, accounts(name)").execute()
+        res = db.table("positions").select("*, accounts(name)").order("symbol").execute()
         positions = res.data or []
+        
+        # Also sort by account name as secondary check
+        positions.sort(key=lambda x: (x.get("accounts", {}).get("name", ""), x.get("symbol", "")))
         
         formatted = []
         for pos in positions:
@@ -188,6 +191,8 @@ async def get_master_open_orders():
                     "order_type": order.get("order_type"),
                     "created_at": order.get("created_at")
                 })
+            # Sort strictly: newest orders at the top, or sorted by ID for complete stability
+            formatted.sort(key=lambda x: x.get("created_at") or "", reverse=True)
             return formatted
         except Exception as e:
             logger.error(f"Failed to fetch master open orders: {e}")
