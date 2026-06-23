@@ -196,7 +196,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
       {/* Master Account Section */}
       <div className="space-y-3">
         <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-wider select-none">
-          Master Account ({masters.length})
+          Master Account
         </h3>
         {renderTable(masters, true)}
       </div>
