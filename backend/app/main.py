@@ -78,6 +78,19 @@ async def lifespan(app: FastAPI):
     # 5. Start Redis Consumer for trade copying
     redis_consumer_task = asyncio.create_task(redis_consumer())
     logger.info("Background Redis consumer started. Copy trading engine is ready.")
+
+    # 6. Trigger automatic sync of live positions on startup asynchronously
+    async def startup_sync():
+        await asyncio.sleep(2) # Give websockets a couple seconds to connect
+        try:
+            from app.api.positions import sync_live_positions
+            logger.info("Triggering automatic live positions sync on startup...")
+            await sync_live_positions()
+            logger.info("Automatic startup live positions sync completed successfully.")
+        except Exception as sync_err:
+            logger.error(f"Failed automatic startup live positions sync: {sync_err}")
+
+    asyncio.create_task(startup_sync())
     
     yield
     

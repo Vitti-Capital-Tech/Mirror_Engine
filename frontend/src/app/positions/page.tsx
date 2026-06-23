@@ -23,6 +23,11 @@ export default function PositionsPage() {
     }
   }, [latestPosition, queryClient]);
 
+  // Automatically sync positions from live exchange on initial page mount
+  useEffect(() => {
+    handleSyncLive();
+  }, []);
+
   const handleSyncLive = async () => {
     try {
       setSyncing(true);
