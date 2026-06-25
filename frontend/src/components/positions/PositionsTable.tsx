@@ -43,6 +43,7 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                 <th className="text-right">Unrealized PNL</th>
                 <th className="text-right">Stop Loss</th>
                 <th className="text-right">Take Profit</th>
+                <th className="py-3 text-right pr-2">Last Synced</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-bg-border/50 font-medium">
@@ -88,6 +89,9 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                     </td>
                     <td className="text-right font-mono text-text-secondary">
                       {pos.tp_price ? Number(pos.tp_price).toFixed(2) : '-'}
+                    </td>
+                    <td className="text-right font-mono text-text-secondary pr-2">
+                      {pos.last_synced_at ? new Date(pos.last_synced_at).toLocaleTimeString() : '-'}
                     </td>
                   </tr>
                 );

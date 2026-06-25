@@ -259,7 +259,7 @@ class DeltaClient:
     async def _ws_authenticate(self, ws: websockets.WebSocketClientProtocol) -> None:
         """Send key-auth frame and wait for confirmation."""
         timestamp = str(int(time.time()))
-        sig_msg = "GET" + timestamp + "/"
+        sig_msg = "GET" + timestamp + "/live"
         sig = hmac.new(
             self.api_secret.encode(), sig_msg.encode(), hashlib.sha256
         ).hexdigest()

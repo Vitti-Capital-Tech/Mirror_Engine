@@ -75,7 +75,7 @@ export function RecentTrades({ trades = [], isLoading }: { trades?: any[]; isLoa
             <tbody className="divide-y divide-bg-border/50 font-medium">
               {recent.map((trade) => {
                 const date = new Date(trade.created_at);
-                const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const timeStr = date.toLocaleString();
                 
                 // Calculate average slippage
                 const copies = trade.copies || [];

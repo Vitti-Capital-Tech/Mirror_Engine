@@ -130,7 +130,8 @@ export default function PositionsPage() {
                             <th className="text-right">Quantity</th>
                             <th className="text-right">Entry Price</th>
                             <th className="text-right">Current Price</th>
-                            <th className="text-right pr-4">Unrealized PNL</th>
+                            <th className="text-right">Unrealized PNL</th>
+                            <th className="text-right pr-4">Last Synced</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-bg-border/30 font-medium">
@@ -152,8 +153,11 @@ export default function PositionsPage() {
                                 <td className="text-right font-mono text-text-primary">{Number(pos.quantity).toFixed(0)}</td>
                                 <td className="text-right font-mono text-text-primary">{Number(pos.entry_price).toFixed(2)}</td>
                                 <td className="text-right font-mono text-text-primary">{Number(pos.current_price || pos.entry_price).toFixed(2)}</td>
-                                <td className={`text-right font-mono pr-4 ${pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-text-secondary'}`}>
+                                <td className={`text-right font-mono ${pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-text-secondary'}`}>
                                   {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT
+                                </td>
+                                <td className="text-right font-mono text-text-secondary pr-4">
+                                  {pos.last_synced_at ? new Date(pos.last_synced_at).toLocaleTimeString() : '-'}
                                 </td>
                               </tr>
                             );
