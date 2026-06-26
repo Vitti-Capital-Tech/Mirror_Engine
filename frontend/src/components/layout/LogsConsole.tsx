@@ -52,14 +52,16 @@ export function LogsConsole() {
     }
   }, [latestTrade]);
 
-  // Listen to position updates
+  // Listen to position updates — only surface mismatches, not routine syncs
   useEffect(() => {
     if (latestPosition) {
-      const isDesynced = latestPosition.sync_status?.toLowerCase() === 'desynced';
-      addLog(
-        `Position sync update: Account ${latestPosition.account_name} holds size=${latestPosition.quantity} on ${latestPosition.symbol} - Status: ${latestPosition.sync_status?.toUpperCase()}`,
-        isDesynced ? 'warning' : 'info'
-      );
+      const status = latestPosition.sync_status?.toLowerCase();
+      if (status === 'out_of_sync' || status === 'desynced') {
+        addLog(
+          `Position OUT OF SYNC: ${latestPosition.account_name} on ${latestPosition.symbol} (size=${latestPosition.quantity})`,
+          'warning'
+        );
+      }
     }
   }, [latestPosition]);
 
