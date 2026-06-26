@@ -198,6 +198,59 @@ async def reset_account(id: str):
         logger.error(f"Error resetting account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/{id}/promote", response_model=AccountResponse)
+async def promote_account(id: str):
+    """Promote a follower to master. Demotes the current master to follower.
+
+    Only one master is ever allowed, so this is an atomic swap:
+      - current master  -> follower
+      - target account   -> master
+    WebSocket feeds are rewired: the new master listens for fills, the demoted
+    account switches to position monitoring.
+    """
+    try:
+        target_res = db.table("accounts").select("*").eq("id", id).execute()
+        if not target_res.data:
+            raise HTTPException(status_code=404, detail="Account not found.")
+        target = target_res.data[0]
+
+        if target.get("is_master"):
+            raise HTTPException(status_code=400, detail="Account is already the master.")
+
+        # Find the current master (if any)
+        master_res = db.table("accounts").select("*").eq("is_master", True).execute()
+        old_master = master_res.data[0] if master_res.data else None
+
+        # Stop the standalone master trade listener and tear down both WS feeds
+        await trade_listener.stop()
+        if old_master:
+            await connection_manager.disconnect_account(old_master["id"])
+        await connection_manager.disconnect_account(id)
+
+        # Swap roles in the DB
+        if old_master:
+            db.table("accounts").update({"is_master": False}).eq("id", old_master["id"]).execute()
+        upd = db.table("accounts").update({"is_master": True}).eq("id", id).execute()
+        if not upd.data:
+            raise HTTPException(status_code=500, detail="Failed to promote account.")
+        new_master = upd.data[0]
+
+        # Rewire WebSocket feeds for the new roles
+        await start_account_ws(new_master)  # master -> on_fill callback
+        if old_master:
+            demoted = {**old_master, "is_master": False}
+            await start_account_ws(demoted)  # follower -> position callback
+
+        resp_acc = dict(new_master)
+        resp_acc["api_key"] = f"...{resp_acc['api_key'][-4:]}" if len(resp_acc['api_key']) >= 4 else "..."
+        resp_acc["api_secret"] = "******"
+        return resp_acc
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error promoting account: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/{id}/test", response_model=AccountTestResult)
 async def test_account(id: str):
     """Instantiate DeltaClient, fetch wallet balances, and update account balance in DB."""

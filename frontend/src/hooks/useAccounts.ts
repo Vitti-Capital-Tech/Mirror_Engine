@@ -46,6 +46,14 @@ export function useDeleteAccount() {
   });
 }
 
+export function usePromoteAccount() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.accounts.promote,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['accounts'] }),
+  });
+}
+
 export function useTestAccount() {
   return useMutation({ mutationFn: api.accounts.test });
 }

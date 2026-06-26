@@ -1,14 +1,15 @@
 'use client';
 import React, { useState } from 'react';
-import { 
-  usePauseAccount, 
-  useResumeAccount, 
-  useDeleteAccount, 
-  useResetAccount, 
-  useTestAccount 
+import {
+  usePauseAccount,
+  useResumeAccount,
+  useDeleteAccount,
+  useResetAccount,
+  useTestAccount,
+  usePromoteAccount
 } from '@/hooks/useAccounts';
 import { StatusBadge } from '../shared/StatusBadge';
-import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw } from 'lucide-react';
+import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw, Crown } from 'lucide-react';
 
 export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; isLoading: boolean }) {
   const pauseAcc = usePauseAccount();
@@ -16,6 +17,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
   const deleteAcc = useDeleteAccount();
   const resetAcc = useResetAccount();
   const testAcc = useTestAccount();
+  const promoteAcc = usePromoteAccount();
 
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; msg: string; ok: boolean } | null>(null);
@@ -55,6 +57,12 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
   const handleDelete = (id: string, name: string) => {
     if (window.confirm(`Are you sure you want to delete account: ${name}?`)) {
       deleteAcc.mutate(id);
+    }
+  };
+
+  const handlePromote = (id: string, name: string) => {
+    if (window.confirm(`Make "${name}" the master account? The current master will be demoted to a follower.`)) {
+      promoteAcc.mutate(id);
     }
   };
 
@@ -170,6 +178,18 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                         className="p-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg border border-blue-500/20 shadow-sm transition-all duration-200 animate-pulse inline-flex items-center justify-center cursor-pointer"
                       >
                         <RotateCcw className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+
+                    {/* Promote follower to master */}
+                    {!isMasterTable && (
+                      <button
+                        onClick={() => handlePromote(acc.id, acc.name)}
+                        disabled={promoteAcc.isPending}
+                        title="Make Master Account"
+                        className="p-2 bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 rounded-lg border border-purple-500/20 shadow-sm transition-all duration-200 disabled:opacity-40 inline-flex items-center justify-center cursor-pointer"
+                      >
+                        <Crown className="w-3.5 h-3.5" />
                       </button>
                     )}
 
