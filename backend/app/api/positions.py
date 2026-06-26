@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Dict
 from fastapi import APIRouter, HTTPException
@@ -9,40 +10,111 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
+
+def _format_live_position(account_id: str, account_name: str, pos: dict) -> dict | None:
+    """Convert a raw Delta position payload into the API response shape.
+
+    Returns None if the position has zero size (closed) so it is omitted.
+    """
+    symbol = pos.get("product_symbol") or pos.get("symbol")
+    if not symbol:
+        return None
+
+    raw_size = float(pos.get("size") or pos.get("quantity") or 0.0)
+    if raw_size == 0:
+        return None  # closed position — don't show
+
+    # Side: explicit field wins, else sign of size
+    explicit_side = pos.get("side")
+    if explicit_side and str(explicit_side).lower() in ("long", "short", "buy", "sell"):
+        s = str(explicit_side).lower()
+        side = "long" if s in ("long", "buy") else "short"
+    else:
+        side = "long" if raw_size >= 0 else "short"
+
+    qty = abs(raw_size)
+    entry_price = float(pos.get("entry_price") or 0.0)
+    current_price = float(pos.get("mark_price") or pos.get("current_price") or entry_price)
+
+    # Options contracts carry a multiplier (e.g. 0.001 BTC per contract)
+    multiplier = float(
+        pos.get("contract_value")
+        or (0.001 if ("-C-" in symbol or "-P-" in symbol or symbol.startswith("C-") or symbol.startswith("P-")) else 1.0)
+    )
+
+    if side == "long":
+        unrealized_pnl = (current_price - entry_price) * qty * multiplier
+    else:
+        unrealized_pnl = (entry_price - current_price) * qty * multiplier
+
+    sl_price = float(pos.get("stop_loss_price")) if pos.get("stop_loss_price") else None
+    tp_price = float(pos.get("take_profit_price")) if pos.get("take_profit_price") else None
+
+    return {
+        "id": f"{account_id}-{symbol}",
+        "account_id": account_id,
+        "account_name": account_name,
+        "symbol": symbol,
+        "side": side,
+        "quantity": qty,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "unrealized_pnl": unrealized_pnl,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "sync_status": "synced",
+        "last_synced_at": None,
+        "created_at": pos.get("created_at"),
+    }
+
+
+async def _fetch_account_positions(acc: dict) -> List[dict]:
+    """Fetch live positions for a single account directly from Delta Exchange."""
+    client = DeltaClient(
+        api_key=acc["api_key"],
+        api_secret=acc["api_secret"],
+        environment=acc.get("environment", "demo"),
+    )
+    try:
+        live = await client.get_positions()
+        out = []
+        for pos in live:
+            formatted = _format_live_position(acc["id"], acc["name"], pos)
+            if formatted:
+                out.append(formatted)
+        return out
+    except Exception as e:
+        logger.warning(f"Failed to fetch live positions for {acc['name']}: {e}")
+        return []
+    finally:
+        await client.close()
+
+
 @router.get("", response_model=List[PositionResponse])
 async def list_positions():
-    """List open positions across all accounts with joined account name, strictly ordered."""
+    """List open positions for all accounts, fetched LIVE from Delta Exchange.
+
+    Reads directly from the exchange (not the DB) so the view always matches
+    exactly what Delta shows, with no flicker from background writers.
+    """
     try:
-        res = db.table("positions").select("*, accounts(name)").order("symbol").execute()
-        positions = res.data or []
-        
-        # Also sort by account name as secondary check
-        positions.sort(key=lambda x: (x.get("accounts", {}).get("name", ""), x.get("symbol", "")))
-        
-        formatted = []
-        for pos in positions:
-            acc_info = pos.get("accounts") or {}
-            acc_name = acc_info.get("name") or "Unknown"
-            
-            formatted.append({
-                "id": pos.get("id"),
-                "account_id": pos.get("account_id"),
-                "account_name": acc_name,
-                "symbol": pos.get("symbol"),
-                "side": pos.get("side"),
-                "quantity": float(pos.get("quantity", 0)),
-                "entry_price": float(pos.get("entry_price", 0)),
-                "current_price": float(pos.get("current_price") or pos.get("entry_price") or 0),
-                "unrealized_pnl": float(pos.get("unrealized_pnl") or 0),
-                "sl_price": pos.get("sl_price"),
-                "tp_price": pos.get("tp_price"),
-                "sync_status": pos.get("sync_status", "unknown"),
-                "last_synced_at": pos.get("last_synced_at"),
-                # created_at = first DB write time (use created_at if available, else updated_at as proxy)
-                "created_at": pos.get("created_at") or pos.get("updated_at")
-            })
-            
-        return formatted
+        acc_res = db.table("accounts").select("*").execute()
+        accounts = acc_res.data or []
+        if not accounts:
+            return []
+
+        results = await asyncio.gather(
+            *[_fetch_account_positions(acc) for acc in accounts],
+            return_exceptions=True,
+        )
+
+        positions = []
+        for r in results:
+            if isinstance(r, list):
+                positions.extend(r)
+
+        positions.sort(key=lambda x: (x["account_name"], x["symbol"]))
+        return positions
     except Exception as e:
         logger.error(f"Error querying positions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -145,18 +217,11 @@ async def sync_live_positions():
                     logger.warning(f"Failed to fetch wallet balance for {acc['name']}: {bal_err}")
 
                 live_positions = await client.get_positions()
-                
-                db_pos_res = db.table("positions").select("symbol").eq("account_id", acc["id"]).execute()
-                db_symbols = {p["symbol"] for p in db_pos_res.data or []}
-                
-                active_symbols = set()
 
                 for pos in live_positions:
                     symbol = pos.get("product_symbol") or pos.get("symbol")
                     if not symbol:
                         continue
-                    size = float(pos.get("size") or pos.get("quantity") or 0.0)
-                    active_symbols.add(symbol)
 
                     from app.core.position_monitor import position_monitor
                     await position_monitor.on_position_update(
@@ -165,24 +230,10 @@ async def sync_live_positions():
                         position_data=pos
                     )
 
-                # Only close positions explicitly returned with size=0 by the API,
-                # or positions in DB that were not seen AND we got a non-empty response
-                # (avoids deleting positions when the API partially fails e.g. 400 on options endpoint)
-                if live_positions:
-                    closed_symbols = db_symbols - active_symbols
-                    for symbol in closed_symbols:
-                        from app.core.position_monitor import position_monitor
-                        await position_monitor.on_position_update(
-                            account_id=acc["id"],
-                            account_name=acc["name"],
-                            position_data={
-                                "symbol": symbol,
-                                "size": 0,
-                                "entry_price": 0,
-                                "mark_price": 0,
-                                "unrealized_pnl": 0
-                            }
-                        )
+                # Deletion is intentionally omitted here.
+                # WebSocket handles position closes (size=0 messages) in real time.
+                # Inferring closure from REST absence causes flickering when the API
+                # partially fails (e.g. options endpoint 400s).
                 
                 sync_results.append({"account_name": acc["name"], "status": "success", "positions_count": len(live_positions)})
             except Exception as e:
