@@ -50,11 +50,21 @@ class PositionMonitor:
             if not symbol:
                 return
 
-            raw_qty = float(position_data.get("size") or position_data.get("quantity") or 0.0)
+            raw_size = float(position_data.get("size") or position_data.get("quantity") or 0.0)
             
-            # Map side: Delta WS uses 'long' or 'short'. Fallback to 'long'.
-            side_str = position_data.get("side", "long").lower()
-            side = "long" if side_str in ("long", "buy") else "short"
+            # Map side: Delta REST API uses a signed 'size' field (positive=long, negative=short).
+            # The WebSocket 'positions' channel may include an explicit 'side' field ('long'/'short').
+            # Priority: explicit side field > sign of size value.
+            explicit_side = position_data.get("side")
+            if explicit_side and str(explicit_side).lower() in ("long", "short", "buy", "sell"):
+                side_str = str(explicit_side).lower()
+                side = "long" if side_str in ("long", "buy") else "short"
+            else:
+                # Infer from the sign of size
+                side = "long" if raw_size >= 0 else "short"
+            
+            # Use absolute quantity for storage
+            raw_qty = abs(raw_size)
             
             entry_price = float(position_data.get("entry_price") or 0.0)
             current_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
