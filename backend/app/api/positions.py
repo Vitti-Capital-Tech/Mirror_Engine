@@ -268,6 +268,17 @@ async def get_master_open_orders():
             open_orders = await client.get_open_orders()
             formatted = []
             for order in open_orders:
+                base_type = order.get("order_type")  # 'market_order' / 'limit_order'
+                stop_type = order.get("stop_order_type")  # e.g. 'stop_loss_order'
+                # A stop/take-profit order is a triggered order — label it like Delta does.
+                if stop_type or order.get("stop_price"):
+                    if base_type == "limit_order":
+                        display_type = "stop_limit"
+                    else:
+                        display_type = "stop_market"
+                else:
+                    display_type = base_type
+
                 formatted.append({
                     "id": order.get("id"),
                     "symbol": order.get("product_symbol"),
@@ -275,7 +286,7 @@ async def get_master_open_orders():
                     "quantity": float(order.get("size", 0)),
                     "limit_price": float(order.get("limit_price")) if order.get("limit_price") else None,
                     "stop_price": float(order.get("stop_price")) if order.get("stop_price") else None,
-                    "order_type": order.get("order_type"),
+                    "order_type": display_type,
                     "created_at": order.get("created_at")
                 })
             # Sort strictly: newest orders at the top, or sorted by ID for complete stability
