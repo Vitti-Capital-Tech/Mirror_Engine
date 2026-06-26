@@ -10,6 +10,30 @@ import {
 } from '@/hooks/useAccounts';
 import { StatusBadge } from '../shared/StatusBadge';
 import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw, Crown } from 'lucide-react';
+import toast from 'react-hot-toast';
+
+// A confirm dialog rendered as a toast (replaces window.confirm)
+function confirmToast(message: string, onConfirm: () => void) {
+  toast((t) => (
+    <div className="flex flex-col gap-2">
+      <span className="text-text-primary">{message}</span>
+      <div className="flex gap-2 justify-end">
+        <button
+          onClick={() => toast.dismiss(t.id)}
+          className="px-2.5 py-1 text-xs rounded-md bg-bg-secondary text-text-secondary hover:text-white border border-bg-border"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => { toast.dismiss(t.id); onConfirm(); }}
+          className="px-2.5 py-1 text-xs rounded-md bg-blue-500 hover:bg-blue-600 text-white font-semibold"
+        >
+          Confirm
+        </button>
+      </div>
+    </div>
+  ), { duration: 8000 });
+}
 
 export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; isLoading: boolean }) {
   const pauseAcc = usePauseAccount();
@@ -20,7 +44,6 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
   const promoteAcc = usePromoteAccount();
 
   const [testingId, setTestingId] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{ id: string; msg: string; ok: boolean } | null>(null);
 
   if (isLoading) {
     return (
@@ -43,27 +66,51 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
 
   const handleTestConnection = async (id: string) => {
     setTestingId(id);
-    setTestResult(null);
+    const tId = toast.loading('Testing connection...');
     try {
       const res = await testAcc.mutateAsync(id);
-      setTestResult({ id, msg: res.message, ok: res.success });
+      if (res.success) {
+        toast.success(res.message, { id: tId });
+      } else {
+        toast.error(res.message, { id: tId });
+      }
     } catch (e: any) {
-      setTestResult({ id, msg: e.message || 'API error', ok: false });
+      toast.error(e.message || 'API error', { id: tId });
     } finally {
       setTestingId(null);
     }
   };
 
   const handleDelete = (id: string, name: string) => {
-    if (window.confirm(`Are you sure you want to delete account: ${name}?`)) {
-      deleteAcc.mutate(id);
-    }
+    confirmToast(`Delete account "${name}"?`, () => {
+      deleteAcc.mutate(id, {
+        onSuccess: () => toast.success(`Account "${name}" deleted.`),
+        onError: (e: any) => toast.error(e.message || 'Failed to delete account.'),
+      });
+    });
   };
 
   const handlePromote = (id: string, name: string) => {
-    if (window.confirm(`Make "${name}" the master account? The current master will be demoted to a follower.`)) {
-      promoteAcc.mutate(id);
-    }
+    confirmToast(`Make "${name}" the master? The current master becomes a follower.`, () => {
+      promoteAcc.mutate(id, {
+        onSuccess: () => toast.success(`"${name}" is now the master account.`),
+        onError: (e: any) => toast.error(e.message || 'Failed to promote account.'),
+      });
+    });
+  };
+
+  const handlePause = (id: string, name: string) => {
+    pauseAcc.mutate(id, {
+      onSuccess: () => toast.success(`"${name}" paused.`),
+      onError: (e: any) => toast.error(e.message || 'Failed to pause.'),
+    });
+  };
+
+  const handleResume = (id: string, name: string) => {
+    resumeAcc.mutate(id, {
+      onSuccess: () => toast.success(`"${name}" is now active.`),
+      onError: (e: any) => toast.error(e.message || 'Failed to resume.'),
+    });
   };
 
   const getAllocationText = (acc: any) => {
@@ -98,7 +145,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
               <th>Environment</th>
               {!isMasterTable && <th>Allocation</th>}
               <th className="text-right pr-6">Balance</th>
-              {!isMasterTable && <th className="text-right pr-6">Today's PnL</th>}
+              <th className="text-right pr-6">Today's PnL</th>
               <th className="pl-12">Status</th>
               <th className="text-right py-3 pr-2">Actions</th>
             </tr>
@@ -120,22 +167,13 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                   <td className="py-4 text-right pr-6 font-mono text-text-primary">
                     {acc.balance !== null ? `${Number(acc.balance).toFixed(2)} USDT` : '-'}
                   </td>
-                  {!isMasterTable && (
-                    <td className={`py-4 text-right pr-6 font-mono ${pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-text-secondary'}`}>
-                      {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT
-                    </td>
-                  )}
+                  <td className={`py-4 text-right pr-6 font-mono ${pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-text-secondary'}`}>
+                    {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT
+                  </td>
                   <td className="py-4 pl-12 select-none">
                     <StatusBadge status={acc.status} />
                   </td>
                   <td className="py-4 text-right space-x-2.5 whitespace-nowrap pr-2">
-                    {/* Connection Test feedback */}
-                    {testResult && testResult.id === acc.id && (
-                      <span className={`inline-block mr-2 text-[10px] font-bold select-none ${testResult.ok ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {testResult.msg}
-                      </span>
-                    )}
-
                     {/* Test Connection */}
                     <button
                       onClick={() => handleTestConnection(acc.id)}
@@ -153,7 +191,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                     {/* Pause / Resume */}
                     {acc.status === 'active' ? (
                       <button
-                        onClick={() => pauseAcc.mutate(acc.id)}
+                        onClick={() => handlePause(acc.id, acc.name)}
                         title="Pause Copying"
                         className="p-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded-lg border border-amber-500/20 shadow-sm transition-all duration-200 inline-flex items-center justify-center cursor-pointer"
                       >
@@ -161,7 +199,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                       </button>
                     ) : (
                       <button
-                        onClick={() => resumeAcc.mutate(acc.id)}
+                        onClick={() => handleResume(acc.id, acc.name)}
                         title="Resume Copying"
                         disabled={acc.status === 'circuit_break'}
                         className="p-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 rounded-lg border border-emerald-500/20 shadow-sm transition-all duration-200 disabled:opacity-30 disabled:hover:bg-emerald-500/10 inline-flex items-center justify-center cursor-pointer"
