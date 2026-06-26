@@ -131,7 +131,7 @@ export default function PositionsPage() {
                             <th className="text-right">Entry Price</th>
                             <th className="text-right">Current Price</th>
                             <th className="text-right">Unrealized PNL</th>
-                            <th className="text-right pr-4">Last Synced</th>
+                            <th className="text-right pr-4">Opened At</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-bg-border/30 font-medium">
@@ -157,7 +157,18 @@ export default function PositionsPage() {
                                   {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT
                                 </td>
                                 <td className="text-right font-mono text-text-secondary pr-4">
-                                  {pos.last_synced_at ? new Date(pos.last_synced_at).toLocaleTimeString() : '-'}
+                                  {pos.created_at
+                                    ? (() => {
+                                        const d = new Date(pos.created_at);
+                                        return d.toLocaleString('en-IN', {
+                                          day: '2-digit',
+                                          month: 'short',
+                                          hour: '2-digit',
+                                          minute: '2-digit',
+                                          hour12: true,
+                                        });
+                                      })()
+                                    : '-'}
                                 </td>
                               </tr>
                             );

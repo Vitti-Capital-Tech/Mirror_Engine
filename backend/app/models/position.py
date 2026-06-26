@@ -36,6 +36,7 @@ class PositionResponse(BaseModel):
     tp_price: Optional[float] = None
     sync_status: SyncStatus = SyncStatus.unknown
     last_synced_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

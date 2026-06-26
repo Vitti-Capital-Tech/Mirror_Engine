@@ -37,7 +37,8 @@ async def list_positions():
                 "sl_price": pos.get("sl_price"),
                 "tp_price": pos.get("tp_price"),
                 "sync_status": pos.get("sync_status", "unknown"),
-                "last_synced_at": pos.get("last_synced_at")
+                "last_synced_at": pos.get("last_synced_at"),
+                "created_at": pos.get("created_at")
             })
             
         return formatted
@@ -93,7 +94,8 @@ async def list_account_positions(account_id: str):
                 "sl_price": pos.get("sl_price"),
                 "tp_price": pos.get("tp_price"),
                 "sync_status": pos.get("sync_status", "unknown"),
-                "last_synced_at": pos.get("last_synced_at")
+                "last_synced_at": pos.get("last_synced_at"),
+                "created_at": pos.get("created_at")
             })
             
         return formatted
