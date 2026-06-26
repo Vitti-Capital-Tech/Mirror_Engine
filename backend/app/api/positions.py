@@ -150,34 +150,39 @@ async def sync_live_positions():
                 db_symbols = {p["symbol"] for p in db_pos_res.data or []}
                 
                 active_symbols = set()
-                
+
                 for pos in live_positions:
                     symbol = pos.get("product_symbol") or pos.get("symbol")
                     if not symbol:
                         continue
+                    size = float(pos.get("size") or pos.get("quantity") or 0.0)
                     active_symbols.add(symbol)
-                    
+
                     from app.core.position_monitor import position_monitor
                     await position_monitor.on_position_update(
                         account_id=acc["id"],
                         account_name=acc["name"],
                         position_data=pos
                     )
-                
-                closed_symbols = db_symbols - active_symbols
-                for symbol in closed_symbols:
-                    from app.core.position_monitor import position_monitor
-                    await position_monitor.on_position_update(
-                        account_id=acc["id"],
-                        account_name=acc["name"],
-                        position_data={
-                            "symbol": symbol,
-                            "size": 0,
-                            "entry_price": 0,
-                            "mark_price": 0,
-                            "unrealized_pnl": 0
-                        }
-                    )
+
+                # Only close positions explicitly returned with size=0 by the API,
+                # or positions in DB that were not seen AND we got a non-empty response
+                # (avoids deleting positions when the API partially fails e.g. 400 on options endpoint)
+                if live_positions:
+                    closed_symbols = db_symbols - active_symbols
+                    for symbol in closed_symbols:
+                        from app.core.position_monitor import position_monitor
+                        await position_monitor.on_position_update(
+                            account_id=acc["id"],
+                            account_name=acc["name"],
+                            position_data={
+                                "symbol": symbol,
+                                "size": 0,
+                                "entry_price": 0,
+                                "mark_price": 0,
+                                "unrealized_pnl": 0
+                            }
+                        )
                 
                 sync_results.append({"account_name": acc["name"], "status": "success", "positions_count": len(live_positions)})
             except Exception as e:

@@ -50,8 +50,11 @@ class PositionMonitor:
             if not symbol:
                 return
 
+            # Only treat as closed if 'size' is explicitly present in the payload AND is 0.
+            # If 'size' is absent (partial WS update), don't infer closure — avoids false deletions.
+            size_present = "size" in position_data or "quantity" in position_data
             raw_size = float(position_data.get("size") or position_data.get("quantity") or 0.0)
-            
+
             # Map side: Delta REST API uses a signed 'size' field (positive=long, negative=short).
             # The WebSocket 'positions' channel may include an explicit 'side' field ('long'/'short').
             # Priority: explicit side field > sign of size value.
@@ -60,12 +63,11 @@ class PositionMonitor:
                 side_str = str(explicit_side).lower()
                 side = "long" if side_str in ("long", "buy") else "short"
             else:
-                # Infer from the sign of size
                 side = "long" if raw_size >= 0 else "short"
-            
+
             # Use absolute quantity for storage
             raw_qty = abs(raw_size)
-            
+
             entry_price = float(position_data.get("entry_price") or 0.0)
             current_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
             
@@ -89,8 +91,8 @@ class PositionMonitor:
 
             logger.info(f"Position update for {account_name} on {symbol}: qty={raw_qty}, price={current_price}")
 
-            # If qty is 0, the position is closed.
-            if raw_qty == 0:
+            # If qty is 0 AND size was explicitly in the payload, the position is closed.
+            if raw_qty == 0 and size_present:
                 # Delete position from DB
                 self.db.table("positions").delete().eq("account_id", account_id).eq("symbol", symbol).execute()
                 if account_id in self._positions_cache and symbol in self._positions_cache[account_id]:
