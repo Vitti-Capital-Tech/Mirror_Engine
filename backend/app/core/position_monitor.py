@@ -113,6 +113,10 @@ class PositionMonitor:
                 await self._resolve_mismatch_alert(account_id, symbol)
                 return
 
+            # Determine if this is a new position (not previously seen in cache)
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            is_new = account_id not in self._positions_cache or symbol not in self._positions_cache[account_id]
+
             # Upsert position in Supabase
             db_pos = {
                 "account_id": account_id,
@@ -125,8 +129,12 @@ class PositionMonitor:
                 "realized_pnl": realized_pnl,
                 "sl_price": sl_price,
                 "tp_price": tp_price,
-                "last_synced_at": datetime.utcnow().isoformat() + "Z"
+                "last_synced_at": now_iso
             }
+
+            # Set created_at only on first insert (new positions) — preserve on updates
+            if is_new:
+                db_pos["created_at"] = now_iso
 
             upsert_res = self.db.table("positions").upsert(db_pos, on_conflict="account_id,symbol").execute()
             if upsert_res.data:
