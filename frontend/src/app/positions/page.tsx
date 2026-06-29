@@ -5,6 +5,7 @@ import { usePositions, useMasterOpenOrders } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
+import { RefreshCw, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 
 export default function PositionsPage() {
   const queryClient = useQueryClient();
@@ -44,28 +45,14 @@ export default function PositionsPage() {
   return (
     <div className="space-y-8 select-none">
       {/* Header action button */}
-      <div className="flex justify-end border-b border-bg-border/50 pb-4">
+      <div className="flex items-center justify-end">
         <button
           onClick={handleSyncLive}
           disabled={syncing}
-          className={`px-3 py-1.5 bg-blue-500 hover:bg-blue-600 disabled:bg-blue-500/50 text-white text-xs font-semibold rounded-lg transition-all flex items-center gap-1.5 shadow-lg shadow-blue-500/10 ${syncing ? 'animate-pulse' : ''}`}
+          className="group relative inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white overflow-hidden border border-blue-400/30 bg-gradient-to-b from-blue-500 to-blue-600 hover:from-blue-400 hover:to-blue-500 shadow-lg shadow-blue-500/25 transition-all disabled:opacity-70 disabled:cursor-not-allowed"
         >
-          {syncing ? (
-            <>
-              <svg className="animate-spin h-3 w-3 text-white" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              Syncing...
-            </>
-          ) : (
-            <>
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 7.89M9 11l3 3 8-8" />
-              </svg>
-              Sync Live Exchange Data
-            </>
-          )}
+          <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : 'group-hover:rotate-90 transition-transform duration-300'}`} />
+          {syncing ? 'Syncing…' : 'Sync Now'}
         </button>
       </div>
 
@@ -87,8 +74,16 @@ export default function PositionsPage() {
             <div key={acc.id} className="card-premium overflow-hidden shadow-md">
               {/* Card Header */}
               <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-6 py-4">
-                <div className="flex items-center gap-3">
-                  <h3 className="font-bold text-text-primary text-sm uppercase tracking-wide">{acc.name}</h3>
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
+                    {acc.name?.charAt(0)?.toUpperCase() || '?'}
+                  </span>
+                  <div className="flex flex-col min-w-0">
+                    <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
+                    <span className="text-[10px] text-text-muted font-medium leading-tight">
+                      {accPositions.length} open position{accPositions.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
                 </div>
                 
                 <div className="flex items-center gap-6 font-mono text-xs font-bold">
@@ -140,11 +135,12 @@ export default function PositionsPage() {
                               <tr key={pos.id} className="hover:bg-bg-secondary/10 transition-colors">
                                 <td className="py-2.5 font-bold text-text-primary">{pos.symbol}</td>
                                 <td>
-                                  <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
-                                    isLong 
-                                      ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
-                                      : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                                  <span className={`inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-full text-[10px] font-bold ring-1 ${
+                                    isLong
+                                      ? 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/25'
+                                      : 'bg-rose-500/10 text-rose-400 ring-rose-500/25'
                                   }`}>
+                                    {isLong ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
                                     {pos.side?.toUpperCase()}
                                   </span>
                                 </td>
@@ -205,11 +201,12 @@ export default function PositionsPage() {
                                 <tr key={ord.id} className="hover:bg-bg-secondary/10 transition-colors">
                                   <td className="py-2.5 font-bold text-text-primary">{ord.symbol}</td>
                                   <td>
-                                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
-                                      isBuy 
-                                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
-                                        : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                                    <span className={`inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-full text-[10px] font-bold ring-1 ${
+                                      isBuy
+                                        ? 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/25'
+                                        : 'bg-rose-500/10 text-rose-400 ring-rose-500/25'
                                     }`}>
+                                      {isBuy ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
                                       {ord.side?.toUpperCase()}
                                     </span>
                                   </td>

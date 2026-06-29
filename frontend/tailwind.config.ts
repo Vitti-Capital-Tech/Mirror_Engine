@@ -37,6 +37,7 @@ const config: Config = {
         'slide-in': 'slideIn 0.3s ease-out',
         'fade-in': 'fadeIn 0.2s ease-out',
         'blink': 'blink 1s ease-in-out infinite',
+        'shimmer': 'shimmer 4.5s ease-in-out infinite',
       },
       keyframes: {
         slideIn: {
@@ -50,6 +51,10 @@ const config: Config = {
         blink: {
           '0%, 100%': { opacity: '1' },
           '50%': { opacity: '0.3' },
+        },
+        shimmer: {
+          '0%': { transform: 'translateX(-160%) skewX(-20deg)' },
+          '55%, 100%': { transform: 'translateX(260%) skewX(-20deg)' },
         },
       },
       fontFamily: {

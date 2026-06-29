@@ -19,11 +19,15 @@ export function Sidebar() {
       isCollapsed ? 'w-20' : 'w-64'
     }`}>
       {/* Top logo */}
-      <div className={`h-16 px-5 border-b border-bg-border flex items-center justify-between ${isCollapsed ? 'flex-col gap-3 justify-center' : ''}`}>
-        <div className="flex items-center gap-3">
-          <img src="/logo.jpg" alt="Mirror Engine Logo" className="w-9 h-9 rounded-xl object-cover ring-1 ring-bg-border shadow-lg shadow-blue-500/10 shrink-0" />
+      <div className={`h-16 border-b border-bg-border flex items-center ${isCollapsed ? 'justify-center px-0' : 'justify-between px-5'}`}>
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="relative w-9 h-9 rounded-xl overflow-hidden ring-1 ring-bg-border shadow-lg shadow-blue-500/20 shrink-0">
+            <img src="/logo.jpg" alt="Mirror Engine Logo" className="w-full h-full object-cover" />
+            {/* Periodic shine sweep */}
+            <span className="pointer-events-none absolute top-0 left-0 h-full w-2/3 bg-gradient-to-r from-transparent via-white/55 to-transparent animate-shimmer" />
+          </div>
           {!isCollapsed && (
-            <span className="font-bold text-base bg-gradient-to-r from-blue-400 via-sky-300 to-emerald-400 bg-clip-text text-transparent tracking-tight whitespace-nowrap">
+            <span className="font-extrabold text-base bg-gradient-to-r from-white via-sky-200 to-blue-400 bg-clip-text text-transparent tracking-tight whitespace-nowrap drop-shadow-[0_0_12px_rgba(59,130,246,0.25)]">
               Mirror Engine
             </span>
           )}
@@ -31,7 +35,7 @@ export function Sidebar() {
         {!isCollapsed && (
           <button
             onClick={() => setIsCollapsed(!isCollapsed)}
-            className="p-1.5 hover:bg-bg-panel border border-transparent hover:border-bg-border rounded-lg text-text-muted hover:text-text-primary transition-colors"
+            className="p-1.5 hover:bg-bg-panel border border-transparent hover:border-bg-border rounded-lg text-text-muted hover:text-text-primary transition-colors shrink-0"
             title="Collapse Sidebar"
           >
             <ChevronLeft className="w-4 h-4" />

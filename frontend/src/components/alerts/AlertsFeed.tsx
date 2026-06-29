@@ -1,7 +1,7 @@
 'use client';
 import React from 'react';
 import { useResolveAlert } from '@/hooks/useAlerts';
-import { AlertTriangle, Info, ShieldAlert, CheckCircle, BellOff, Activity, Gauge, GitCompareArrows, Wifi } from 'lucide-react';
+import { AlertTriangle, Info, ShieldAlert, CheckCircle } from 'lucide-react';
 
 function relativeTime(iso: string): string {
   const then = new Date(iso).getTime();
@@ -41,41 +41,15 @@ export function AlertsFeed({ alerts = [], isLoading }: { alerts?: any[]; isLoadi
   };
 
   if (alerts.length === 0) {
-    const monitored = [
-      { icon: Gauge, label: 'Slippage breaches', desc: 'When a copy fills too far from the master price' },
-      { icon: ShieldAlert, label: 'Circuit breakers', desc: 'When an account is auto-paused after repeated failures' },
-      { icon: GitCompareArrows, label: 'Position mismatches', desc: 'When a follower drifts out of sync with the master' },
-      { icon: Wifi, label: 'Connection issues', desc: 'When an account loses its exchange connection' },
-    ];
     return (
-      <div className="card-premium p-10 flex flex-col items-center text-center select-none">
-        <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-emerald-500/10 mb-4">
-          <CheckCircle className="w-7 h-7 text-emerald-400" />
+      <div className="card-premium py-16 flex flex-col items-center text-center select-none">
+        <div className="flex items-center justify-center w-12 h-12 rounded-2xl bg-emerald-500/10 mb-3">
+          <CheckCircle className="w-6 h-6 text-emerald-400" />
         </div>
-        <h3 className="text-base font-bold text-text-primary">All clear</h3>
-        <p className="text-xs text-text-muted mt-1 max-w-sm">
-          No active alerts. The engine is running smoothly and will surface anything that needs your attention here.
+        <h3 className="text-sm font-bold text-text-primary">All clear</h3>
+        <p className="text-xs text-text-muted mt-1 max-w-xs">
+          No alerts right now. Anything that needs your attention will show up here.
         </p>
-
-        <div className="hairline w-full max-w-md my-7" />
-
-        <span className="text-[10px] font-semibold tracking-[0.15em] text-text-muted uppercase mb-4">What this feed monitors</span>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
-          {monitored.map((m) => {
-            const Icon = m.icon;
-            return (
-              <div key={m.label} className="flex items-start gap-3 text-left p-3.5 rounded-xl bg-bg-secondary/40 border border-bg-border">
-                <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-bg-panel shrink-0">
-                  <Icon className="w-4 h-4 text-text-secondary" />
-                </span>
-                <div>
-                  <p className="text-xs font-semibold text-text-primary">{m.label}</p>
-                  <p className="text-[11px] text-text-muted mt-0.5 leading-relaxed">{m.desc}</p>
-                </div>
-              </div>
-            );
-          })}
-        </div>
       </div>
     );
   }
