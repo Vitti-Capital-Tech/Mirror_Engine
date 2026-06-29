@@ -66,7 +66,7 @@ export function TradeLogTable({
 
   if (isLoading) {
     return (
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-6 h-96 animate-pulse flex flex-col justify-between">
+      <div className="card-premium p-6 h-96 animate-pulse flex flex-col justify-between">
         <div className="h-4 bg-bg-secondary rounded w-full mb-4"></div>
         <div className="flex-1 space-y-4">
           {[...Array(6)].map((_, i) => (
@@ -85,7 +85,7 @@ export function TradeLogTable({
 
   return (
     <div className="space-y-4">
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-6">
+      <div className="card-premium p-6">
         <div className="overflow-x-auto">
           {trades.length === 0 ? (
             <div className="py-12 text-center text-text-muted text-xs select-none">

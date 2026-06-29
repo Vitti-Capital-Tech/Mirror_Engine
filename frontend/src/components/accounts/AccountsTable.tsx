@@ -47,7 +47,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
 
   if (isLoading) {
     return (
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-6 h-64 animate-pulse flex flex-col justify-between">
+      <div className="card-premium p-6 h-64 animate-pulse flex flex-col justify-between">
         <div className="h-4 bg-bg-secondary rounded w-full mb-4"></div>
         <div className="flex-1 space-y-4">
           {[...Array(4)].map((_, i) => (
@@ -137,7 +137,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
     }
 
     return (
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-5 overflow-x-auto">
+      <div className="card-premium p-5 overflow-x-auto">
         <table className="w-full text-left text-xs border-collapse">
           <thead>
             <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">

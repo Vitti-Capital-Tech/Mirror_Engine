@@ -58,7 +58,7 @@ export function SlippageChart({ trades = [] }: { trades?: any[] }) {
   };
 
   return (
-    <div className="bg-bg-panel border border-bg-border rounded-xl p-6 h-[320px] flex flex-col justify-between">
+    <div className="card-premium p-6 h-[320px] flex flex-col justify-between">
       <div className="flex items-center justify-between mb-4 select-none">
         <div>
           <h3 className="text-sm font-semibold text-text-primary">Average Copy Slippage</h3>

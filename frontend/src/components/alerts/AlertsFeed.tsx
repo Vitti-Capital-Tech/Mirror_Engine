@@ -10,7 +10,7 @@ export function AlertsFeed({ alerts = [], isLoading }: { alerts?: any[]; isLoadi
     return (
       <div className="space-y-4 select-none">
         {[...Array(3)].map((_, i) => (
-          <div key={i} className="bg-bg-panel border border-bg-border rounded-xl p-5 h-24 animate-pulse flex flex-col justify-between">
+          <div key={i} className="card-premium p-5 h-24 animate-pulse flex flex-col justify-between">
             <div className="h-4 bg-bg-secondary rounded w-1/4"></div>
             <div className="h-4 bg-bg-secondary rounded w-3/4"></div>
           </div>
@@ -52,7 +52,7 @@ export function AlertsFeed({ alerts = [], isLoading }: { alerts?: any[]; isLoadi
   return (
     <div className="space-y-4">
       {alerts.length === 0 ? (
-        <div className="bg-bg-panel border border-bg-border rounded-xl p-8 text-center text-text-muted text-xs select-none">
+        <div className="card-premium p-8 text-center text-text-muted text-xs select-none">
           No system alerts logged. Everything is running smoothly.
         </div>
       ) : (

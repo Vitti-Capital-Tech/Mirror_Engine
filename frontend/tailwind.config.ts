@@ -15,6 +15,7 @@ const config: Config = {
           secondary: 'var(--bg-secondary)',
           panel: 'var(--bg-panel)',
           border: 'var(--bg-border)',
+          elevated: 'var(--bg-elevated)',
         },
         accent: {
           blue: '#3b82f6',

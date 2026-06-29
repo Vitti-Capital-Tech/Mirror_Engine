@@ -79,7 +79,7 @@ export default function PositionsPage() {
           const activePnL = accPositions.reduce((sum: number, p: any) => sum + Number(p.unrealized_pnl || 0), 0);
           
           return (
-            <div key={acc.id} className="bg-bg-panel border border-bg-border rounded-xl overflow-hidden shadow-md">
+            <div key={acc.id} className="card-premium overflow-hidden shadow-md">
               {/* Card Header */}
               <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-6 py-4">
                 <div className="flex items-center gap-3">

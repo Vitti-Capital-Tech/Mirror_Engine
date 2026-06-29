@@ -64,7 +64,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg-primary/80 backdrop-blur-sm p-4 select-none">
-      <div className="bg-bg-panel border border-bg-border rounded-xl w-full max-w-[500px] overflow-hidden shadow-2xl animate-slide-in">
+      <div className="card-premium w-full max-w-[500px] overflow-hidden shadow-2xl animate-slide-in">
         
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-bg-border">

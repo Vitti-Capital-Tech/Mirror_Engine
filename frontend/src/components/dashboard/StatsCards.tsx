@@ -34,7 +34,7 @@ export function StatsCards({ stats, isLoading }: { stats?: Stats; isLoading: boo
       subtitle: `${stats.active_accounts} active, ${stats.error_accounts} blocked`,
       icon: Users,
       color: 'text-blue-400',
-      glow: 'shadow-blue-500/5',
+      ring: 'bg-blue-500/10',
     },
     {
       title: 'Copy Success Rate',
@@ -42,7 +42,7 @@ export function StatsCards({ stats, isLoading }: { stats?: Stats; isLoading: boo
       subtitle: 'Target: >99%',
       icon: CheckCircle2,
       color: stats.success_rate_pct >= 95 ? 'text-emerald-400' : 'text-rose-400',
-      glow: stats.success_rate_pct >= 95 ? 'shadow-emerald-500/5' : 'shadow-rose-500/5',
+      ring: stats.success_rate_pct >= 95 ? 'bg-emerald-500/10' : 'bg-rose-500/10',
     },
     {
       title: 'Avg. Slippage',
@@ -50,7 +50,7 @@ export function StatsCards({ stats, isLoading }: { stats?: Stats; isLoading: boo
       subtitle: `Max: ${(stats.max_slippage_pct * 100).toFixed(4)}%`,
       icon: Zap,
       color: stats.avg_slippage_pct <= 0.0003 ? 'text-emerald-400' : 'text-rose-400',
-      glow: stats.avg_slippage_pct <= 0.0003 ? 'shadow-emerald-500/5' : 'shadow-rose-500/5',
+      ring: stats.avg_slippage_pct <= 0.0003 ? 'bg-emerald-500/10' : 'bg-rose-500/10',
     },
     {
       title: 'Today\'s Total PnL',
@@ -58,23 +58,25 @@ export function StatsCards({ stats, isLoading }: { stats?: Stats; isLoading: boo
       subtitle: 'Across all followers',
       icon: TrendingUp,
       color: stats.total_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400',
-      glow: stats.total_pnl >= 0 ? 'shadow-emerald-500/5' : 'shadow-rose-500/5',
+      ring: stats.total_pnl >= 0 ? 'bg-emerald-500/10' : 'bg-rose-500/10',
     },
   ];
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 select-none">
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 select-none">
       {cards.map((card, i) => {
         const Icon = card.icon;
         return (
-          <div key={i} className={`bg-bg-panel border border-bg-border rounded-xl p-6 shadow-md ${card.glow} flex flex-col justify-between transition-all duration-200 hover:border-[#3b82f6]/30`}>
+          <div key={i} className="card-premium card-hover p-5 flex flex-col justify-between">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">{card.title}</span>
-              <Icon className={`w-5 h-5 ${card.color}`} />
+              <span className="text-[11px] font-semibold text-text-muted uppercase tracking-[0.12em]">{card.title}</span>
+              <span className={`flex items-center justify-center w-9 h-9 rounded-xl ${card.ring}`}>
+                <Icon className={`w-[18px] h-[18px] ${card.color}`} />
+              </span>
             </div>
-            <div className="mt-3">
-              <span className={`text-2xl font-bold tracking-tight text-text-primary`}>{card.value}</span>
-              <p className="text-xs text-text-muted mt-1">{card.subtitle}</p>
+            <div className="mt-5">
+              <span className="text-[26px] leading-none font-bold tracking-tight text-text-primary font-mono">{card.value}</span>
+              <p className="text-xs text-text-muted mt-2">{card.subtitle}</p>
             </div>
           </div>
         );

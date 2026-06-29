@@ -43,17 +43,23 @@ export function TopBar() {
   const title = titles[pathname] || 'Mirror Engine';
 
   return (
-    <header className="h-16 border-b border-bg-border bg-bg-panel flex items-center justify-between px-6 select-none shrink-0">
-      <h1 className="text-lg font-semibold text-text-primary tracking-wide">{title}</h1>
-      
-      <div className="flex items-center gap-2">
+    <header className="h-16 border-b border-bg-border bg-bg-panel/70 backdrop-blur-xl flex items-center justify-between px-6 select-none shrink-0">
+      <div className="flex flex-col">
+        <h1 className="text-base font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
+        <span className="text-[11px] text-text-muted font-medium">Delta Exchange India · Copy Trading</span>
+      </div>
+
+      <div className="flex items-center gap-2.5">
         {/* Connection Status Indicator */}
-        <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold select-none mr-1.5 border ${
-          isConnected 
-            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-            : 'bg-red-500/10 text-red-400 border-red-500/20'
+        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-bold tracking-wide select-none border transition-colors ${
+          isConnected
+            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/25 shadow-[0_0_16px_-4px_rgba(16,185,129,0.4)]'
+            : 'bg-red-500/10 text-red-400 border-red-500/25'
         }`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
+          <span className="relative flex h-2 w-2">
+            {isConnected && <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping" />}
+            <span className={`relative inline-flex h-2 w-2 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-red-400'}`} />
+          </span>
           {isConnected ? 'LIVE' : 'DISCONNECTED'}
         </div>
 

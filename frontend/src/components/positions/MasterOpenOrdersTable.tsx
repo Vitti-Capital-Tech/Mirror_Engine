@@ -15,7 +15,7 @@ export interface OpenOrder {
 export function MasterOpenOrdersTable({ orders = [], isLoading }: { orders?: OpenOrder[]; isLoading: boolean }) {
   if (isLoading) {
     return (
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-6 h-48 animate-pulse flex flex-col justify-between">
+      <div className="card-premium p-6 h-48 animate-pulse flex flex-col justify-between">
         <div className="h-4 bg-bg-secondary rounded w-full mb-4"></div>
         <div className="flex-1 space-y-4">
           {[...Array(3)].map((_, i) => (
@@ -34,7 +34,7 @@ export function MasterOpenOrdersTable({ orders = [], isLoading }: { orders?: Ope
   }
 
   return (
-    <div className="bg-bg-panel border border-bg-border rounded-xl p-6">
+    <div className="card-premium p-6">
       <div className="overflow-x-auto">
         {orders.length === 0 ? (
           <div className="py-8 text-center text-text-muted text-xs select-none">

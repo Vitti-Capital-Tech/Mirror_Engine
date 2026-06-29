@@ -5,7 +5,7 @@ import { ArrowUpRight, ArrowDownRight } from 'lucide-react';
 export function RecentTrades({ trades = [], isLoading }: { trades?: any[]; isLoading: boolean }) {
   if (isLoading) {
     return (
-      <div className="bg-bg-panel border border-bg-border rounded-xl p-6 h-[400px] animate-pulse flex flex-col justify-between">
+      <div className="card-premium p-6 h-[400px] animate-pulse flex flex-col justify-between">
         <div className="h-4 bg-bg-secondary rounded w-1/4 mb-4"></div>
         <div className="flex-1 space-y-4">
           {[...Array(6)].map((_, i) => (
@@ -48,7 +48,7 @@ export function RecentTrades({ trades = [], isLoading }: { trades?: any[]; isLoa
   };
 
   return (
-    <div className="bg-bg-panel border border-bg-border rounded-xl p-6 flex flex-col h-[400px]">
+    <div className="card-premium p-6 flex flex-col h-[400px]">
       <div className="flex items-center justify-between mb-4 select-none">
         <h3 className="text-sm font-semibold text-text-primary">Recent Copy Executions</h3>
         <span className="text-[10px] text-text-muted font-bold uppercase tracking-wider">Last 10 trades</span>

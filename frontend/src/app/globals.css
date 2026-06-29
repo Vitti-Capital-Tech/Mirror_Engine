@@ -3,27 +3,36 @@
 @tailwind utilities;
 
 :root {
-  /* Light Mode Variables */
-  --bg-primary: #f8fafc;
-  --bg-secondary: #f1f5f9;
+  /* Light Mode */
+  --bg-primary: #f6f8fb;
+  --bg-secondary: #eef1f6;
   --bg-panel: #ffffff;
-  --bg-border: #e2e8f0;
-  
-  --text-primary: #0f172a;
+  --bg-border: #e3e8f0;
+  --bg-elevated: #ffffff;
+
+  --text-primary: #0b1220;
   --text-secondary: #475569;
   --text-muted: #94a3b8;
+
+  --accent: #2563eb;
+  --shadow-color: 220 40% 60%;
 }
 
 .dark {
-  /* Dark Mode Variables (Default) */
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #111118;
-  --bg-panel: #16161f;
-  --bg-border: #1e1e2e;
-  
-  --text-primary: #e2e8f0;
-  --text-secondary: #94a3b8;
-  --text-muted: #475569;
+  /* Dark Mode (default) — deep, blue-tinted, premium */
+  --bg-primary: #07090f;
+  --bg-secondary: #0c0f17;
+  --bg-panel: #11141d;
+  --bg-border: #20263400;
+  --bg-border: #212838;
+  --bg-elevated: #161a25;
+
+  --text-primary: #e8ecf5;
+  --text-secondary: #97a1b6;
+  --text-muted: #5b667d;
+
+  --accent: #3b82f6;
+  --shadow-color: 220 60% 2%;
 }
 
 * {
@@ -32,44 +41,98 @@
   padding: 0;
 }
 
+html, body {
+  height: 100%;
+}
+
 body {
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: 'Inter', -apple-system, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  transition: background-color 0.2s ease, color 0.2s ease;
+  letter-spacing: -0.01em;
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
-/* Custom premium scrollbars */
+/* Subtle ambient glow on the dark background for depth */
+.dark body {
+  background-image:
+    radial-gradient(900px circle at 12% -5%, rgba(59, 130, 246, 0.06), transparent 55%),
+    radial-gradient(800px circle at 100% 0%, rgba(139, 92, 246, 0.05), transparent 50%);
+  background-attachment: fixed;
+}
+
+/* Tabular figures for all monospaced numeric data */
+.font-mono {
+  font-feature-settings: "tnum" 1, "zero" 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Premium scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
-::-webkit-scrollbar-track { 
-  background: var(--bg-secondary); 
+::-webkit-scrollbar-track {
+  background: transparent;
 }
-::-webkit-scrollbar-thumb { 
-  background: var(--bg-border); 
-  border-radius: 3px; 
+::-webkit-scrollbar-thumb {
+  background: var(--bg-border);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { 
-  background: #3b82f6; 
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4458;
+  background-clip: padding-box;
 }
 
-/* Neon glow classes */
-.glow-blue { 
-  box-shadow: 0 0 20px rgba(59, 130, 246, 0.15); 
+/* Text selection */
+::selection {
+  background: rgba(59, 130, 246, 0.28);
+  color: #fff;
 }
-.glow-green { 
-  box-shadow: 0 0 20px rgba(16, 185, 129, 0.15); 
+
+/* ----- Reusable premium component classes ----- */
+@layer components {
+  /* Elevated glass panel with depth */
+  .card-premium {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 120px),
+      var(--bg-panel);
+    border: 1px solid var(--bg-border);
+    border-radius: 0.875rem;
+    box-shadow:
+      0 1px 0 0 rgba(255, 255, 255, 0.03) inset,
+      0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  }
+
+  .card-hover {
+    transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+  }
+  .card-hover:hover {
+    border-color: #2d3650;
+    box-shadow: 0 12px 30px -14px rgba(0, 0, 0, 0.7);
+  }
+
+  /* Gradient hairline divider */
+  .hairline {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--bg-border) 20%, var(--bg-border) 80%, transparent);
+  }
 }
-.glow-red { 
-  box-shadow: 0 0 20px rgba(239, 68, 68, 0.15); 
-}
-.glow-yellow { 
-  box-shadow: 0 0 20px rgba(245, 158, 11, 0.15); 
-}
-.glow-purple { 
-  box-shadow: 0 0 20px rgba(139, 92, 246, 0.15); 
+
+/* Neon glow accents (kept, slightly refined) */
+.glow-blue { box-shadow: 0 0 24px rgba(59, 130, 246, 0.18); }
+.glow-green { box-shadow: 0 0 24px rgba(16, 185, 129, 0.18); }
+.glow-red { box-shadow: 0 0 24px rgba(239, 68, 68, 0.18); }
+.glow-yellow { box-shadow: 0 0 24px rgba(245, 158, 11, 0.18); }
+.glow-purple { box-shadow: 0 0 24px rgba(139, 92, 246, 0.18); }
+
+/* Smooth global focus ring */
+:focus-visible {
+  outline: 2px solid rgba(59, 130, 246, 0.6);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
