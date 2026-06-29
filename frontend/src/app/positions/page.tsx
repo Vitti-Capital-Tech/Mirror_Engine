@@ -89,13 +89,6 @@ export default function PositionsPage() {
               <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-6 py-4">
                 <div className="flex items-center gap-3">
                   <h3 className="font-bold text-text-primary text-sm uppercase tracking-wide">{acc.name}</h3>
-                  <span className={`px-2 py-0.5 rounded text-[9px] font-bold ${
-                    acc.is_master 
-                      ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' 
-                      : 'bg-purple-500/10 text-purple-400 border border-purple-500/20'
-                  }`}>
-                    {acc.is_master ? 'MASTER' : 'FOLLOWER'}
-                  </span>
                 </div>
                 
                 <div className="flex items-center gap-6 font-mono text-xs font-bold">
@@ -246,10 +239,7 @@ export default function PositionsPage() {
           <div className="space-y-10">
             {/* Master section */}
             <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="h-1.5 w-1.5 rounded-full bg-blue-400" />
-                <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h3>
-              </div>
+              <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h3>
               {masterAccts.length > 0 ? (
                 <div className="space-y-6">{masterAccts.map(renderCard)}</div>
               ) : (
@@ -261,12 +251,9 @@ export default function PositionsPage() {
 
             {/* Followers section */}
             <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="h-1.5 w-1.5 rounded-full bg-purple-400" />
-                <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">
-                  Follower Accounts ({followerAccts.length})
-                </h3>
-              </div>
+              <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">
+                Follower Accounts ({followerAccts.length})
+              </h3>
               {followerAccts.length > 0 ? (
                 <div className="space-y-6">{followerAccts.map(renderCard)}</div>
               ) : (

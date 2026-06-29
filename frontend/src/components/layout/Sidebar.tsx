@@ -8,9 +8,8 @@ export function Sidebar() {
   const [isCollapsed, setIsCollapsed] = React.useState(false);
 
   const links = [
-    { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-    { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/positions', label: 'Positions', icon: Activity },
+    { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/trades', label: 'Trades Log', icon: FileText },
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
   ];
