@@ -49,20 +49,29 @@ class TradeListener:
         """
         try:
             logger.info(f"Master order update received: {order}")
-            
-            # Double check if it is filled
+
+            # Delta marks immediately-filled market/IOC orders as state 'closed'
+            # (the order's lifecycle is done) and resting limit fills as 'filled'.
+            # Both are genuine fills — the reliable signal is reason == 'fill'.
             state = order.get("state")
-            if state != "filled":
-                logger.debug(f"Ignoring order with state {state}")
+            reason = order.get("reason")
+            if reason != "fill" and state != "filled":
+                logger.debug(f"Ignoring order update (state={state}, reason={reason})")
                 return
 
             # Extract fields
             order_id = str(order.get("id"))
             symbol = order.get("product_symbol")
             side_str = order.get("side", "").lower()
-            size = float(order.get("size", 0))
-            # Average fill price (or fallback to limit price)
-            avg_price = float(order.get("avg_fill_price") or order.get("limit_price") or 0.0)
+            # Prefer the actually-filled size; fall back to ordered size.
+            size = float(order.get("filled_size") or order.get("size") or 0)
+            # Delta's field is 'average_fill_price' (not 'avg_fill_price').
+            avg_price = float(
+                order.get("average_fill_price")
+                or order.get("avg_fill_price")
+                or order.get("limit_price")
+                or 0.0
+            )
 
             if not order_id or not symbol or not side_str or size <= 0:
                 logger.error(f"Missing crucial fields in order fill payload: {order}")

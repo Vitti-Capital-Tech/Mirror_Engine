@@ -88,65 +88,28 @@ class OrderExecutor:
 
         for attempt in range(MAX_RETRIES + 1):
             try:
-                # 1. Place limit order at master's entry price first
-                logger.info(f"Placing limit order for {account_name} on {symbol} at price {master_price} for size {order_size}")
-                limit_response = await client.place_order(
+                # Place a single market order for the full size. A market order
+                # fills immediately and atomically, so the follower position
+                # exactly mirrors the master. (The previous limit-then-sweep
+                # approach could double-fill: if the limit filled at the same
+                # instant we tried to cancel it, the cancel 404'd, we misread
+                # the fill as 0, and fired a second market order — producing 2x
+                # the intended size.)
+                logger.info(f"Placing market order for {account_name} on {symbol} side={side.lower()} size={order_size}")
+                market_response = await client.place_order(
                     symbol=symbol,
                     side=side.lower(),
                     size=order_size,
-                    order_type='limit_order',
-                    limit_price=master_price
+                    order_type='market_order'
                 )
-                
-                order_id = limit_response.get("id") or limit_response.get("result", {}).get("id")
-                
+
+                order_id = market_response.get("id") or market_response.get("result", {}).get("id")
                 if order_id:
-                    # Wait 100ms for limit order to fill
-                    await asyncio.sleep(0.10)
-                    
-                    # Fetch current order fill state
-                    order_status = await client.get_order(order_id)
-                    result_data = order_status.get("result", order_status)
-                    state = result_data.get("state")
-                    filled_size = int(result_data.get("filled_size", 0))
-                    
-                    if state == "filled":
-                        logger.info(f"Limit order {order_id} fully filled at {master_price}")
-                        order_success = True
-                        order_response = order_status
-                        break
-                    else:
-                        # Cancel partial limit order
-                        logger.warning(f"Limit order {order_id} is {state} (filled {filled_size}/{order_size}). Cancelling and sweeping remainder via market order.")
-                        try:
-                            await client.cancel_order(order_id)
-                        except Exception as ce:
-                            logger.warning(f"Limit cancel error (might have filled during cancel call): {ce}")
-                            
-                        # Confirm final filled size
-                        final_status = await client.get_order(order_id)
-                        final_result = final_status.get("result", final_status)
-                        final_filled = int(final_result.get("filled_size", 0))
-                        
-                        remaining_size = order_size - final_filled
-                        if remaining_size <= 0:
-                            logger.info(f"Limit order fully filled during cancellation.")
-                            order_success = True
-                            order_response = final_status
-                            break
-                        else:
-                            logger.info(f"Limit partially filled ({final_filled}/{order_size}). Punching market order for remainder {remaining_size}.")
-                            market_response = await client.place_order(
-                                symbol=symbol,
-                                side=side.lower(),
-                                size=remaining_size,
-                                order_type='market_order'
-                            )
-                            order_success = True
-                            order_response = market_response
-                            break
+                    order_success = True
+                    order_response = market_response
+                    break
                 else:
-                    last_error = f"Invalid API response on limit placement: {limit_response}"
+                    last_error = f"Invalid API response on market placement: {market_response}"
             except Exception as e:
                 last_error = str(e)
                 logger.warning(f"Attempt {attempt + 1} failed for {account_name} on {symbol}: {last_error}")
