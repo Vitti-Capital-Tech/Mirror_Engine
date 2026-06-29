@@ -36,19 +36,21 @@ def _format_live_position(account_id: str, account_name: str, pos: dict) -> dict
     entry_price = float(pos.get("entry_price") or 0.0)
     current_price = float(pos.get("mark_price") or pos.get("current_price") or entry_price)
 
-    # Use Delta's own unrealized_pnl — it is authoritative and matches the Delta UI.
-    # Only fall back to a manual estimate if the field is genuinely absent.
-    if pos.get("unrealized_pnl") is not None:
-        unrealized_pnl = float(pos.get("unrealized_pnl"))
+    # Mark-to-market PnL computed live from the mark price. This matches the
+    # value Delta's own web UI shows (its UPNL column). NOTE: Delta's API
+    # `unrealized_pnl` field is NOT the MTM PnL for options — it disagrees with
+    # the UI — so we deliberately do not use it.
+    # contract_value lives under the nested product spec (e.g. 0.001 for BTC options).
+    product = pos.get("product") or {}
+    multiplier = float(
+        product.get("contract_value")
+        or pos.get("contract_value")
+        or (0.001 if ("-C-" in symbol or "-P-" in symbol or symbol.startswith("C-") or symbol.startswith("P-")) else 1.0)
+    )
+    if side == "long":
+        unrealized_pnl = (current_price - entry_price) * qty * multiplier
     else:
-        multiplier = float(
-            pos.get("contract_value")
-            or (0.001 if ("-C-" in symbol or "-P-" in symbol or symbol.startswith("C-") or symbol.startswith("P-")) else 1.0)
-        )
-        if side == "long":
-            unrealized_pnl = (current_price - entry_price) * qty * multiplier
-        else:
-            unrealized_pnl = (entry_price - current_price) * qty * multiplier
+        unrealized_pnl = (entry_price - current_price) * qty * multiplier
 
     sl_price = float(pos.get("stop_loss_price")) if pos.get("stop_loss_price") else None
     tp_price = float(pos.get("take_profit_price")) if pos.get("take_profit_price") else None
