@@ -78,12 +78,7 @@ export default function PositionsPage() {
                   <span className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
                     {acc.name?.charAt(0)?.toUpperCase() || '?'}
                   </span>
-                  <div className="flex flex-col min-w-0">
-                    <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
-                    <span className="text-[10px] text-text-muted font-medium leading-tight">
-                      {accPositions.length} open position{accPositions.length === 1 ? '' : 's'}
-                    </span>
-                  </div>
+                  <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
                 </div>
                 
                 <div className="flex items-center gap-6 font-mono text-xs font-bold">
