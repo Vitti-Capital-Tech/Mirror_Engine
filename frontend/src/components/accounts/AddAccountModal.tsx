@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { useCreateAccount, useAccounts } from '@/hooks/useAccounts';
 import { X, Eye, EyeOff, ShieldCheck, RefreshCw } from 'lucide-react';
+import { Select } from '@/components/shared/Select';
 
 export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount();
@@ -146,26 +147,26 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
           <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-1.5">
               <label className="text-text-muted uppercase tracking-wider text-[10px]">Account Role</label>
-              <select
+              <Select
                 value={isMaster ? 'master' : 'follower'}
-                onChange={(e) => setIsMaster(e.target.value === 'master')}
-                className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
-              >
-                <option value="follower">Follower</option>
-                {!hasMaster && <option value="master">Master</option>}
-              </select>
+                onChange={(v) => setIsMaster(v === 'master')}
+                options={[
+                  { value: 'follower', label: 'Follower' },
+                  ...(!hasMaster ? [{ value: 'master', label: 'Master' }] : []),
+                ]}
+              />
             </div>
 
             <div className="flex flex-col gap-1.5">
               <label className="text-text-muted uppercase tracking-wider text-[10px]">Environment</label>
-              <select
+              <Select
                 value={environment}
-                onChange={(e) => setEnvironment(e.target.value as 'demo' | 'live')}
-                className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
-              >
-                <option value="demo">Demo (Testnet)</option>
-                <option value="live">Live (Production)</option>
-              </select>
+                onChange={(v) => setEnvironment(v as 'demo' | 'live')}
+                options={[
+                  { value: 'demo', label: 'Demo (Testnet)' },
+                  { value: 'live', label: 'Live (Production)' },
+                ]}
+              />
             </div>
           </div>
 
@@ -179,20 +180,19 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
               <div className="grid grid-cols-2 gap-3">
                 <div className={`flex flex-col gap-1.5 ${allocationMode === 'auto_ratio' ? 'col-span-2' : 'col-span-2 sm:col-span-1'}`}>
                   <label className="text-text-muted uppercase tracking-wider text-[9px]">Copy Mode</label>
-                  <select
+                  <Select
                     value={allocationMode}
-                    onChange={(e) => {
-                      const mode = e.target.value as any;
-                      setAllocationMode(mode);
+                    onChange={(mode) => {
+                      setAllocationMode(mode as any);
                       if (mode === 'auto_ratio') {
                         setAllocationValue('1.0'); // default fallback value
                       }
                     }}
-                    className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
-                  >
-                    <option value="auto_ratio">Auto Balance Ratio (Recommended)</option>
-                    <option value="multiplier">Multiplier (x Size)</option>
-                  </select>
+                    options={[
+                      { value: 'auto_ratio', label: 'Auto Balance Ratio (Recommended)' },
+                      { value: 'multiplier', label: 'Multiplier (x Size)' },
+                    ]}
+                  />
                   {allocationMode === 'auto_ratio' && (
                     <p className="text-[10px] text-text-muted font-normal leading-relaxed mt-0.5">
                       Sizes each copy by the follower-to-master balance ratio automatically.

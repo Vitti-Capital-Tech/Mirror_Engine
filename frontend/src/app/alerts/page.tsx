@@ -5,6 +5,7 @@ import { useAlerts, useClearAlerts } from '@/hooks/useAlerts';
 import { useSocket } from '@/hooks/useSocket';
 import { AlertsFeed } from '@/components/alerts/AlertsFeed';
 import { Trash2 } from 'lucide-react';
+import { Select } from '@/components/shared/Select';
 
 export default function AlertsPage() {
   const queryClient = useQueryClient();
@@ -49,17 +50,19 @@ export default function AlertsPage() {
       <div className="flex items-center justify-between border-b border-bg-border/50 pb-4 select-none">
         <div className="flex items-center gap-4">
           <h2 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">Alert Feed</h2>
-          <select
+          <Select
             value={level}
-            onChange={(e) => setLevel(e.target.value)}
-            className="bg-bg-panel border border-bg-border rounded-lg px-2.5 py-1.5 text-xs text-text-primary outline-none focus:border-blue-500 cursor-pointer"
-          >
-            <option value="">All Levels</option>
-            <option value="info">Info</option>
-            <option value="warning">Warning</option>
-            <option value="error">Error</option>
-            <option value="critical">Critical</option>
-          </select>
+            onChange={setLevel}
+            size="sm"
+            className="w-40"
+            options={[
+              { value: '', label: 'All Levels' },
+              { value: 'info', label: 'Info' },
+              { value: 'warning', label: 'Warning' },
+              { value: 'error', label: 'Error' },
+              { value: 'critical', label: 'Critical' },
+            ]}
+          />
         </div>
 
         {resolvedAlerts.length > 0 && (
