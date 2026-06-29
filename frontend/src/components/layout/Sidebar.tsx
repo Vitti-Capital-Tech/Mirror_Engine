@@ -49,15 +49,8 @@ export function Sidebar() {
         </button>
       )}
 
-      {/* Section label */}
-      {!isCollapsed && (
-        <div className="px-6 pt-6 pb-2">
-          <span className="text-[10px] font-semibold tracking-[0.15em] text-text-muted uppercase">Navigation</span>
-        </div>
-      )}
-
       {/* Nav links */}
-      <nav className={`flex-1 ${isCollapsed ? 'px-2 pt-4' : 'px-4 pt-1'} space-y-1`}>
+      <nav className={`flex-1 ${isCollapsed ? 'px-2 pt-6' : 'px-4 pt-6'} space-y-1`}>
         {links.map((link) => {
           const Icon = link.icon;
           const isActive = pathname === link.href;

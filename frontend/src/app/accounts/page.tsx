@@ -12,7 +12,7 @@ export default function AccountsPage() {
   const total = accounts.length;
   const active = accounts.filter(a => a.status === 'active').length;
   const paused = accounts.filter(a => a.status === 'paused').length;
-  const errors = accounts.filter(a => a.status === 'error' || a.status === 'circuit_break').length;
+  const followers = accounts.filter(a => !a.is_master).length;
 
   return (
     <div className="space-y-6">
@@ -30,14 +30,14 @@ export default function AccountsPage() {
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 select-none">
         {[
-          { label: 'Total Accounts', value: total, border: 'border-bg-border' },
-          { label: 'Active Sessions', value: active, border: 'border-bg-border', color: 'text-emerald-400' },
-          { label: 'Paused Copies', value: paused, border: 'border-bg-border', color: 'text-amber-400' },
-          { label: 'Circuit Broken', value: errors, border: 'border-bg-border', color: errors > 0 ? 'text-red-400' : 'text-text-muted' },
+          { label: 'Total Accounts', value: total, color: 'text-text-primary' },
+          { label: 'Active Sessions', value: active, color: 'text-emerald-400' },
+          { label: 'Paused', value: paused, color: 'text-text-secondary' },
+          { label: 'Followers', value: followers, color: 'text-blue-400' },
         ].map((item, i) => (
-          <div key={i} className={`bg-bg-panel border ${item.border} rounded-lg px-4 py-3 flex flex-col justify-between`}>
-            <span className="text-[10px] text-text-secondary uppercase font-bold tracking-wider">{item.label}</span>
-            <span className={`text-lg font-bold mt-1 ${item.color || 'text-text-primary'}`}>{isLoading ? '-' : item.value}</span>
+          <div key={i} className="card-premium px-4 py-3.5 flex flex-col gap-1">
+            <span className="text-[10px] text-text-muted uppercase font-semibold tracking-[0.12em]">{item.label}</span>
+            <span className={`text-xl font-bold font-mono ${item.color}`}>{isLoading ? '–' : item.value}</span>
           </div>
         ))}
       </div>

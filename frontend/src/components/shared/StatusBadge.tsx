@@ -3,26 +3,33 @@ import React from 'react';
 
 export function StatusBadge({ status }: { status: string }) {
   const normalized = status?.toLowerCase() || 'paused';
-  
-  let styles = 'bg-slate-500/10 text-slate-400 border-slate-500/20';
-  let label = status;
+
+  let dot = 'bg-slate-400';
+  let styles = 'bg-slate-500/10 text-slate-300 border-slate-500/20';
+  let label = 'Paused';
+  let pulse = false;
 
   if (normalized === 'active') {
-    styles = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
-    label = 'ACTIVE';
+    dot = 'bg-emerald-400';
+    styles = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20';
+    label = 'Active';
+    pulse = true;
   } else if (normalized === 'paused') {
-    styles = 'bg-amber-500/10 text-amber-400 border-amber-500/20';
-    label = 'PAUSED';
+    dot = 'bg-slate-400';
+    styles = 'bg-slate-500/10 text-slate-300 border-slate-500/20';
+    label = 'Paused';
   } else if (normalized === 'error') {
-    styles = 'bg-orange-500/10 text-orange-400 border-orange-500/20';
-    label = 'ERROR';
-  } else if (normalized === 'circuit_break') {
-    styles = 'bg-red-500/10 text-red-400 border-red-500/20 animate-pulse';
-    label = 'BLOCKED (CB)';
+    dot = 'bg-rose-400';
+    styles = 'bg-rose-500/10 text-rose-300 border-rose-500/20';
+    label = 'Error';
   }
 
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold border ${styles}`}>
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${styles}`}>
+      <span className="relative flex h-1.5 w-1.5">
+        {pulse && <span className={`absolute inline-flex h-full w-full rounded-full ${dot} opacity-60 animate-ping`} />}
+        <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${dot}`} />
+      </span>
       {label}
     </span>
   );

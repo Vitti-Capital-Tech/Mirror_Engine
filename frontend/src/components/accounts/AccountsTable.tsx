@@ -9,6 +9,7 @@ import {
   usePromoteAccount
 } from '@/hooks/useAccounts';
 import { StatusBadge } from '../shared/StatusBadge';
+import { Tooltip } from '../shared/Tooltip';
 import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw, Crown } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -158,9 +159,13 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
               return (
                 <tr key={acc.id} className="hover:bg-bg-secondary/20 transition-colors">
                   <td className="py-4 font-bold text-text-primary pl-1">{acc.name}</td>
-                  <td className="py-4 select-none font-bold">
-                    <span className={acc.environment === 'live' ? 'text-amber-400' : 'text-text-secondary'}>
-                      {acc.environment?.toUpperCase()}
+                  <td className="py-4 select-none">
+                    <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                      acc.environment === 'live'
+                        ? 'bg-blue-500/10 text-blue-300 border-blue-500/20'
+                        : 'bg-slate-500/10 text-slate-300 border-slate-500/20'
+                    }`}>
+                      {acc.environment === 'live' ? 'LIVE' : 'DEMO'}
                     </span>
                   </td>
                   {!isMasterTable && <td className="py-4 text-text-secondary">{getAllocationText(acc)}</td>}
@@ -173,72 +178,65 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                   <td className="py-4 pl-12 select-none">
                     <StatusBadge status={acc.status} />
                   </td>
-                  <td className="py-4 text-right space-x-2.5 whitespace-nowrap pr-2">
-                    {/* Test Connection */}
-                    <button
-                      onClick={() => handleTestConnection(acc.id)}
-                      disabled={isTesting}
-                      title="Test API Connection"
-                      className="p-2 bg-bg-secondary hover:bg-bg-border/60 hover:text-white text-text-secondary rounded-lg border border-bg-border shadow-sm transition-all duration-200 disabled:opacity-50 inline-flex items-center justify-center cursor-pointer"
-                    >
-                      {isTesting ? (
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <td className="py-4 pr-2 text-right">
+                    <div className="inline-flex items-center gap-0.5 rounded-xl border border-bg-border bg-bg-secondary/40 p-1">
+                      {/* Test Connection */}
+                      <Tooltip label="Test connection">
+                        <button
+                          onClick={() => handleTestConnection(acc.id)}
+                          disabled={isTesting}
+                          className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-blue-400 hover:bg-blue-500/10 transition-all duration-150 disabled:opacity-50 cursor-pointer"
+                        >
+                          {isTesting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
+                        </button>
+                      </Tooltip>
+
+                      {/* Pause / Resume */}
+                      {acc.status === 'active' ? (
+                        <Tooltip label="Pause copying">
+                          <button
+                            onClick={() => handlePause(acc.id, acc.name)}
+                            className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-amber-400 hover:bg-amber-500/10 transition-all duration-150 cursor-pointer"
+                          >
+                            <Pause className="w-4 h-4" />
+                          </button>
+                        </Tooltip>
                       ) : (
-                        <ShieldCheck className="w-3.5 h-3.5" />
+                        <Tooltip label="Resume copying">
+                          <button
+                            onClick={() => handleResume(acc.id, acc.name)}
+                            className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-emerald-400 hover:bg-emerald-500/10 transition-all duration-150 cursor-pointer"
+                          >
+                            <Play className="w-4 h-4" />
+                          </button>
+                        </Tooltip>
                       )}
-                    </button>
 
-                    {/* Pause / Resume */}
-                    {acc.status === 'active' ? (
-                      <button
-                        onClick={() => handlePause(acc.id, acc.name)}
-                        title="Pause Copying"
-                        className="p-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded-lg border border-amber-500/20 shadow-sm transition-all duration-200 inline-flex items-center justify-center cursor-pointer"
-                      >
-                        <Pause className="w-3.5 h-3.5" />
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleResume(acc.id, acc.name)}
-                        title="Resume Copying"
-                        disabled={acc.status === 'circuit_break'}
-                        className="p-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 rounded-lg border border-emerald-500/20 shadow-sm transition-all duration-200 disabled:opacity-30 disabled:hover:bg-emerald-500/10 inline-flex items-center justify-center cursor-pointer"
-                      >
-                        <Play className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                      {/* Promote follower to master */}
+                      {!isMasterTable && (
+                        <Tooltip label="Make master">
+                          <button
+                            onClick={() => handlePromote(acc.id, acc.name)}
+                            disabled={promoteAcc.isPending}
+                            className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-purple-400 hover:bg-purple-500/10 transition-all duration-150 disabled:opacity-40 cursor-pointer"
+                          >
+                            <Crown className="w-4 h-4" />
+                          </button>
+                        </Tooltip>
+                      )}
 
-                    {/* Reset failure counter */}
-                    {acc.status === 'circuit_break' && (
-                      <button
-                        onClick={() => resetAcc.mutate(acc.id)}
-                        title="Reset Circuit Breaker"
-                        className="p-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg border border-blue-500/20 shadow-sm transition-all duration-200 animate-pulse inline-flex items-center justify-center cursor-pointer"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                      <span className="w-px h-5 bg-bg-border mx-0.5" />
 
-                    {/* Promote follower to master */}
-                    {!isMasterTable && (
-                      <button
-                        onClick={() => handlePromote(acc.id, acc.name)}
-                        disabled={promoteAcc.isPending}
-                        title="Make Master Account"
-                        className="p-2 bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 rounded-lg border border-purple-500/20 shadow-sm transition-all duration-200 disabled:opacity-40 inline-flex items-center justify-center cursor-pointer"
-                      >
-                        <Crown className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-
-                    {/* Delete */}
-                    <button
-                      onClick={() => handleDelete(acc.id, acc.name)}
-                      title="Delete Account"
-                      className="p-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg border border-red-500/20 shadow-sm transition-all duration-200 inline-flex items-center justify-center cursor-pointer"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                      {/* Delete */}
+                      <Tooltip label="Delete account">
+                        <button
+                          onClick={() => handleDelete(acc.id, acc.name)}
+                          className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-red-400 hover:bg-red-500/10 transition-all duration-150 cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </Tooltip>
+                    </div>
                   </td>
                 </tr>
               );

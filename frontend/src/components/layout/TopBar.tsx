@@ -32,21 +32,24 @@ export function TopBar() {
     setTheme(nextTheme);
   };
 
-  const titles: Record<string, string> = {
-    '/': 'Trading Overview',
-    '/accounts': 'Accounts Management',
-    '/positions': 'Live Positions',
-    '/trades': 'Trade Audit Log',
-    '/alerts': 'System Alert Feed',
+  const meta: Record<string, { title: string; subtitle: string }> = {
+    '/': { title: 'Live Positions', subtitle: 'Real-time positions and orders mirrored from your master account' },
+    '/accounts': { title: 'Accounts', subtitle: 'Manage your master and follower exchange connections' },
+    '/positions': { title: 'Live Positions', subtitle: 'Real-time positions and orders mirrored from your master account' },
+    '/trades': { title: 'Trade Log', subtitle: 'Full audit trail of every copied trade and its fills' },
+    '/alerts': { title: 'Alerts', subtitle: 'Slippage, sync and connection events that need your attention' },
   };
 
-  const title = titles[pathname] || 'Mirror Engine';
+  const { title, subtitle } = meta[pathname] || { title: 'Mirror Engine', subtitle: 'Delta Exchange India · Copy Trading' };
 
   return (
     <header className="h-16 border-b border-bg-border bg-bg-panel/70 backdrop-blur-xl flex items-center justify-between px-6 select-none shrink-0">
-      <div className="flex flex-col">
-        <h1 className="text-base font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
-        <span className="text-[11px] text-text-muted font-medium">Delta Exchange India · Copy Trading</span>
+      <div className="flex items-center gap-3.5">
+        <span className="h-9 w-1 rounded-full bg-gradient-to-b from-blue-400 to-emerald-400" />
+        <div className="flex flex-col">
+          <h1 className="text-[17px] font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
+          <span className="text-[11px] text-text-muted font-medium leading-tight mt-0.5">{subtitle}</span>
+        </div>
       </div>
 
       <div className="flex items-center gap-2.5">
