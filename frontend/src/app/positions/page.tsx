@@ -78,7 +78,7 @@ export default function PositionsPage() {
                   <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
                     {acc.name?.charAt(0)?.toUpperCase() || '?'}
                     {acc.is_master && (
-                      <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm">
+                      <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm rotate-[18deg]">
                         <Crown className="w-2.5 h-2.5 text-[#1a1205]" fill="currentColor" />
                       </span>
                     )}

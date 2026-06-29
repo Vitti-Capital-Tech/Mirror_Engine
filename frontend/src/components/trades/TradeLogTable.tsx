@@ -153,7 +153,7 @@ export function TradeLogTable({
                       {/* Expanded follower copy details */}
                       {isExpanded && (
                         <tr>
-                          <td colSpan={9} className="bg-bg-primary/60 px-6 py-5 border-b border-bg-border/70">
+                          <td colSpan={9} className="bg-bg-primary/60 px-6 py-5 border-b border-white/[0.04]">
                             <div className="space-y-3">
                               <h4 className="text-[10px] text-text-muted font-bold uppercase tracking-[0.15em] select-none">
                                 Follower Execution Breakdown
