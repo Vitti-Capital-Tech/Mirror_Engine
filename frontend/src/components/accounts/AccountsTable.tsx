@@ -151,7 +151,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
               <th className="text-right py-3 pr-2">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-bg-border/50 font-medium">
+          <tbody className="divide-y divide-white/[0.04] font-medium">
             {list.map((acc) => {
               const isTesting = testingId === acc.id;
               const pnl = Number(acc.today_pnl || 0);

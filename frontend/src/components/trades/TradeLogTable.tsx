@@ -52,16 +52,11 @@ export function TradeLogTable({
 
   const getCopyStatusBadge = (status: string) => {
     const s = status?.toLowerCase();
-    if (s === 'filled') {
-      return <span className="text-emerald-400 font-bold">FILLED</span>;
-    }
-    if (s === 'skipped') {
-      return <span className="text-slate-400 font-bold">SKIPPED</span>;
-    }
-    if (s === 'retrying') {
-      return <span className="text-blue-400 font-bold animate-pulse">RETRYING</span>;
-    }
-    return <span className="text-red-400 font-bold">FAILED</span>;
+    const base = 'inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold';
+    if (s === 'filled') return <span className={`${base} bg-emerald-500/10 text-emerald-400`}>FILLED</span>;
+    if (s === 'skipped') return <span className={`${base} bg-slate-500/10 text-slate-300`}>SKIPPED</span>;
+    if (s === 'retrying') return <span className={`${base} bg-blue-500/10 text-blue-400`}>RETRYING</span>;
+    return <span className={`${base} bg-red-500/10 text-red-400`}>FAILED</span>;
   };
 
   if (isLoading) {
@@ -106,7 +101,7 @@ export function TradeLogTable({
                   <th className="text-center py-3">Chain Status</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-bg-border/50 font-medium">
+              <tbody className="divide-y divide-white/[0.04] font-medium">
                 {trades.map((trade) => {
                   const date = new Date(trade.created_at);
                   const dateStr = date.toLocaleString();
@@ -136,8 +131,21 @@ export function TradeLogTable({
                         <td className="text-text-secondary capitalize">{trade.trade_type?.replace('_', ' ')}</td>
                         <td className="text-right font-mono text-text-primary">{Number(trade.quantity).toFixed(0)}</td>
                         <td className="text-right font-mono text-text-primary">{Number(trade.entry_price).toFixed(2)}</td>
-                        <td className="text-center text-text-secondary font-mono">
-                          {filledCopiesCount} / {copies.length}
+                        <td className="text-center">
+                          <span
+                            title={`${filledCopiesCount} of ${copies.length} follower${copies.length === 1 ? '' : 's'} filled`}
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold font-mono ${
+                              copies.length === 0
+                                ? 'bg-bg-secondary text-text-muted'
+                                : filledCopiesCount === copies.length
+                                  ? 'bg-emerald-500/10 text-emerald-400'
+                                  : filledCopiesCount === 0
+                                    ? 'bg-red-500/10 text-red-400'
+                                    : 'bg-amber-500/10 text-amber-400'
+                            }`}
+                          >
+                            {filledCopiesCount}/{copies.length}
+                          </span>
                         </td>
                         <td className="text-center py-3.5">{getStatusBadge(trade.status)}</td>
                       </tr>
@@ -145,65 +153,63 @@ export function TradeLogTable({
                       {/* Expanded follower copy details */}
                       {isExpanded && (
                         <tr>
-                          <td colSpan={9} className="bg-[#0c0c12] p-4 border-t border-b border-bg-border/70">
-                            <div className="space-y-3 pl-8">
-                              <h4 className="text-[10px] text-blue-400 font-bold uppercase tracking-wider select-none">
+                          <td colSpan={9} className="bg-bg-primary/60 px-6 py-5 border-b border-bg-border/70">
+                            <div className="space-y-3">
+                              <h4 className="text-[10px] text-text-muted font-bold uppercase tracking-[0.15em] select-none">
                                 Follower Execution Breakdown
                               </h4>
-                              
+
                               {copies.length === 0 ? (
-                                <div className="text-text-muted italic text-[11px] py-1">
+                                <div className="text-text-muted italic text-[11px] py-3 px-4 rounded-lg border border-dashed border-bg-border">
                                   No follower copies were triggered for this trade.
                                 </div>
                               ) : (
-                                <table className="w-full text-left text-[11px] border-collapse bg-bg-secondary/70 border border-bg-border/80 rounded-lg overflow-hidden">
-                                  <thead>
-                                    <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[9px] bg-bg-panel/35 select-none">
-                                      <th className="py-2 pl-3">Follower Name</th>
-                                      <th className="text-right">Execution Price</th>
-                                      <th className="text-right">Slippage</th>
-                                      <th className="text-right">Latency</th>
-                                      <th>Status</th>
-                                      <th className="py-2 pl-3">Notes / Failure Reason</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody className="divide-y divide-bg-border/40 font-medium">
-                                    {copies.map((copy: any, index: number) => {
-                                      const slippagePct = Number(copy.slippage_pct || 0) * 100;
-                                      const isHighSlippage = slippagePct > 0.03;
-                                      
-                                      return (
-                                        <tr key={index} className="hover:bg-bg-panel/20 transition-colors">
-                                          <td className="py-2 pl-3 text-text-primary font-bold">{copy.account_name}</td>
-                                          <td className="text-right font-mono text-text-primary">
-                                            {copy.execution_price ? Number(copy.execution_price).toFixed(2) : '-'}
-                                          </td>
-                                          <td className={`text-right font-mono ${
-                                            copy.status !== 'filled' 
-                                              ? 'text-text-muted' 
-                                              : isHighSlippage 
-                                                ? 'text-red-400 font-bold flex items-center justify-end gap-1' 
-                                                : 'text-emerald-400'
-                                          }`}>
-                                            {copy.status === 'filled' ? (
-                                              <>
-                                                {isHighSlippage && <AlertTriangle className="w-3 h-3 text-red-400" />}
-                                                {slippagePct.toFixed(4)}%
-                                              </>
-                                            ) : '-'}
-                                          </td>
-                                          <td className="text-right font-mono text-text-secondary">
-                                            {copy.execution_time_ms ? `${copy.execution_time_ms}ms` : '-'}
-                                          </td>
-                                          <td className="select-none">{getCopyStatusBadge(copy.status)}</td>
-                                          <td className="py-2 pl-3 text-red-400 text-[10px] max-w-[200px] truncate">
-                                            {copy.failure_reason || '-'}
-                                          </td>
-                                        </tr>
-                                      );
-                                    })}
-                                  </tbody>
-                                </table>
+                                <div className="rounded-xl border border-bg-border overflow-hidden">
+                                  <table className="w-full text-left text-[11px] border-collapse">
+                                    <thead>
+                                      <tr className="text-text-muted uppercase font-bold text-[9px] bg-bg-secondary/60 select-none">
+                                        <th className="py-2.5 px-4">Follower</th>
+                                        <th className="text-right px-4">Exec Price</th>
+                                        <th className="text-right px-4">Slippage</th>
+                                        <th className="text-right px-4">Latency</th>
+                                        <th className="px-4">Status</th>
+                                        <th className="px-4">Notes</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-white/[0.04] font-medium">
+                                      {copies.map((copy: any, index: number) => {
+                                        const slippagePct = Number(copy.slippage_pct || 0) * 100;
+                                        const isHighSlippage = slippagePct > 0.03;
+
+                                        return (
+                                          <tr key={index} className="hover:bg-bg-secondary/30 transition-colors">
+                                            <td className="py-2.5 px-4 text-text-primary font-bold">{copy.account_name}</td>
+                                            <td className="text-right px-4 font-mono text-text-primary">
+                                              {copy.execution_price ? Number(copy.execution_price).toFixed(2) : '-'}
+                                            </td>
+                                            <td className="text-right px-4 font-mono">
+                                              {copy.status === 'filled' ? (
+                                                <span className={`inline-flex items-center justify-end gap-1 ${isHighSlippage ? 'text-red-400 font-bold' : 'text-emerald-400'}`}>
+                                                  {isHighSlippage && <AlertTriangle className="w-3 h-3" />}
+                                                  {slippagePct.toFixed(4)}%
+                                                </span>
+                                              ) : (
+                                                <span className="text-text-muted">-</span>
+                                              )}
+                                            </td>
+                                            <td className="text-right px-4 font-mono text-text-secondary">
+                                              {copy.execution_time_ms ? `${copy.execution_time_ms}ms` : '-'}
+                                            </td>
+                                            <td className="px-4 select-none">{getCopyStatusBadge(copy.status)}</td>
+                                            <td className="px-4 text-text-muted text-[10px] max-w-[200px] truncate">
+                                              {copy.failure_reason || '–'}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
                               )}
                             </div>
                           </td>

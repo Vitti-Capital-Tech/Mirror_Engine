@@ -2,7 +2,7 @@
 import React from 'react';
 import { usePathname } from 'next/navigation';
 import { useAlerts } from '@/hooks/useAlerts';
-import { Bell, Sun, Moon, AlertTriangle, ShieldAlert, Info, CheckCircle } from 'lucide-react';
+import { Bell, Sun, Moon, AlertTriangle, ShieldAlert, Info, CheckCircle, ArrowRight } from 'lucide-react';
 import Link from 'next/link';
 import { useSocket } from '@/hooks/useSocket';
 
@@ -65,10 +65,10 @@ export function TopBar() {
 
   const alertIcon = (level: string) => {
     const l = level?.toLowerCase();
-    if (l === 'critical') return { Icon: ShieldAlert, color: 'text-red-400' };
-    if (l === 'error') return { Icon: AlertTriangle, color: 'text-orange-400' };
-    if (l === 'warning') return { Icon: AlertTriangle, color: 'text-amber-400' };
-    return { Icon: Info, color: 'text-blue-400' };
+    if (l === 'critical') return { Icon: ShieldAlert, chip: 'bg-red-500/10 text-red-400', label: 'text-red-400', bar: 'bg-red-500' };
+    if (l === 'error') return { Icon: AlertTriangle, chip: 'bg-orange-500/10 text-orange-400', label: 'text-orange-400', bar: 'bg-orange-500' };
+    if (l === 'warning') return { Icon: AlertTriangle, chip: 'bg-amber-500/10 text-amber-400', label: 'text-amber-400', bar: 'bg-amber-500' };
+    return { Icon: Info, chip: 'bg-blue-500/10 text-blue-400', label: 'text-blue-400', bar: 'bg-blue-500' };
   };
 
   const toggleTheme = () => {
@@ -164,7 +164,7 @@ export function TopBar() {
               </div>
 
               {/* List */}
-              <div className="max-h-80 overflow-auto">
+              <div className="max-h-80 overflow-auto p-1.5 space-y-0.5">
                 {alerts.length === 0 ? (
                   <div className="flex flex-col items-center text-center py-10 px-4">
                     <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-emerald-500/10 mb-2">
@@ -175,22 +175,24 @@ export function TopBar() {
                   </div>
                 ) : (
                   alerts.slice(0, 6).map((a: any) => {
-                    const { Icon, color } = alertIcon(a.level);
+                    const { Icon, chip } = alertIcon(a.level);
                     const unread = !readIds.has(a.id);
                     return (
                       <button
                         key={a.id}
                         onClick={() => markRead(a.id)}
-                        className={`w-full text-left flex items-start gap-3 px-4 py-3 border-b border-bg-border/50 transition-colors ${
-                          unread ? 'bg-blue-500/[0.06] hover:bg-blue-500/10' : 'hover:bg-bg-secondary/40'
+                        className={`w-full text-left flex items-start gap-3 px-2.5 py-2.5 rounded-lg transition-colors ${
+                          unread ? 'bg-blue-500/[0.06] hover:bg-blue-500/[0.11]' : 'hover:bg-bg-secondary/50'
                         }`}
                       >
-                        <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${color}`} />
+                        <span className={`flex items-center justify-center w-8 h-8 rounded-lg shrink-0 ${chip}`}>
+                          <Icon className="w-4 h-4" />
+                        </span>
                         <div className="min-w-0 flex-1">
                           <p className={`text-[11px] leading-snug line-clamp-2 ${unread ? 'text-text-primary font-semibold' : 'text-text-secondary font-medium'}`}>{a.message}</p>
                           <span className="text-[10px] text-text-muted">{relTime(a.created_at)} ago{a.account_name ? ` · ${a.account_name}` : ''}</span>
                         </div>
-                        {unread && <span className="mt-1 h-2 w-2 rounded-full bg-blue-400 shrink-0" />}
+                        {unread && <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-blue-400 shrink-0" />}
                       </button>
                     );
                   })
@@ -201,9 +203,10 @@ export function TopBar() {
               <Link
                 href="/alerts"
                 onClick={() => setBellOpen(false)}
-                className="block text-center py-2.5 text-[11px] font-semibold text-blue-400 hover:bg-bg-secondary/40 border-t border-bg-border transition-colors"
+                className="group/link flex items-center justify-center gap-1.5 py-2.5 text-[11px] font-semibold text-blue-400 hover:bg-bg-secondary/40 border-t border-bg-border transition-colors"
               >
                 View all alerts
+                <ArrowRight className="w-3 h-3 transition-transform group-hover/link:translate-x-0.5" />
               </Link>
             </div>
           )}

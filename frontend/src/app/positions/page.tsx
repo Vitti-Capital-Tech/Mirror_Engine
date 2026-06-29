@@ -5,7 +5,7 @@ import { usePositions, useMasterOpenOrders } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
-import { RefreshCw, ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { RefreshCw, ArrowUpRight, ArrowDownRight, Crown } from 'lucide-react';
 
 export default function PositionsPage() {
   const queryClient = useQueryClient();
@@ -75,8 +75,13 @@ export default function PositionsPage() {
               {/* Card Header */}
               <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-6 py-4">
                 <div className="flex items-center gap-3 min-w-0">
-                  <span className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
+                  <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
                     {acc.name?.charAt(0)?.toUpperCase() || '?'}
+                    {acc.is_master && (
+                      <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm">
+                        <Crown className="w-2.5 h-2.5 text-[#1a1205]" fill="currentColor" />
+                      </span>
+                    )}
                   </span>
                   <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
                 </div>
@@ -122,7 +127,7 @@ export default function PositionsPage() {
                             <th className="text-right pr-4">Opened At</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-bg-border/30 font-medium">
+                        <tbody className="divide-y divide-white/[0.04] font-medium">
                           {accPositions.map((pos: any) => {
                             const isLong = pos.side?.toLowerCase() === 'long';
                             const pnl = Number(pos.unrealized_pnl || 0);
@@ -189,7 +194,7 @@ export default function PositionsPage() {
                               <th className="text-right pr-4">Trigger Price</th>
                             </tr>
                           </thead>
-                          <tbody className="divide-y divide-bg-border/30 font-medium">
+                          <tbody className="divide-y divide-white/[0.04] font-medium">
                             {accOrders.map((ord: any) => {
                               const isBuy = ord.side?.toLowerCase() === 'buy';
                               return (
