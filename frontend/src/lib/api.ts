@@ -1,5 +1,15 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+function buildQuery(params?: Record<string, any>): string {
+  if (!params) return '';
+  const clean: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') clean[k] = String(v);
+  }
+  const qs = new URLSearchParams(clean).toString();
+  return qs ? `?${qs}` : '';
+}
+
 async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -26,7 +36,7 @@ export const api = {
   },
   trades: {
     list: (params?: Record<string, any>) => {
-      const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+      const qs = buildQuery(params);
       return fetchAPI<any[]>(`/api/trades${qs}`);
     },
     getById: (id: string) => fetchAPI<any>(`/api/trades/${id}`),
@@ -41,7 +51,7 @@ export const api = {
   },
   alerts: {
     list: (params?: Record<string, any>) => {
-      const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+      const qs = buildQuery(params);
       return fetchAPI<any[]>(`/api/alerts${qs}`);
     },
     resolve: (id: string) => fetchAPI<any>(`/api/alerts/${id}/resolve`, { method: 'POST' }),

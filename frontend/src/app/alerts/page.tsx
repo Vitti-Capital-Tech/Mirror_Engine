@@ -11,7 +11,7 @@ export default function AlertsPage() {
   const queryClient = useQueryClient();
   const [level, setLevel] = useState<string>('');
   
-  const { data: alerts = [], isLoading } = useAlerts({ level: level || undefined });
+  const { data: alerts = [], isLoading } = useAlerts(level ? { level } : undefined);
   const clearAlerts = useClearAlerts();
   const { latestAlert } = useSocket();
 

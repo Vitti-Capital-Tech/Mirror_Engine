@@ -96,12 +96,9 @@ export function TopBar() {
 
   return (
     <header className="relative z-30 h-16 border-b border-bg-border bg-bg-panel/70 backdrop-blur-xl flex items-center justify-between px-6 select-none shrink-0">
-      <div className="flex items-center gap-3.5">
-        <span className="h-9 w-1 rounded-full bg-gradient-to-b from-blue-400 to-emerald-400" />
-        <div className="flex flex-col">
-          <h1 className="text-[17px] font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
-          <span className="text-[11px] text-text-muted font-medium leading-tight mt-0.5">{subtitle}</span>
-        </div>
+      <div className="flex flex-col">
+        <h1 className="text-[17px] font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
+        <span className="text-[11px] text-text-muted font-medium leading-tight mt-0.5">{subtitle}</span>
       </div>
 
       <div className="flex items-center gap-2.5">
