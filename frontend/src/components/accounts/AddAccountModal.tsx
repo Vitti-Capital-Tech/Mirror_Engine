@@ -177,7 +177,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div className="flex flex-col gap-1.5 col-span-2 sm:col-span-1">
+                <div className={`flex flex-col gap-1.5 ${allocationMode === 'auto_ratio' ? 'col-span-2' : 'col-span-2 sm:col-span-1'}`}>
                   <label className="text-text-muted uppercase tracking-wider text-[9px]">Copy Mode</label>
                   <select
                     value={allocationMode}
@@ -188,16 +188,21 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                         setAllocationValue('1.0'); // default fallback value
                       }
                     }}
-                    className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
+                    className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500 cursor-pointer"
                   >
                     <option value="auto_ratio">Auto Balance Ratio (Recommended)</option>
                     <option value="multiplier">Multiplier (x Size)</option>
                   </select>
+                  {allocationMode === 'auto_ratio' && (
+                    <p className="text-[10px] text-text-muted font-normal leading-relaxed mt-0.5">
+                      Sizes each copy by the follower-to-master balance ratio automatically.
+                    </p>
+                  )}
                 </div>
 
                 {allocationMode !== 'auto_ratio' && (
                   <div className="flex flex-col gap-1.5 col-span-2 sm:col-span-1 animate-slide-in">
-                    <label className="text-text-muted uppercase tracking-wider text-[9px]">Value</label>
+                    <label className="text-text-muted uppercase tracking-wider text-[9px]">Multiplier Value</label>
                     <input
                       type="number"
                       step="0.01"
@@ -205,7 +210,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                       required
                       value={allocationValue}
                       onChange={(e) => setAllocationValue(e.target.value)}
-                      className="bg-bg-primary border border-bg-border rounded-lg px-2.5 py-1.5 text-text-primary outline-none focus:border-blue-500"
+                      className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500"
                     />
                   </div>
                 )}

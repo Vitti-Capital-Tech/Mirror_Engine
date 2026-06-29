@@ -136,3 +136,23 @@ body {
   outline-offset: 2px;
   border-radius: 6px;
 }
+
+/* Native <select> styling — custom chevron + dark dropdown options */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8499' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 0.7rem center;
+  background-size: 0.9em;
+  padding-right: 2rem !important;
+}
+.dark select option {
+  background-color: #11141d;
+  color: #e8ecf5;
+}
+.dark select optgroup {
+  background-color: #11141d;
+  color: #97a1b6;
+}
