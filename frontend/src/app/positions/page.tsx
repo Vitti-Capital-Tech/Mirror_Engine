@@ -69,15 +69,20 @@ export default function PositionsPage() {
         </button>
       </div>
 
-      {/* Account Cards Loop */}
-      <div className="space-y-8">
-        {accounts.map((acc: any) => {
+      {/* Grouped account cards: master on top, active followers below.
+          Paused accounts are intentionally hidden from the positions view. */}
+      {(() => {
+        const visible = accounts.filter((a: any) => a.status !== 'paused');
+        const masterAccts = visible.filter((a: any) => a.is_master);
+        const followerAccts = visible.filter((a: any) => !a.is_master);
+
+        const renderCard = (acc: any) => {
           const accPositions = positions.filter((p: any) => p.account_id === acc.id);
           const accOrders = acc.is_master ? masterOrders : [];
-          
+
           // Calculate active PnL (sum of position unrealized pnl values)
           const activePnL = accPositions.reduce((sum: number, p: any) => sum + Number(p.unrealized_pnl || 0), 0);
-          
+
           return (
             <div key={acc.id} className="card-premium overflow-hidden shadow-md">
               {/* Card Header */}
@@ -235,8 +240,44 @@ export default function PositionsPage() {
               </div>
             </div>
           );
-        })}
-      </div>
+        };
+
+        return (
+          <div className="space-y-10">
+            {/* Master section */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="h-1.5 w-1.5 rounded-full bg-blue-400" />
+                <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h3>
+              </div>
+              {masterAccts.length > 0 ? (
+                <div className="space-y-6">{masterAccts.map(renderCard)}</div>
+              ) : (
+                <div className="card-premium py-6 text-center text-text-muted text-xs">
+                  No active master account.
+                </div>
+              )}
+            </div>
+
+            {/* Followers section */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="h-1.5 w-1.5 rounded-full bg-purple-400" />
+                <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">
+                  Follower Accounts ({followerAccts.length})
+                </h3>
+              </div>
+              {followerAccts.length > 0 ? (
+                <div className="space-y-6">{followerAccts.map(renderCard)}</div>
+              ) : (
+                <div className="card-premium py-6 text-center text-text-muted text-xs">
+                  No active follower accounts.
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
