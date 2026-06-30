@@ -289,6 +289,7 @@ async def get_master_open_orders():
                     "limit_price": float(order.get("limit_price")) if order.get("limit_price") else None,
                     "stop_price": float(order.get("stop_price")) if order.get("stop_price") else None,
                     "order_type": display_type,
+                    "trigger_method": order.get("stop_trigger_method"),  # mark_price / spot_price / etc.
                     "created_at": order.get("created_at")
                 })
             # Sort strictly: newest orders at the top, or sorted by ID for complete stability

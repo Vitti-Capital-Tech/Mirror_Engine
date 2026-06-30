@@ -191,12 +191,20 @@ export default function PositionsPage() {
                               <th>Type</th>
                               <th className="text-right">Quantity</th>
                               <th className="text-right">Limit Price</th>
-                              <th className="text-right pr-4">Trigger Price</th>
+                              <th className="text-right">Trigger Price</th>
+                              <th className="text-right pr-4">Trigger Index</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-white/[0.04] font-medium">
                             {accOrders.map((ord: any) => {
                               const isBuy = ord.side?.toLowerCase() === 'buy';
+                              const tm = (ord.trigger_method || '').toLowerCase();
+                              const triggerIndex = ord.stop_price
+                                ? (tm === 'mark_price' ? 'Mark Price'
+                                   : tm === 'spot_price' ? 'Index Price'
+                                   : tm === 'last_traded_price' ? 'Last Price'
+                                   : tm ? tm.replace(/_/g, ' ') : '-')
+                                : '-';
                               return (
                                 <tr key={ord.id} className="hover:bg-bg-secondary/10 transition-colors">
                                   <td className="py-2.5 font-bold text-text-primary">{ord.symbol}</td>
@@ -215,9 +223,10 @@ export default function PositionsPage() {
                                   <td className="text-right font-mono text-text-primary">
                                     {ord.limit_price ? Number(ord.limit_price).toFixed(2) : '-'}
                                   </td>
-                                  <td className="text-right font-mono text-text-secondary pr-4">
+                                  <td className="text-right font-mono text-text-secondary">
                                     {ord.stop_price ? Number(ord.stop_price).toFixed(2) : '-'}
                                   </td>
+                                  <td className="text-right text-text-secondary pr-4 capitalize">{triggerIndex}</td>
                                 </tr>
                               );
                             })}

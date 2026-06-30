@@ -230,8 +230,9 @@ class CopyEngine:
         ref_price = limit_price or stop_price or 0.0
         for follower in followers:
             follower["master_balance"] = master_balance
-            # reduce-only (SL/TP) orders ceil so they fully cover; entries floor.
-            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=reduce_only)
+            # Floor so the mirrored order quantity matches the follower's position
+            # (which was also floored on open). reduce_only caps it anyway.
+            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=False)
             client = await self._get_follower_client(follower)
             if not client:
                 continue
@@ -255,7 +256,8 @@ class CopyEngine:
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
             except Exception as e:
-                logger.error(f"Failed to mirror order to {follower['name']}: {e}")
+                body = getattr(getattr(e, "response", None), "text", "")
+                logger.error(f"Failed to mirror order to {follower['name']}: {e} {body}")
 
     async def _mirror_cancel(self, master_order_id: str) -> None:
         key = f"ordermap:{master_order_id}"
