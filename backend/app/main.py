@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 redis_client = None
 copy_engine = None
 redis_consumer_task = None
+order_consumer_task = None
 position_poller_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, copy_engine, redis_consumer_task, position_poller_task
+    global redis_client, copy_engine, redis_consumer_task, order_consumer_task, position_poller_task
     logger.info("Starting Copy Trading Backend...")
     
     # 1. Connect to Redis
@@ -76,9 +77,10 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Failed to start master trade listener: {e}")
                 
-    # 5. Start Redis Consumer for trade copying
+    # 5. Start Redis Consumers for trade copying + order mirroring
     redis_consumer_task = asyncio.create_task(redis_consumer())
-    logger.info("Background Redis consumer started. Copy trading engine is ready.")
+    order_consumer_task = asyncio.create_task(order_consumer())
+    logger.info("Background Redis consumers started. Copy trading engine is ready.")
 
     # 6. Trigger automatic sync of live positions on startup asynchronously
     async def startup_sync():
@@ -108,13 +110,20 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    if order_consumer_task:
+        order_consumer_task.cancel()
+        try:
+            await order_consumer_task
+        except asyncio.CancelledError:
+            pass
+
     if position_poller_task:
         position_poller_task.cancel()
         try:
             await position_poller_task
         except asyncio.CancelledError:
             pass
-            
+
     await trade_listener.stop()
     await connection_manager.disconnect_all()
     await redis_client.close()
@@ -135,6 +144,23 @@ async def redis_consumer():
             break
         except Exception as e:
             logger.error(f"Error in Redis consumer loop: {e}")
+            await asyncio.sleep(0.1)
+
+async def order_consumer():
+    """Background loop consuming master resting-order place/cancel events and
+    mirroring them onto followers via the CopyEngine."""
+    logger.info("Order mirror consumer loop started.")
+    while True:
+        try:
+            data = await redis_client.brpop("order_events", timeout=1)
+            if data:
+                _, raw_payload = data
+                event = json.loads(raw_payload)
+                await copy_engine.process_order_event(event)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in order consumer loop: {e}")
             await asyncio.sleep(0.1)
 
 async def position_poller():

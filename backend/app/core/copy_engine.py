@@ -178,6 +178,111 @@ class CopyEngine:
         await self.socket_manager.emit_trade_copy(trade_event_payload)
         logger.info(f"Completed trade copy chain. Status: {final_status}. Fills: {filled_count}/{len(followers)}")
 
+    async def _get_follower_client(self, follower: dict):
+        client = self.connection_manager.get_client(follower["id"])
+        if not client:
+            try:
+                client = await self.connection_manager.connect_account(follower)
+            except Exception as e:
+                logger.error(f"Failed to connect client for follower {follower['name']}: {e}")
+                return None
+        return client
+
+    async def process_order_event(self, event: dict) -> None:
+        """Mirror a master's resting order onto followers (place) or cancel the
+        mirrored follower orders (cancel)."""
+        action = event.get("action")
+        master_order_id = str(event.get("master_order_id"))
+        if action == "place":
+            await self._mirror_place(event, master_order_id)
+        elif action == "cancel":
+            await self._mirror_cancel(master_order_id)
+
+    async def _mirror_place(self, event: dict, master_order_id: str) -> None:
+        symbol = event.get("symbol")
+        side = event.get("side")
+        master_qty = float(event.get("size") or 0)
+        order_type = event.get("order_type") or "limit_order"
+        limit_price = float(event["limit_price"]) if event.get("limit_price") else None
+        stop_price = float(event["stop_price"]) if event.get("stop_price") else None
+        reduce_only = bool(event.get("reduce_only"))
+        if not symbol or not side or master_qty <= 0:
+            return
+
+        # Active followers
+        try:
+            followers = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active").execute().data or []
+        except Exception as e:
+            logger.error(f"Failed to query followers for order mirror: {e}")
+            return
+        if not followers:
+            return
+
+        # Master balance for the ratio
+        master_balance = 0.0
+        try:
+            m = self.db.table("accounts").select("available_margin, balance").eq("is_master", True).execute()
+            if m.data:
+                master_balance = float(m.data[0].get("available_margin") or m.data[0].get("balance") or 0.0)
+        except Exception:
+            pass
+
+        ref_price = limit_price or stop_price or 0.0
+        for follower in followers:
+            follower["master_balance"] = master_balance
+            # reduce-only (SL/TP) orders ceil so they fully cover; entries floor.
+            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=reduce_only)
+            client = await self._get_follower_client(follower)
+            if not client:
+                continue
+            try:
+                resp = await client.place_order(
+                    symbol=symbol,
+                    side=side,
+                    size=int(qty),
+                    order_type=order_type,
+                    limit_price=limit_price,
+                    reduce_only=reduce_only,
+                    stop_price=stop_price,
+                    stop_order_type=event.get("stop_order_type"),
+                    stop_trigger_method=event.get("stop_trigger_method"),
+                )
+                result = resp.get("result", resp)
+                follower_order_id = result.get("id")
+                if follower_order_id:
+                    # Map master order -> this follower's order, so we can cancel it later.
+                    await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
+                    await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
+                    logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
+            except Exception as e:
+                logger.error(f"Failed to mirror order to {follower['name']}: {e}")
+
+    async def _mirror_cancel(self, master_order_id: str) -> None:
+        key = f"ordermap:{master_order_id}"
+        try:
+            mapping = await self.redis.hgetall(key)
+        except Exception as e:
+            logger.error(f"Failed to read order map {key}: {e}")
+            return
+        if not mapping:
+            return
+        for follower_id, follower_order_id in mapping.items():
+            acc_res = self.db.table("accounts").select("*").eq("id", follower_id).execute()
+            if not acc_res.data:
+                continue
+            client = await self._get_follower_client(acc_res.data[0])
+            if not client:
+                continue
+            try:
+                await client.cancel_order(str(follower_order_id))
+                logger.info(f"Cancelled mirrored order {follower_order_id} for follower {follower_id}")
+            except Exception as e:
+                logger.warning(f"Failed to cancel mirrored order {follower_order_id}: {e}")
+        try:
+            await self.redis.delete(key)
+        except Exception:
+            pass
+
     async def handle_sl_tp(self, account_id: str, symbol: str, sl_price: float = None, tp_price: float = None) -> None:
         logger.info(f"Copying SL/TP order for follower {account_id} on {symbol}: SL={sl_price}, TP={tp_price}")
         client = self.connection_manager.get_client(account_id)

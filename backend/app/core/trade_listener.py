@@ -44,71 +44,97 @@ class TradeListener:
 
     async def on_order_fill(self, order: dict) -> None:
         """
-        Callback triggered when a master order state is 'filled'.
-        Parses the order and pushes a TradeEvent to Redis.
+        Master order lifecycle handler. Routes each event:
+          - market-order fill        -> copy as a market order (position/close)
+          - resting limit/stop placed -> mirror as a resting order on followers
+          - order cancelled           -> cancel the mirrored follower orders
+        Limit/stop *fills* are NOT copied again — their mirrored resting orders
+        fill on their own (avoids double fills).
         """
         try:
             logger.info(f"Master order update received: {order}")
 
-            # Delta marks immediately-filled market/IOC orders as state 'closed'
-            # (the order's lifecycle is done) and resting limit fills as 'filled'.
-            # Both are genuine fills — the reliable signal is reason == 'fill'.
-            state = order.get("state")
+            state = (order.get("state") or "").lower()
             reason = order.get("reason")
-            if reason != "fill" and state != "filled":
-                logger.debug(f"Ignoring order update (state={state}, reason={reason})")
+            action = (order.get("action") or "").lower()
+            order_type = order.get("order_type", "") or ""
+            is_stop = bool(order.get("stop_order_type") or order.get("stop_price"))
+
+            # ---- 1. Fills ----
+            if reason == "fill" or state == "filled":
+                # Only market (non-stop) fills are copied as market orders.
+                # Limit and stop orders were mirrored as resting orders that fill
+                # on their own, so we skip copying their fills.
+                if order_type == "market_order" and not is_stop:
+                    await self._push_fill_event(order)
+                else:
+                    logger.info("Skipping fill copy for resting %s (mirrored separately)", order_type)
                 return
 
-            # Extract fields
-            order_id = str(order.get("id"))
-            symbol = order.get("product_symbol")
-            side_str = order.get("side", "").lower()
-            # Prefer the actually-filled size; fall back to ordered size.
-            size = float(order.get("filled_size") or order.get("size") or 0)
-            # Delta's field is 'average_fill_price' (not 'avg_fill_price').
-            avg_price = float(
-                order.get("average_fill_price")
-                or order.get("avg_fill_price")
-                or order.get("limit_price")
-                or 0.0
-            )
-
-            if not order_id or not symbol or not side_str or size <= 0:
-                logger.error(f"Missing crucial fields in order fill payload: {order}")
+            # ---- 2. New resting order placed (limit / stop) ----
+            if action in ("create", "update") and state in ("open", "pending"):
+                if order_type == "limit_order" or is_stop:
+                    await self._push_order_event(order, "place")
                 return
 
-            # Map side
-            side = TradeSide.buy if side_str == "buy" else TradeSide.sell
-
-            # Map trade type
-            order_type = order.get("order_type", "")
-            reduce_only = order.get("reduce_only", False)
-            close_on_trigger = order.get("close_on_trigger", False)
-
-            trade_type = TradeType.entry
-            if reduce_only or close_on_trigger:
-                trade_type = TradeType.exit
-            if "stop" in order_type.lower():
-                trade_type = TradeType.sl
-
-            # Create TradeEvent
-            trade_event = TradeEvent(
-                master_trade_id=order_id,
-                symbol=symbol,
-                side=side,
-                quantity=size,
-                entry_price=avg_price,
-                trade_type=trade_type,
-                raw_payload=order
-            )
-
-            # Push to Redis
-            logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
-            event_data = trade_event.dict()
-            await self.redis.lpush("trade_events", json.dumps(event_data))
+            # ---- 3. Cancellation ----
+            if state in ("cancelled", "canceled") or (action == "delete" and reason != "fill"):
+                await self._push_order_event(order, "cancel")
+                return
 
         except Exception as e:
-            logger.error(f"Error handling master order fill callback: {e}", exc_info=True)
+            logger.error(f"Error handling master order event: {e}", exc_info=True)
+
+    async def _push_fill_event(self, order: dict) -> None:
+        """Push a filled market order to Redis for the copy engine."""
+        order_id = str(order.get("id"))
+        symbol = order.get("product_symbol")
+        side_str = order.get("side", "").lower()
+        size = float(order.get("filled_size") or order.get("size") or 0)
+        avg_price = float(
+            order.get("average_fill_price")
+            or order.get("avg_fill_price")
+            or order.get("limit_price")
+            or 0.0
+        )
+        if not order_id or not symbol or not side_str or size <= 0:
+            logger.error(f"Missing crucial fields in order fill payload: {order}")
+            return
+
+        side = TradeSide.buy if side_str == "buy" else TradeSide.sell
+        reduce_only = order.get("reduce_only", False)
+        close_on_trigger = order.get("close_on_trigger", False)
+        trade_type = TradeType.exit if (reduce_only or close_on_trigger) else TradeType.entry
+
+        trade_event = TradeEvent(
+            master_trade_id=order_id,
+            symbol=symbol,
+            side=side,
+            quantity=size,
+            entry_price=avg_price,
+            trade_type=trade_type,
+            raw_payload=order,
+        )
+        logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
+        await self.redis.lpush("trade_events", json.dumps(trade_event.dict()))
+
+    async def _push_order_event(self, order: dict, action: str) -> None:
+        """Push a resting-order place/cancel event to Redis for the copy engine."""
+        payload = {
+            "action": action,  # 'place' or 'cancel'
+            "master_order_id": str(order.get("id")),
+            "symbol": order.get("product_symbol"),
+            "side": (order.get("side") or "").lower(),
+            "size": float(order.get("size") or 0),
+            "order_type": order.get("order_type") or "limit_order",
+            "limit_price": order.get("limit_price"),
+            "stop_price": order.get("stop_price"),
+            "stop_order_type": order.get("stop_order_type"),
+            "stop_trigger_method": order.get("stop_trigger_method"),
+            "reduce_only": bool(order.get("reduce_only")),
+        }
+        logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")
+        await self.redis.lpush("order_events", json.dumps(payload))
 
     async def on_position_update(self, position_data: dict) -> None:
         logger.info(f"Master position update received: {position_data}")

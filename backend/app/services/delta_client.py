@@ -116,9 +116,16 @@ class DeltaClient:
         order_type: str = "market_order",
         limit_price: Optional[float] = None,
         reduce_only: bool = False,
+        stop_price: Optional[float] = None,
+        stop_order_type: Optional[str] = None,
+        stop_trigger_method: Optional[str] = None,
     ) -> dict:
-        """Place a market or limit order. reduce_only=True can only reduce/close
-        an existing position (never flips it)."""
+        """Place a market/limit order, optionally a stop (triggered) order.
+
+        reduce_only=True can only reduce/close an existing position (never flips).
+        Pass stop_price (+ optional stop_order_type/stop_trigger_method) to place
+        a stop / take-profit / bracket-style triggered order.
+        """
         path = "/v2/orders"
         body_dict: dict = {
             "product_symbol": symbol,
@@ -130,6 +137,10 @@ class DeltaClient:
             body_dict["limit_price"] = str(limit_price)
         if reduce_only:
             body_dict["reduce_only"] = True
+        if stop_price is not None:
+            body_dict["stop_price"] = str(stop_price)
+            body_dict["stop_order_type"] = stop_order_type or "stop_loss_order"
+            body_dict["stop_trigger_method"] = stop_trigger_method or "mark_price"
 
         body = json.dumps(body_dict)
         headers = self._get_headers("POST", path, body)
@@ -293,8 +304,9 @@ class DeltaClient:
 
         if msg_type == "orders":
             order = data.get("order", data)
-            state = order.get("state", "")
-            if state in ("filled", "closed") and self._on_fill:
+            # Forward every order lifecycle event (create/fill/cancel); the
+            # listener decides how to handle each.
+            if self._on_fill:
                 await self._on_fill(order)
 
         elif msg_type == "positions":
