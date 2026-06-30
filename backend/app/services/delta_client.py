@@ -164,15 +164,19 @@ class DeltaClient:
         product_id: int,
         stop_price: Optional[float] = None,
         limit_price: Optional[float] = None,
+        stop_trigger_method: Optional[str] = None,
     ) -> dict:
-        """Edit an existing order's trigger/limit price (PUT /v2/orders).
-        Used to mirror SL/TP price modifications without recreating the bracket."""
+        """Edit an existing order's trigger/limit price and trigger method
+        (PUT /v2/orders). Used to mirror SL/TP modifications in place — also
+        keeps the trigger reference (mark/index) in sync."""
         path = "/v2/orders"
         body_dict: dict = {"id": int(order_id), "product_id": int(product_id)}
         if stop_price is not None:
             body_dict["stop_price"] = str(stop_price)
         if limit_price is not None:
             body_dict["limit_price"] = str(limit_price)
+        if stop_trigger_method:
+            body_dict["stop_trigger_method"] = stop_trigger_method
         body = json.dumps(body_dict)
         headers = self._get_headers("PUT", path, body)
         resp = await self._client.put(f"{self.rest_url}{path}", headers=headers, content=body)

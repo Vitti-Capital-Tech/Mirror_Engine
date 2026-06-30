@@ -205,7 +205,7 @@ class CopyEngine:
         if action == "place":
             await self._mirror_place(event, master_order_id)
         elif action == "cancel":
-            await self._mirror_cancel(master_order_id)
+            await self._mirror_cancel(master_order_id, event)
 
     async def _mirror_place(self, event: dict, master_order_id: str) -> None:
         symbol = event.get("symbol")
@@ -282,7 +282,7 @@ class CopyEngine:
                     if is_update and existing_foid:
                         # Master EDITED the SL/TP price -> edit the follower's existing
                         # bracket order rather than creating a new one (which 400s).
-                        resp = await client.edit_order(existing_foid, product_id=product_id, stop_price=jittered_stop)
+                        resp = await client.edit_order(existing_foid, product_id=product_id, stop_price=jittered_stop, stop_trigger_method=trigger_method)
                         new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
                         if new_id and str(new_id) != str(existing_foid):
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
@@ -347,16 +347,51 @@ class CopyEngine:
                 body = getattr(getattr(e, "response", None), "text", "")
                 logger.error(f"Failed to mirror order to {follower['name']}: {e} {body}")
 
-    async def _mirror_cancel(self, master_order_id: str) -> None:
+    async def _find_follower_order(self, client, event: dict):
+        """Locate the follower's order matching a master order, for self-healing
+        cancels when the id map is missing/stale. Matches on product + leg, or
+        for plain orders on side + price."""
+        product_id = event.get("product_id")
+        stop_order_type = event.get("stop_order_type")
+        side = (event.get("side") or "").lower()
+        limit_price = event.get("limit_price")
+        orders = []
+        for st in ("pending", "open"):
+            try:
+                orders += await client.get_open_orders(state=st)
+            except Exception:
+                pass
+        for o in orders:
+            if str(o.get("product_id")) != str(product_id):
+                continue
+            if stop_order_type:
+                if o.get("stop_order_type") == stop_order_type:
+                    return str(o.get("id"))
+            else:
+                if (o.get("side") or "").lower() == side and not o.get("stop_order_type"):
+                    if limit_price is None or str(o.get("limit_price")) == str(limit_price):
+                        return str(o.get("id"))
+        return None
+
+    async def _mirror_cancel(self, master_order_id: str, event: dict | None = None) -> None:
         key = f"ordermap:{master_order_id}"
         try:
             mapping = await self.redis.hgetall(key)
         except Exception as e:
             logger.error(f"Failed to read order map {key}: {e}")
-            return
-        if not mapping:
-            return
-        for follower_id, follower_order_id in mapping.items():
+            mapping = {}
+
+        # Determine the set of followers to act on: mapped ones, plus (for
+        # self-heal) all active followers if we have no mapping.
+        targets = dict(mapping) if mapping else {}
+        if not targets and event:
+            try:
+                fols = self.db.table("accounts").select("id").eq("is_master", False).eq("status", "active").execute().data or []
+                targets = {f["id"]: None for f in fols}
+            except Exception:
+                targets = {}
+
+        for follower_id, follower_order_id in targets.items():
             acc_res = self.db.table("accounts").select("*").eq("id", follower_id).execute()
             if not acc_res.data:
                 continue
@@ -364,10 +399,25 @@ class CopyEngine:
             if not client:
                 continue
             try:
-                await client.cancel_order(str(follower_order_id))
-                logger.info(f"Cancelled mirrored order {follower_order_id} for follower {follower_id}")
+                if follower_order_id:
+                    await client.cancel_order(str(follower_order_id))
+                    logger.info(f"Cancelled mirrored order {follower_order_id} for follower {follower_id}")
+                else:
+                    raise RuntimeError("no mapped id")
             except Exception as e:
-                logger.warning(f"Failed to cancel mirrored order {follower_order_id}: {e}")
+                # Self-heal: find the matching order on the exchange and cancel it.
+                if event:
+                    try:
+                        foid = await self._find_follower_order(client, event)
+                        if foid:
+                            await client.cancel_order(foid)
+                            logger.info(f"Self-healed cancel: cancelled {foid} for follower {follower_id}")
+                        else:
+                            logger.warning(f"Cancel: no matching follower order found for {follower_id}")
+                    except Exception as e2:
+                        logger.warning(f"Failed self-heal cancel for {follower_id}: {e2}")
+                else:
+                    logger.warning(f"Failed to cancel mirrored order {follower_order_id}: {e}")
         try:
             await self.redis.delete(key)
         except Exception:
