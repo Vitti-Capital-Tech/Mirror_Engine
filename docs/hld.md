@@ -32,12 +32,14 @@ graph TD
     Frontend[Next.js Client Dashboard]
 
     %% Communications
-    MasterExchange -->|WebSocket Feed: Fills| Listener
-    Listener -->|Push Trade Event| Redis
+    MasterExchange -->|WebSocket: fills + order lifecycle| Listener
+    Listener -->|Market fills -> trade_events| Redis
+    Listener -->|Limit/stop place·edit·cancel -> order_events| Redis
     Redis -->|Subscribe / Pop Event| CopyEngine
     CopyEngine -->|1. Validate Size & Balance| Risk
     Risk -->|2. Parallel Executions| Executor
-    Executor -->|3. Market Orders| FollowerExchange
+    Executor -->|3. Market / reduce-only orders| FollowerExchange
+    CopyEngine -->|3b. Mirror limit & bracket orders| FollowerExchange
     Executor -->|4. Log Results & Slippage| DB
     
     API -->|Fetch Status / History| DB
@@ -73,7 +75,13 @@ The lifecycle of a copy trade execution consists of three phases:
 ### Phase 2: Copy & Risk Evaluation ($<35\text{ms}$)
 1. The **Copy Engine** (running parallel worker threads) pops the event from Redis.
 2. It queries active followers in Supabase and routes them to the **Risk Engine**.
-3. The **Risk Engine** validates follower margin balances and computes customized order sizes using the follower's allocation multiplier.
+3. The **Risk Engine** validates follower margin balances and computes customized order sizes using the follower's allocation mode:
+   * **Auto Balance Ratio** — `master_size × (follower_balance ÷ master_balance)`, floored on opens, ceiled on closes.
+   * **Multiplier** — a fixed scale of the master size.
+   * An optional per-account **allocated balance** overrides the real balance for this ratio (useful for testing across very different balances).
+
+### Phase 2b: Order Mirroring (non-fill events)
+Pending **limit** and **stop / SL / TP (bracket)** orders the master places, edits or cancels are routed through a separate `order_events` queue. The Copy Engine mirrors them onto followers — placing limit orders, attaching brackets via Delta's bracket endpoint (with the master's Mark/Index trigger), editing in place on price/trigger changes, and cancelling (with a self-heal lookup if the id map is stale). A master→follower order-id map is kept in Redis. Each follower's SL/TP trigger is jittered by ±(10–50) so they don't all fire simultaneously.
 
 ### Phase 3: Parallel Execution & Logging ($<150\text{ms}$)
 1. The **Order Executor** converts the allocation into direct REST market orders on Delta Exchange.
