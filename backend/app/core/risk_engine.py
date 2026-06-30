@@ -122,7 +122,8 @@ class RiskEngine:
         else:
             qty = master_quantity  # fallback: mirror exactly
 
-        result = max(1, int(round(qty)))  # minimum 1 lot
+        import math
+        result = max(1, math.floor(qty))  # floor (round down), minimum 1 lot
         max_pos: float | None = account.get("max_position_size")
         if max_pos is not None:
             result = min(result, int(max_pos))

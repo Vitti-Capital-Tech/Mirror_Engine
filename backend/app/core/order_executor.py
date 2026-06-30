@@ -72,8 +72,9 @@ class OrderExecutor:
         last_error = ""
         order_response = None
         
-        # Round quantity to integer for contract sizes
-        order_size = int(round(quantity))
+        # Floor quantity to whole contracts (round down, never up)
+        import math
+        order_size = int(math.floor(quantity))
         if order_size <= 0:
             db.table("trade_copies").update({
                 "status": "skipped",
