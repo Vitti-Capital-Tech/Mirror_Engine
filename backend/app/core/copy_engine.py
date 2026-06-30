@@ -381,6 +381,8 @@ class CopyEngine:
             logger.error(f"Failed to read order map {key}: {e}")
             mapping = {}
 
+        product_id = (event or {}).get("product_id")
+
         # Determine the set of followers to act on: mapped ones, plus (for
         # self-heal) all active followers if we have no mapping.
         targets = dict(mapping) if mapping else {}
@@ -400,7 +402,7 @@ class CopyEngine:
                 continue
             try:
                 if follower_order_id:
-                    await client.cancel_order(str(follower_order_id))
+                    await client.cancel_order(str(follower_order_id), product_id=product_id)
                     logger.info(f"Cancelled mirrored order {follower_order_id} for follower {follower_id}")
                 else:
                     raise RuntimeError("no mapped id")
@@ -410,7 +412,7 @@ class CopyEngine:
                     try:
                         foid = await self._find_follower_order(client, event)
                         if foid:
-                            await client.cancel_order(foid)
+                            await client.cancel_order(foid, product_id=product_id)
                             logger.info(f"Self-healed cancel: cancelled {foid} for follower {follower_id}")
                         else:
                             logger.warning(f"Cancel: no matching follower order found for {follower_id}")

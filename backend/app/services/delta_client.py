@@ -150,11 +150,18 @@ class DeltaClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order by order ID."""
-        path = f"/v2/orders/{order_id}"
-        headers = self._get_headers("DELETE", path)
-        resp = await self._client.delete(f"{self.rest_url}{path}", headers=headers)
+    async def cancel_order(self, order_id: str, product_id: Optional[int] = None) -> dict:
+        """Cancel an order. Delta India expects DELETE /v2/orders with a JSON
+        body {id, product_id} — the path form /v2/orders/{id} 404s."""
+        path = "/v2/orders"
+        body_dict: dict = {"id": int(order_id)}
+        if product_id is not None:
+            body_dict["product_id"] = int(product_id)
+        body = json.dumps(body_dict)
+        headers = self._get_headers("DELETE", path, body)
+        resp = await self._client.request(
+            "DELETE", f"{self.rest_url}{path}", headers=headers, content=body
+        )
         resp.raise_for_status()
         return resp.json()
 
