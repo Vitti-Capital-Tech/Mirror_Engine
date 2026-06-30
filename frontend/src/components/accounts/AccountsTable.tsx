@@ -10,7 +10,8 @@ import {
 } from '@/hooks/useAccounts';
 import { StatusBadge } from '../shared/StatusBadge';
 import { Tooltip } from '../shared/Tooltip';
-import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw, Crown } from 'lucide-react';
+import { EditAccountModal } from './EditAccountModal';
+import { Play, Pause, RotateCcw, Trash2, ShieldCheck, RefreshCw, Crown, Pencil } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 // A confirm dialog rendered as a toast (replaces window.confirm)
@@ -45,6 +46,7 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
   const promoteAcc = usePromoteAccount();
 
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [editingAccount, setEditingAccount] = useState<any | null>(null);
 
   if (isLoading) {
     return (
@@ -171,6 +173,11 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                   {!isMasterTable && <td className="py-4 text-text-secondary">{getAllocationText(acc)}</td>}
                   <td className="py-4 text-right pr-6 font-mono text-text-primary">
                     {acc.balance !== null ? `${Number(acc.balance).toFixed(2)} USDT` : '-'}
+                    {acc.allocated_balance != null && (
+                      <div className="text-[10px] text-blue-400 font-semibold mt-0.5">
+                        Alloc: {Number(acc.allocated_balance).toFixed(2)}
+                      </div>
+                    )}
                   </td>
                   <td className={`py-4 text-right pr-6 font-mono ${pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-text-secondary'}`}>
                     {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT
@@ -211,6 +218,16 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
                           </button>
                         </Tooltip>
                       )}
+
+                      {/* Edit settings */}
+                      <Tooltip label="Edit settings">
+                        <button
+                          onClick={() => setEditingAccount(acc)}
+                          className="flex items-center justify-center w-8 h-8 rounded-lg text-text-muted hover:text-sky-400 hover:bg-sky-500/10 transition-all duration-150 cursor-pointer"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                      </Tooltip>
 
                       {/* Promote follower to master */}
                       {!isMasterTable && (
@@ -264,6 +281,10 @@ export function AccountsTable({ accounts = [], isLoading }: { accounts?: any[]; 
         </h3>
         {renderTable(followers, false)}
       </div>
+
+      {editingAccount && (
+        <EditAccountModal account={editingAccount} onClose={() => setEditingAccount(null)} />
+      )}
     </div>
   );
 }

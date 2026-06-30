@@ -17,6 +17,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [environment, setEnvironment] = useState<'demo' | 'live'>('demo');
   const [allocationMode, setAllocationMode] = useState<'fixed' | 'multiplier' | 'capital_pct' | 'auto_ratio'>('auto_ratio');
   const [allocationValue, setAllocationValue] = useState<string>('1.0');
+  const [allocatedBalance, setAllocatedBalance] = useState<string>('');
   const [maxPositionSize, setMaxPositionSize] = useState<string>('');
   const [leverageLimit, setLeverageLimit] = useState<string>('');
 
@@ -44,6 +45,9 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
 
       if (leverageLimit) {
         payload.leverage_limit = parseInt(leverageLimit);
+      }
+      if (allocatedBalance) {
+        payload.allocated_balance = parseFloat(allocatedBalance);
       }
 
       if (!isMaster) {
@@ -168,6 +172,23 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                 ]}
               />
             </div>
+          </div>
+
+          {/* Allocated Balance (optional, used for ratio sizing) */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-text-muted uppercase tracking-wider text-[10px]">Allocated Balance (USD) — optional</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              placeholder="Leave blank to use real balance"
+              value={allocatedBalance}
+              onChange={(e) => setAllocatedBalance(e.target.value)}
+              className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
+            />
+            <p className="text-[10px] text-text-muted font-normal leading-relaxed">
+              Overrides the real balance when computing the copy ratio. e.g. set 60 on the master and 56 on the follower so 1 lot copies as ~1 lot.
+            </p>
           </div>
 
           {/* Allocation Config (Follower only) */}

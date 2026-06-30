@@ -31,6 +31,7 @@ class AccountCreate(BaseModel):
     environment: AccountEnvironment = Field(default=AccountEnvironment.demo)
     allocation_mode: Optional[AllocationMode] = None
     allocation_value: Optional[float] = Field(default=None, gt=0)
+    allocated_balance: Optional[float] = Field(default=None, gt=0)
     max_position_size: Optional[float] = Field(default=None, gt=0)
     leverage_limit: int = Field(default=10, ge=1, le=200)
 
@@ -43,6 +44,7 @@ class AccountUpdate(BaseModel):
     environment: Optional[AccountEnvironment] = None
     allocation_mode: Optional[AllocationMode] = None
     allocation_value: Optional[float] = Field(default=None, gt=0)
+    allocated_balance: Optional[float] = Field(default=None, gt=0)
     max_position_size: Optional[float] = Field(default=None, gt=0)
     leverage_limit: Optional[int] = Field(default=None, ge=1, le=200)
     status: Optional[AccountStatus] = None
@@ -57,6 +59,7 @@ class AccountResponse(BaseModel):
     status: AccountStatus
     allocation_mode: Optional[AllocationMode] = None
     allocation_value: Optional[float] = None
+    allocated_balance: Optional[float] = None
     max_position_size: Optional[float] = None
     leverage_limit: int
     consecutive_failures: int

@@ -111,9 +111,17 @@ class RiskEngine:
             qty = budget / notional_per_lot if notional_per_lot > 0 else 0
 
         elif allocation_mode == "auto_ratio":
-            # Dynamic balance ratio (follower balance / master balance)
+            # Dynamic balance ratio (follower balance / master balance).
+            # An explicit allocated_balance overrides the real balance for the
+            # ratio — lets you size copies as if the accounts were comparable
+            # (e.g. allocate 60 on a 4000-balance master to test 1-lot copies).
             master_balance = float(account.get("master_balance") or 0.0)
-            follower_balance = float(account.get("available_margin") or account.get("balance") or 0.0)
+            follower_balance = float(
+                account.get("allocated_balance")
+                or account.get("available_margin")
+                or account.get("balance")
+                or 0.0
+            )
             
             if master_balance > 0 and follower_balance > 0:
                 ratio = follower_balance / master_balance

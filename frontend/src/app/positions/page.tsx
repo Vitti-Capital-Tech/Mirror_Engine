@@ -100,6 +100,13 @@ export default function PositionsPage() {
                       {acc.balance !== null ? `${Number(acc.balance).toFixed(2)} USDT` : '-'}
                     </span>
                   </div>
+
+                  {acc.allocated_balance != null && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-text-muted text-[10px] uppercase font-semibold">Alloc:</span>
+                      <span className="text-blue-400">{Number(acc.allocated_balance).toFixed(2)} USDT</span>
+                    </div>
+                  )}
                 </div>
               </div>
 

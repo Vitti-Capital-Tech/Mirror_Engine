@@ -95,9 +95,9 @@ class CopyEngine:
         # 3. Create execution tasks for each follower
         master_balance = 0.0
         try:
-            master_acc = self.db.table("accounts").select("available_margin, balance").eq("is_master", True).execute()
+            master_acc = self.db.table("accounts").select("*").eq("is_master", True).execute()
             if master_acc.data:
-                master_balance = float(master_acc.data[0].get("available_margin") or master_acc.data[0].get("balance") or 0.0)
+                master_balance = float(master_acc.data[0].get("allocated_balance") or master_acc.data[0].get("available_margin") or master_acc.data[0].get("balance") or 0.0)
         except Exception as e:
             logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
 
@@ -221,9 +221,9 @@ class CopyEngine:
         # Master balance for the ratio
         master_balance = 0.0
         try:
-            m = self.db.table("accounts").select("available_margin, balance").eq("is_master", True).execute()
+            m = self.db.table("accounts").select("*").eq("is_master", True).execute()
             if m.data:
-                master_balance = float(m.data[0].get("available_margin") or m.data[0].get("balance") or 0.0)
+                master_balance = float(m.data[0].get("allocated_balance") or m.data[0].get("available_margin") or m.data[0].get("balance") or 0.0)
         except Exception:
             pass
 
