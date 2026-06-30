@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import random
 from typing import List, Dict, Any
 from app.database import db
 from app.websocket.socket_manager import socket_manager
@@ -178,6 +179,14 @@ class CopyEngine:
         await self.socket_manager.emit_trade_copy(trade_event_payload)
         logger.info(f"Completed trade copy chain. Status: {final_status}. Fills: {filled_count}/{len(followers)}")
 
+    @staticmethod
+    def _jitter_trigger(price):
+        """Offset an SL/TP trigger price by a random +/- (1..50) so multiple
+        followers don't all trigger at the exact same price/instant."""
+        if price is None:
+            return None
+        return round(float(price) + random.choice([-1, 1]) * random.randint(1, 50), 1)
+
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
         if not client:
@@ -246,14 +255,40 @@ class CopyEngine:
             # Bracket SL/TP attached to a position -> use the bracket endpoint.
             if is_bracket and product_id and stop_price is not None:
                 existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+                # Self-heal: if this is an edit but we have no mapped follower order
+                # (e.g. the bracket was created before id-tracking), find the
+                # follower's matching bracket order on the exchange.
+                if is_update and not existing_foid:
+                    try:
+                        orders = []
+                        for st in ("pending", "open"):
+                            try:
+                                orders += await client.get_open_orders(state=st)
+                            except Exception:
+                                pass
+                        match = next(
+                            (o for o in orders
+                             if str(o.get("product_id")) == str(product_id)
+                             and o.get("stop_order_type") == stop_order_type),
+                            None,
+                        )
+                        if match and match.get("id"):
+                            existing_foid = str(match["id"])
+                            await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], existing_foid)
+                    except Exception as e:
+                        logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
                 try:
+                    jittered_stop = self._jitter_trigger(stop_price)
                     if is_update and existing_foid:
                         # Master EDITED the SL/TP price -> edit the follower's existing
                         # bracket order rather than creating a new one (which 400s).
-                        await client.edit_order(existing_foid, product_id=product_id, stop_price=stop_price)
-                        logger.info(f"Updated bracket {master_order_id} ({stop_order_type}) -> {follower['name']} order {existing_foid} @ {stop_price}")
+                        resp = await client.edit_order(existing_foid, product_id=product_id, stop_price=jittered_stop)
+                        new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
+                        if new_id and str(new_id) != str(existing_foid):
+                            await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
+                        logger.info(f"Updated bracket {master_order_id} ({stop_order_type}) -> {follower['name']} order {new_id or existing_foid} @ {jittered_stop} (master {stop_price})")
                     else:
-                        leg = {"order_type": order_type, "stop_price": str(stop_price)}
+                        leg = {"order_type": order_type, "stop_price": str(jittered_stop)}
                         if order_type == "limit_order" and limit_price is not None:
                             leg["limit_price"] = str(limit_price)
                         sl = leg if stop_order_type == "stop_loss_order" else None
@@ -273,6 +308,22 @@ class CopyEngine:
                     logger.error(f"Failed to mirror bracket to {follower['name']}: {e} {body}")
                 continue
 
+            # Plain limit order: if the master EDITED it, edit the follower's
+            # existing order instead of placing a duplicate.
+            existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+            if is_update and existing_foid:
+                try:
+                    resp = await client.edit_order(existing_foid, product_id=product_id, limit_price=limit_price)
+                    # Delta edits can cancel-and-replace (new order id) — refresh the map.
+                    new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
+                    if new_id and str(new_id) != str(existing_foid):
+                        await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
+                    logger.info(f"Updated order {master_order_id} -> {follower['name']} order {new_id or existing_foid} @ {limit_price}")
+                except Exception as e:
+                    body = getattr(getattr(e, "response", None), "text", "")
+                    logger.error(f"Failed to update order for {follower['name']}: {e} {body}")
+                continue
+
             try:
                 resp = await client.place_order(
                     symbol=symbol,
@@ -288,7 +339,7 @@ class CopyEngine:
                 result = resp.get("result", resp)
                 follower_order_id = result.get("id")
                 if follower_order_id:
-                    # Map master order -> this follower's order, so we can cancel it later.
+                    # Map master order -> this follower's order, so we can cancel/edit it later.
                     await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")

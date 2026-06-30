@@ -236,9 +236,9 @@ class DeltaClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def get_open_orders(self) -> list:
-        """Fetch all active open orders."""
-        path = "/v2/orders?state=open"
+    async def get_open_orders(self, state: str = "open") -> list:
+        """Fetch active orders in the given state ('open' or 'pending')."""
+        path = f"/v2/orders?state={state}"
         headers = self._get_headers("GET", path)
         resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
         resp.raise_for_status()
