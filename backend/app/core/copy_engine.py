@@ -101,11 +101,15 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
 
+        # Closes (exit/sl) round up so reduce-only orders never leave a residual;
+        # opens floor so we never over-expose.
+        is_exit = trade_type in ("exit", "sl")
+
         tasks = []
         for follower in followers:
             # Inject master balance context
             follower["master_balance"] = master_balance
-            follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower)
+            follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=is_exit)
             
             client = self.connection_manager.get_client(follower["id"])
             if not client:

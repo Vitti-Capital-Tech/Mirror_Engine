@@ -82,11 +82,16 @@ class RiskEngine:
         master_quantity: float,
         master_price: float,
         account: dict,
+        round_up: bool = False,
     ) -> int:
         """
         Compute the order size for a follower account based on its allocation_mode.
 
         Returns the quantity as an integer (Delta Exchange uses integer lot sizes).
+
+        round_up=False (opens): floor the result so we never over-expose.
+        round_up=True (closes): ceil the result so a reduce-only close never
+        leaves a residual — combined with reduce_only it can't over-close.
         """
         allocation_mode: str = account.get("allocation_mode") or "multiplier"
         allocation_value: float = account.get("allocation_value") or 1.0
@@ -123,7 +128,10 @@ class RiskEngine:
             qty = master_quantity  # fallback: mirror exactly
 
         import math
-        result = max(1, math.floor(qty))  # floor (round down), minimum 1 lot
+        # Opens floor (never over-expose); closes ceil (never leave a residual,
+        # reduce_only caps it so it can't over-close).
+        rounded = math.ceil(qty) if round_up else math.floor(qty)
+        result = max(1, rounded)
         max_pos: float | None = account.get("max_position_size")
         if max_pos is not None:
             result = min(result, int(max_pos))
