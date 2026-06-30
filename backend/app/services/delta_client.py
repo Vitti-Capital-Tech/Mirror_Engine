@@ -115,8 +115,10 @@ class DeltaClient:
         size: int,
         order_type: str = "market_order",
         limit_price: Optional[float] = None,
+        reduce_only: bool = False,
     ) -> dict:
-        """Place a market or limit order."""
+        """Place a market or limit order. reduce_only=True can only reduce/close
+        an existing position (never flips it)."""
         path = "/v2/orders"
         body_dict: dict = {
             "product_symbol": symbol,
@@ -126,6 +128,8 @@ class DeltaClient:
         }
         if limit_price is not None and order_type == "limit_order":
             body_dict["limit_price"] = str(limit_price)
+        if reduce_only:
+            body_dict["reduce_only"] = True
 
         body = json.dumps(body_dict)
         headers = self._get_headers("POST", path, body)

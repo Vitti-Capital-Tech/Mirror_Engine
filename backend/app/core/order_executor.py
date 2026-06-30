@@ -87,6 +87,11 @@ class OrderExecutor:
                 "failure_reason": f"Quantity rounded to 0: {quantity}"
             }
 
+        # Exit/SL trades close an existing position — send them reduce-only so the
+        # follower can only reduce/close and never accidentally flip into an
+        # opposite position.
+        is_exit = trade_type in ("exit", "sl")
+
         for attempt in range(MAX_RETRIES + 1):
             try:
                 # Place a single market order for the full size. A market order
@@ -96,12 +101,13 @@ class OrderExecutor:
                 # instant we tried to cancel it, the cancel 404'd, we misread
                 # the fill as 0, and fired a second market order — producing 2x
                 # the intended size.)
-                logger.info(f"Placing market order for {account_name} on {symbol} side={side.lower()} size={order_size}")
+                logger.info(f"Placing market order for {account_name} on {symbol} side={side.lower()} size={order_size} reduce_only={is_exit}")
                 market_response = await client.place_order(
                     symbol=symbol,
                     side=side.lower(),
                     size=order_size,
-                    order_type='market_order'
+                    order_type='market_order',
+                    reduce_only=is_exit
                 )
 
                 order_id = market_response.get("id") or market_response.get("result", {}).get("id")
