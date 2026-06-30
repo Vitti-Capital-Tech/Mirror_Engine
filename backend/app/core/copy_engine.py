@@ -181,11 +181,12 @@ class CopyEngine:
 
     @staticmethod
     def _jitter_trigger(price):
-        """Offset an SL/TP trigger price by a random +/- (1..50) so multiple
-        followers don't all trigger at the exact same price/instant."""
+        """Offset an SL/TP trigger price by a random +/- (10..50) so multiple
+        followers don't all trigger at the exact same price/instant. The lower
+        bound is 10 so the offset is never negligibly small."""
         if price is None:
             return None
-        return round(float(price) + random.choice([-1, 1]) * random.randint(1, 50), 1)
+        return round(float(price) + random.choice([-1, 1]) * random.randint(10, 50), 1)
 
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
