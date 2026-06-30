@@ -158,6 +158,54 @@ class DeltaClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def edit_order(
+        self,
+        order_id: str,
+        product_id: int,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> dict:
+        """Edit an existing order's trigger/limit price (PUT /v2/orders).
+        Used to mirror SL/TP price modifications without recreating the bracket."""
+        path = "/v2/orders"
+        body_dict: dict = {"id": int(order_id), "product_id": int(product_id)}
+        if stop_price is not None:
+            body_dict["stop_price"] = str(stop_price)
+        if limit_price is not None:
+            body_dict["limit_price"] = str(limit_price)
+        body = json.dumps(body_dict)
+        headers = self._get_headers("PUT", path, body)
+        resp = await self._client.put(f"{self.rest_url}{path}", headers=headers, content=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def place_bracket(
+        self,
+        product_id: int,
+        stop_loss: Optional[dict] = None,
+        take_profit: Optional[dict] = None,
+        trigger_method: str = "mark_price",
+    ) -> dict:
+        """Attach a bracket (stop-loss / take-profit) to an existing position via
+        Delta's bracket endpoint. trigger_method is the reference price the stop
+        prices are evaluated against (mark_price / spot_price / last_traded_price)
+        and MUST match the original order — using the wrong one makes an
+        index-priced stop look already-triggered ('immediate execution')."""
+        path = "/v2/orders/bracket"
+        body_dict: dict = {
+            "product_id": int(product_id),
+            "bracket_stop_trigger_method": trigger_method,
+        }
+        if stop_loss:
+            body_dict["stop_loss_order"] = stop_loss
+        if take_profit:
+            body_dict["take_profit_order"] = take_profit
+        body = json.dumps(body_dict)
+        headers = self._get_headers("POST", path, body)
+        resp = await self._client.post(f"{self.rest_url}{path}", headers=headers, content=body)
+        resp.raise_for_status()
+        return resp.json()
+
     async def edit_bracket_order(
         self,
         order_id: str,

@@ -227,6 +227,12 @@ class CopyEngine:
         except Exception:
             pass
 
+        is_bracket = bool(event.get("is_bracket"))
+        is_update = bool(event.get("is_update"))
+        product_id = event.get("product_id")
+        stop_order_type = event.get("stop_order_type")
+        trigger_method = event.get("stop_trigger_method") or "mark_price"
+
         ref_price = limit_price or stop_price or 0.0
         for follower in followers:
             follower["master_balance"] = master_balance
@@ -236,6 +242,37 @@ class CopyEngine:
             client = await self._get_follower_client(follower)
             if not client:
                 continue
+
+            # Bracket SL/TP attached to a position -> use the bracket endpoint.
+            if is_bracket and product_id and stop_price is not None:
+                existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+                try:
+                    if is_update and existing_foid:
+                        # Master EDITED the SL/TP price -> edit the follower's existing
+                        # bracket order rather than creating a new one (which 400s).
+                        await client.edit_order(existing_foid, product_id=product_id, stop_price=stop_price)
+                        logger.info(f"Updated bracket {master_order_id} ({stop_order_type}) -> {follower['name']} order {existing_foid} @ {stop_price}")
+                    else:
+                        leg = {"order_type": order_type, "stop_price": str(stop_price)}
+                        if order_type == "limit_order" and limit_price is not None:
+                            leg["limit_price"] = str(limit_price)
+                        sl = leg if stop_order_type == "stop_loss_order" else None
+                        tp = leg if stop_order_type == "take_profit_order" else None
+                        resp = await client.place_bracket(
+                            product_id=product_id, stop_loss=sl, take_profit=tp, trigger_method=trigger_method
+                        )
+                        result = resp.get("result", resp) if isinstance(resp, dict) else {}
+                        leg_key = "stop_loss_order" if sl else "take_profit_order"
+                        foid = (result.get(leg_key) or {}).get("id") if isinstance(result, dict) else None
+                        if foid:
+                            await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(foid))
+                            await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
+                        logger.info(f"Mirrored bracket {master_order_id} ({stop_order_type}, trigger={trigger_method}) -> {follower['name']}")
+                except Exception as e:
+                    body = getattr(getattr(e, "response", None), "text", "")
+                    logger.error(f"Failed to mirror bracket to {follower['name']}: {e} {body}")
+                continue
+
             try:
                 resp = await client.place_order(
                     symbol=symbol,

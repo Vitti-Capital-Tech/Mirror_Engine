@@ -124,6 +124,7 @@ class TradeListener:
             "action": action,  # 'place' or 'cancel'
             "master_order_id": str(order.get("id")),
             "symbol": order.get("product_symbol"),
+            "product_id": order.get("product_id"),
             "side": (order.get("side") or "").lower(),
             "size": float(order.get("size") or 0),
             "order_type": order.get("order_type") or "limit_order",
@@ -132,6 +133,11 @@ class TradeListener:
             "stop_order_type": order.get("stop_order_type"),
             "stop_trigger_method": order.get("stop_trigger_method"),
             "reduce_only": bool(order.get("reduce_only")),
+            # A bracket order is an SL/TP attached to a position (set via the
+            # position TP/SL UI). These need Delta's bracket endpoint, not /v2/orders.
+            "is_bracket": bool(order.get("bracket_order")) or str((order.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL"),
+            # stop_update / action 'update' => the master EDITED an existing SL/TP.
+            "is_update": order.get("reason") == "stop_update" or order.get("action") == "update",
         }
         logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")
         await self.redis.lpush("order_events", json.dumps(payload))
