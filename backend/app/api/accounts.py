@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, status, Depends
 from app.database import db
 from app.models.account import AccountCreate, AccountUpdate, AccountResponse, AccountTestResult
 from app.core.connection_manager import connection_manager
-from app.core.trade_listener import trade_listener
+from app.core.trade_listener import listener_manager
 from app.core.position_monitor import position_monitor
 from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_account_or_404
 from app.services.delta_client import DeltaClient
@@ -14,16 +14,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
 async def start_account_ws(account: dict) -> None:
-    """Connect an account's WS feed based on its role."""
-    if account.get("status") == "active":
-        try:
+    """Connect an account's WS feed based on its role.
+
+    Masters run a dedicated per-user TradeListener (via the ListenerManager) so
+    each user's fills copy only to that user's followers. Followers get a plain
+    connection for position monitoring.
+    """
+    if account.get("status") != "active":
+        return
+    try:
+        if account.get("is_master"):
+            await listener_manager.start_master(account)
+        else:
             await connection_manager.connect_account(
                 account,
-                on_fill=trade_listener.on_order_fill if account.get("is_master") else None,
                 on_position=position_monitor.make_position_callback(account["id"], account["name"])
             )
-        except Exception as e:
-            logger.error(f"Failed to start WebSocket for account {account.get('name')}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to start WebSocket for account {account.get('name')}: {e}")
+
+async def stop_account_ws(account: dict) -> None:
+    """Tear down an account's live feed based on its role."""
+    try:
+        if account.get("is_master"):
+            await listener_manager.stop_master(account["id"])
+        else:
+            await connection_manager.disconnect_account(account["id"])
+    except Exception as e:
+        logger.warning(f"Failed to stop WebSocket for account {account.get('name')}: {e}")
 
 @router.get("", response_model=List[AccountResponse])
 async def list_accounts(user: CurrentUser = Depends(get_current_user)):
@@ -107,9 +125,9 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
             
         updated = update_res.data[0]
         
-        # Disconnect old WS client
-        await connection_manager.disconnect_account(id)
-        
+        # Disconnect old feed (routes master->listener, follower->connection_manager)
+        await stop_account_ws(updated)
+
         # Reconnect if active
         if updated.get("status") == "active":
             await start_account_ws(updated)
@@ -128,9 +146,9 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
 async def delete_account(id: str, user: CurrentUser = Depends(get_current_user)):
     """Delete account and disconnect its WS."""
     try:
-        owned_account_or_404(id, user)
-        await connection_manager.disconnect_account(id)
-        
+        acc = owned_account_or_404(id, user)
+        await stop_account_ws(acc)
+
         res = db.table("accounts").delete().eq("id", id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
@@ -148,9 +166,9 @@ async def pause_account(id: str, user: CurrentUser = Depends(get_current_user)):
         res = db.table("accounts").update({"status": "paused"}).eq("id", id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
-            
-        await connection_manager.disconnect_account(id)
-        
+
+        await stop_account_ws(res.data[0])
+
         acc = res.data[0]
         acc["api_key"] = f"...{acc['api_key'][-4:]}" if len(acc['api_key']) >= 4 else "..."
         acc["api_secret"] = "******"
@@ -217,10 +235,9 @@ async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)
         master_res = db.table("accounts").select("*").eq("is_master", True).eq("owner_id", target["owner_id"]).execute()
         old_master = master_res.data[0] if master_res.data else None
 
-        # Stop the standalone master trade listener and tear down both WS feeds
-        await trade_listener.stop()
+        # Tear down both feeds: old master's per-user listener + target's follower feed
         if old_master:
-            await connection_manager.disconnect_account(old_master["id"])
+            await listener_manager.stop_master(old_master["id"])
         await connection_manager.disconnect_account(id)
 
         # Swap roles in the DB

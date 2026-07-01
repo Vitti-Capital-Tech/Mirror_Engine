@@ -109,12 +109,13 @@ async def get_system_status():
     except Exception as e:
         logger.error(f"Redis ping failed: {e}")
         
-    # 3. Check Master WS
+    # 3. Check Master WS — masters run under the per-user ListenerManager
     try:
-        res = db.table("accounts").select("id").eq("is_master", True).execute()
-        if res.data:
-            master_id = res.data[0]["id"]
-            master_ws_connected = connection_manager.is_connected(master_id)
+        from app.core.trade_listener import listener_manager
+        res = db.table("accounts").select("id").eq("is_master", True).eq("status", "active").execute()
+        # Healthy if every active master has a running listener (and there is at least one)
+        active_masters = [a["id"] for a in (res.data or [])]
+        master_ws_connected = bool(active_masters) and all(listener_manager.is_running(mid) for mid in active_masters)
     except Exception:
         pass
         

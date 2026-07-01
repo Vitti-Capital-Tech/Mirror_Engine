@@ -158,3 +158,45 @@ class TradeListener:
 
 trade_listener = TradeListener()
 
+
+class ListenerManager:
+    """Runs one TradeListener per user's master account, so each user's master
+    fills copy only into that user's followers (true multi-tenant trading)."""
+
+    def __init__(self) -> None:
+        self._listeners: dict = {}  # master_account_id -> TradeListener
+        self.redis = None
+
+    async def start_master(self, master_account: dict) -> None:
+        aid = master_account["id"]
+        await self.stop_master(aid)  # replace any existing
+        tl = TradeListener(self.redis)
+        try:
+            await tl.start(master_account)
+            self._listeners[aid] = tl
+            logger.info("Listener started for master %s (owner %s)", master_account.get("name"), master_account.get("owner_id"))
+        except Exception as e:
+            logger.error("Failed to start listener for master %s: %s", master_account.get("name"), e)
+
+    async def stop_master(self, master_account_id: str) -> None:
+        tl = self._listeners.pop(master_account_id, None)
+        if tl:
+            try:
+                await tl.stop()
+            except Exception as e:
+                logger.warning("Error stopping listener %s: %s", master_account_id, e)
+
+    async def stop_all(self) -> None:
+        for aid in list(self._listeners.keys()):
+            await self.stop_master(aid)
+
+    def is_running(self, master_account_id: str) -> bool:
+        return master_account_id in self._listeners
+
+    @property
+    def active_count(self) -> int:
+        return len(self._listeners)
+
+
+listener_manager = ListenerManager()
+

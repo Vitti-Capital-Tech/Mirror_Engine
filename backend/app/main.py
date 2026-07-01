@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import db
 from app.websocket.socket_manager import sio, socket_app, socket_manager
-from app.core.trade_listener import trade_listener
+from app.core.trade_listener import listener_manager
 from app.core.copy_engine import CopyEngine
 from app.core.position_monitor import position_monitor
 from app.core.connection_manager import connection_manager
@@ -34,8 +34,8 @@ async def lifespan(app: FastAPI):
     await redis_client.ping()
     logger.info("Redis connected successfully.")
     
-    # Set the redis client on trade_listener
-    trade_listener.redis = redis_client
+    # Set the redis client on the listener manager (one master listener per user)
+    listener_manager.redis = redis_client
     
     # 2. Instantiate copy engine
     copy_engine = CopyEngine(db, redis_client, socket_manager, connection_manager)
@@ -67,15 +67,15 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Failed to connect follower WS {follower['name']}: {e}")
                 
-    # Connect active master and start listening to trades
-    if master_accounts:
-        master = master_accounts[0]
+    # Connect every user's active master and start listening to trades.
+    # One TradeListener per master → each user's fills copy only to their followers.
+    for master in master_accounts:
         if master.get("status") == "active":
             try:
-                await trade_listener.start(master)
-                logger.info(f"Trade listener started for master: {master['name']}")
+                await listener_manager.start_master(master)
+                logger.info(f"Trade listener started for master: {master['name']} (owner {master.get('owner_id')})")
             except Exception as e:
-                logger.error(f"Failed to start master trade listener: {e}")
+                logger.error(f"Failed to start master trade listener {master.get('name')}: {e}")
                 
     # 5. Start Redis Consumers for trade copying + order mirroring
     redis_consumer_task = asyncio.create_task(redis_consumer())
@@ -124,7 +124,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    await trade_listener.stop()
+    await listener_manager.stop_all()
     await connection_manager.disconnect_all()
     await redis_client.close()
     logger.info("Shutdown completed.")
