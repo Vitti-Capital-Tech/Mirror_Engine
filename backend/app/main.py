@@ -12,7 +12,7 @@ from app.core.trade_listener import trade_listener
 from app.core.copy_engine import CopyEngine
 from app.core.position_monitor import position_monitor
 from app.core.connection_manager import connection_manager
-from app.api import accounts, trades, positions, alerts, dashboard
+from app.api import accounts, trades, positions, alerts, dashboard, auth
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -194,6 +194,7 @@ app.add_middleware(
 )
 
 # Register API routes
+app.include_router(auth.router)
 app.include_router(accounts.router)
 app.include_router(trades.router)
 app.include_router(positions.router)

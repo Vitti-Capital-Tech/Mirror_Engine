@@ -7,6 +7,14 @@ class Settings(BaseSettings):
     # Supabase
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_KEY: str = ""
+    SUPABASE_ANON_KEY: str = ""
+    SUPABASE_JWT_SECRET: str = ""   # for verifying user JWTs (Settings → API → JWT Secret)
+
+    # Auth / 2FA (Resend email OTP)
+    RESEND_API_KEY: str = ""
+    RESEND_FROM: str = "Mirror Engine <noreply@example.com>"
+    OTP_TTL_SECONDS: int = 300
+    OTP_MAX_ATTEMPTS: int = 5
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
