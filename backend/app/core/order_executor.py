@@ -10,9 +10,10 @@ from app.websocket.socket_manager import socket_manager
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-BACKOFFS = [0.05, 0.10, 0.20]  # seconds
-CIRCUIT_BREAKER_LIMIT = 5
+# Liquidity-shortfall handling: fill what's available, then retry the unfilled
+# remainder every FILL_RETRY_DELAY seconds up to MAX_FILL_RETRIES times.
+MAX_FILL_RETRIES = 3
+FILL_RETRY_DELAY = 5  # seconds
 
 class OrderExecutor:
     def __init__(self) -> None:
@@ -68,10 +69,8 @@ class OrderExecutor:
             
         # 3. Execution with retries
         start_time = time.time()
-        order_success = False
         last_error = ""
-        order_response = None
-        
+
         # Floor quantity to whole contracts (round down, never up)
         import math
         order_size = int(math.floor(quantity))
@@ -87,141 +86,120 @@ class OrderExecutor:
                 "failure_reason": f"Quantity rounded to 0: {quantity}"
             }
 
-        # Exit/SL trades close an existing position — send them reduce-only so the
-        # follower can only reduce/close and never accidentally flip into an
-        # opposite position.
+        # Exit/SL trades close an existing position — reduce-only so the follower
+        # can only reduce/close and never flip.
         is_exit = trade_type in ("exit", "sl")
 
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                # Place a single market order for the full size. A market order
-                # fills immediately and atomically, so the follower position
-                # exactly mirrors the master. (The previous limit-then-sweep
-                # approach could double-fill: if the limit filled at the same
-                # instant we tried to cancel it, the cancel 404'd, we misread
-                # the fill as 0, and fired a second market order — producing 2x
-                # the intended size.)
-                logger.info(f"Placing market order for {account_name} on {symbol} side={side.lower()} size={order_size} reduce_only={is_exit}")
-                market_response = await client.place_order(
-                    symbol=symbol,
-                    side=side.lower(),
-                    size=order_size,
-                    order_type='market_order',
-                    reduce_only=is_exit
-                )
+        # Fill as much as the order book allows, then retry the unfilled
+        # remainder every FILL_RETRY_DELAY seconds up to MAX_FILL_RETRIES times.
+        # (Handles the case where combined demand across accounts exceeds
+        # available liquidity — each account takes its share and keeps retrying.)
+        total_filled = 0
+        remaining = order_size
+        weighted_px = []  # list of (filled_qty, price)
 
-                order_id = market_response.get("id") or market_response.get("result", {}).get("id")
-                if order_id:
-                    order_success = True
-                    order_response = market_response
-                    break
+        for attempt in range(MAX_FILL_RETRIES + 1):  # 1 initial + N retries
+            if remaining <= 0:
+                break
+            if attempt > 0:
+                await asyncio.sleep(FILL_RETRY_DELAY)
+                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol}: {remaining}/{order_size} lots still unfilled")
+            try:
+                resp = await client.place_order(
+                    symbol=symbol, side=side.lower(), size=remaining,
+                    order_type='market_order', reduce_only=is_exit,
+                )
+                oid = resp.get("id") or resp.get("result", {}).get("id")
+                if not oid:
+                    last_error = f"Invalid API response: {resp}"
+                    continue
+                # Market/IOC orders fill immediately — read how much actually filled.
+                await asyncio.sleep(0.1)
+                status = await client.get_order(oid)
+                rd = status.get("result", status)
+                filled = int(float(rd.get("filled_size") or 0))
+                px = rd.get("average_fill_price") or rd.get("avg_fill_price")
+                if filled > 0:
+                    total_filled += filled
+                    remaining = order_size - total_filled
+                    if px:
+                        weighted_px.append((filled, float(px)))
                 else:
-                    last_error = f"Invalid API response on market placement: {market_response}"
+                    last_error = "No liquidity filled on this attempt"
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1} failed for {account_name} on {symbol}: {last_error}")
-                
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(BACKOFFS[attempt])
-                
+                logger.warning(f"Fill attempt {attempt + 1} for {account_name} on {symbol}: {last_error}")
+
         execution_time_ms = int((time.time() - start_time) * 1000)
-        
-        if order_success:
-            result_data = order_response.get("result", order_response)
-            exec_price = result_data.get("avg_fill_price") or result_data.get("limit_price")
-            if exec_price:
-                exec_price = float(exec_price)
-            else:
-                exec_price = master_price  # fallback to prevent division by zero in slippage
-                
-            # Update consecutive_failures to 0 in DB
-            db.table("accounts").update({
-                "consecutive_failures": 0,
-                "status": "active"
-            }).eq("id", account_id).execute()
-            
-            # Record slippage and update DB status to filled
-            points, pct = await slippage_tracker.record_and_alert(
-                trade_copy_id=copy_id,
-                account_id=account_id,
-                account_name=account_name,
-                symbol=symbol,
-                side=side,
-                master_price=master_price,
-                follower_price=exec_price,
-                quantity=quantity,
-                execution_time_ms=execution_time_ms
-            )
-            
-            # Emit account update with reset failures
-            await socket_manager.emit_account_update({
-                "id": account_id,
-                "consecutive_failures": 0,
-                "status": "active"
-            })
-            
-            return {
-                "account_id": account_id,
-                "account_name": account_name,
-                "status": "filled",
-                "execution_price": exec_price,
-                "slippage_pct": pct,
-                "execution_time_ms": execution_time_ms
-            }
+
+        # Weighted-average execution price across the fills
+        if weighted_px:
+            exec_price = sum(q * p for q, p in weighted_px) / sum(q for q, p in weighted_px)
         else:
-            logger.error(f"Copy trade failed for follower {account_name} on {symbol} after {MAX_RETRIES + 1} attempts. Error: {last_error}")
-            
-            # Increment consecutive failures
-            new_failures = account.get("consecutive_failures", 0) + 1
-            new_status = "active"
-            
-            if new_failures >= CIRCUIT_BREAKER_LIMIT:
-                new_status = "circuit_break"
-                msg = f"Circuit breaker triggered for {account_name}: {new_failures} consecutive failures. Account PAUSED."
-                logger.critical(msg)
-                
-                # Record circuit break alert
-                alert_data = {
-                    "level": "critical",
-                    "type": "circuit_breaker",
-                    "account_id": account_id,
-                    "message": msg,
-                    "metadata": {
-                        "consecutive_failures": new_failures,
-                        "last_error": last_error,
-                        "symbol": symbol
-                    }
-                }
-                alert_result = db.table("alerts").insert(alert_data).execute()
-                if alert_result.data:
-                    await socket_manager.emit_alert(alert_result.data[0])
-            
-            # Update account in DB
-            db.table("accounts").update({
-                "consecutive_failures": new_failures,
-                "status": new_status
-            }).eq("id", account_id).execute()
-            
-            # Update copy status in DB
+            exec_price = master_price
+
+        fully_filled = total_filled >= order_size
+        partial = 0 < total_filled < order_size
+
+        if total_filled > 0:
+            db.table("accounts").update({"consecutive_failures": 0, "status": "active"}).eq("id", account_id).execute()
+
+            points, pct = await slippage_tracker.record_and_alert(
+                trade_copy_id=copy_id, account_id=account_id, account_name=account_name,
+                symbol=symbol, side=side, master_price=master_price,
+                follower_price=exec_price, quantity=total_filled, execution_time_ms=execution_time_ms,
+            )
+
+            status_str = "filled" if fully_filled else "partial"
+            reason = None if fully_filled else f"Partial fill: {total_filled}/{order_size} lots after {MAX_FILL_RETRIES} retries (insufficient liquidity)"
             db.table("trade_copies").update({
-                "status": "failed",
-                "failure_reason": last_error,
-                "retry_count": MAX_RETRIES
+                "status": status_str, "quantity": total_filled, "failure_reason": reason,
             }).eq("id", copy_id).execute()
-            
-            # Emit account update
-            await socket_manager.emit_account_update({
-                "id": account_id,
-                "consecutive_failures": new_failures,
-                "status": new_status
-            })
-            
+
+            await socket_manager.emit_account_update({"id": account_id, "consecutive_failures": 0, "status": "active"})
+
+            if partial:
+                logger.error(f"PARTIAL fill for {account_name} on {symbol}: {total_filled}/{order_size} lots after {MAX_FILL_RETRIES} retries")
+                try:
+                    alert = db.table("alerts").insert({
+                        "level": "warning", "type": "partial_fill", "account_id": account_id,
+                        "message": f"Partial fill for {account_name} on {symbol}: filled {total_filled} of {order_size} lots (insufficient liquidity after {MAX_FILL_RETRIES} retries)",
+                        "metadata": {"symbol": symbol, "filled": total_filled, "requested": order_size},
+                    }).execute()
+                    if alert.data:
+                        await socket_manager.emit_alert(alert.data[0])
+                except Exception:
+                    pass
+
             return {
-                "account_id": account_id,
-                "account_name": account_name,
-                "status": "failed",
-                "failure_reason": last_error,
-                "execution_time_ms": execution_time_ms
+                "account_id": account_id, "account_name": account_name,
+                "status": status_str, "execution_price": exec_price, "slippage_pct": pct,
+                "filled_quantity": total_filled, "requested_quantity": order_size,
+                "execution_time_ms": execution_time_ms, "failure_reason": reason,
             }
+
+        # Nothing filled at all after all retries
+        logger.error(f"Copy trade UNFILLED for {account_name} on {symbol}: 0/{order_size} lots after {MAX_FILL_RETRIES} retries. Error: {last_error}")
+        new_failures = account.get("consecutive_failures", 0) + 1
+        db.table("accounts").update({"consecutive_failures": new_failures}).eq("id", account_id).execute()
+        db.table("trade_copies").update({
+            "status": "failed", "failure_reason": last_error or "No liquidity", "retry_count": MAX_FILL_RETRIES,
+        }).eq("id", copy_id).execute()
+        try:
+            alert = db.table("alerts").insert({
+                "level": "error", "type": "fill_failed", "account_id": account_id,
+                "message": f"Order unfilled for {account_name} on {symbol}: 0/{order_size} lots after {MAX_FILL_RETRIES} retries ({last_error})",
+                "metadata": {"symbol": symbol, "requested": order_size, "last_error": last_error},
+            }).execute()
+            if alert.data:
+                await socket_manager.emit_alert(alert.data[0])
+        except Exception:
+            pass
+        await socket_manager.emit_account_update({"id": account_id, "consecutive_failures": new_failures})
+        return {
+            "account_id": account_id, "account_name": account_name,
+            "status": "failed", "failure_reason": last_error or "No liquidity",
+            "execution_time_ms": execution_time_ms,
+        }
 
 order_executor = OrderExecutor()

@@ -145,7 +145,7 @@ class CopyEngine:
             results = await asyncio.gather(*tasks)
 
         # 5. Determine final master trade status
-        filled_count = sum(1 for r in results if r.get("status") == "filled")
+        filled_count = sum(1 for r in results if r.get("status") in ("filled", "partial"))
         failed_count = sum(1 for r in results if r.get("status") == "failed")
         skipped_count = sum(1 for r in results if r.get("status") in ("skipped", "skipped_circuit_breaker"))
 
