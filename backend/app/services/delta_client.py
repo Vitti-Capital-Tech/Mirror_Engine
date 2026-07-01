@@ -119,12 +119,14 @@ class DeltaClient:
         stop_price: Optional[float] = None,
         stop_order_type: Optional[str] = None,
         stop_trigger_method: Optional[str] = None,
+        time_in_force: Optional[str] = None,
     ) -> dict:
         """Place a market/limit order, optionally a stop (triggered) order.
 
         reduce_only=True can only reduce/close an existing position (never flips).
         Pass stop_price (+ optional stop_order_type/stop_trigger_method) to place
         a stop / take-profit / bracket-style triggered order.
+        time_in_force='fok' = fill-or-kill (fills the whole size or nothing).
         """
         path = "/v2/orders"
         body_dict: dict = {
@@ -133,6 +135,8 @@ class DeltaClient:
             "size": size,
             "order_type": order_type,
         }
+        if time_in_force:
+            body_dict["time_in_force"] = time_in_force
         if limit_price is not None and order_type == "limit_order":
             body_dict["limit_price"] = str(limit_price)
         if reduce_only:
