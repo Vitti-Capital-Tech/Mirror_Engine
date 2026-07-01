@@ -1,8 +1,9 @@
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.database import db
 from app.models.position import AlertResponse
+from app.core.auth import get_current_user, CurrentUser, scope_owned
 
 logger = logging.getLogger(__name__)
 
@@ -14,12 +15,13 @@ async def list_alerts(
     limit: int = Query(50, ge=1, le=100),
     level: Optional[str] = None,
     type: Optional[str] = None,
-    is_resolved: Optional[bool] = None
+    is_resolved: Optional[bool] = None,
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """List system alerts with pagination and optional filters."""
+    """List the caller's alerts with pagination and optional filters."""
     try:
-        query = db.table("alerts").select("*, accounts(name)")
-        
+        query = scope_owned(db.table("alerts").select("*, accounts(name)"), user)
+
         if level:
             query = query.eq("level", level)
         if type:
@@ -56,9 +58,12 @@ async def list_alerts(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/{id}/resolve", response_model=AlertResponse)
-async def resolve_alert(id: str):
-    """Mark a specific alert as resolved."""
+async def resolve_alert(id: str, user: CurrentUser = Depends(get_current_user)):
+    """Mark a specific alert as resolved (must be owned)."""
     try:
+        chk = scope_owned(db.table("alerts").select("id").eq("id", id), user).execute()
+        if not chk.data:
+            raise HTTPException(status_code=404, detail="Alert not found.")
         res = db.table("alerts").update({"is_resolved": True}).eq("id", id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Alert not found.")
@@ -78,10 +83,10 @@ async def resolve_alert(id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/clear")
-async def clear_resolved_alerts():
-    """Clear all resolved alerts from the database."""
+async def clear_resolved_alerts(user: CurrentUser = Depends(get_current_user)):
+    """Clear the caller's resolved alerts."""
     try:
-        res = db.table("alerts").delete().eq("is_resolved", True).execute()
+        res = scope_owned(db.table("alerts").delete().eq("is_resolved", True), user).execute()
         deleted_count = len(res.data or [])
         return {"success": True, "message": f"Cleared {deleted_count} resolved alerts."}
     except Exception as e:

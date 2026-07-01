@@ -1,11 +1,12 @@
 import logging
 import time
 from datetime import datetime, date
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from app.database import db
 from app.config import settings
 from app.models.position import DashboardStats, SystemStatus
 from app.core.connection_manager import connection_manager
+from app.core.auth import get_current_user, CurrentUser, scope_owned
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +15,11 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 START_TIME = time.time()
 
 @router.get("/stats", response_model=DashboardStats)
-async def get_dashboard_stats():
-    """Retrieve aggregated dashboard stats."""
+async def get_dashboard_stats(user: CurrentUser = Depends(get_current_user)):
+    """Retrieve aggregated dashboard stats for the caller."""
     try:
-        # 1. Query all accounts
-        acc_res = db.table("accounts").select("*").execute()
+        # 1. Query the caller's accounts
+        acc_res = scope_owned(db.table("accounts").select("*"), user).execute()
         accounts = acc_res.data or []
         
         total_accounts = len(accounts)
@@ -34,7 +35,7 @@ async def get_dashboard_stats():
         
         # 2. Query today's trade copies
         today_iso = date.today().isoformat()
-        copies_res = db.table("trade_copies").select("status, slippage_pct").gte("created_at", today_iso).execute()
+        copies_res = scope_owned(db.table("trade_copies").select("status, slippage_pct"), user).gte("created_at", today_iso).execute()
         copies = copies_res.data or []
         
         total_copies_today = len(copies)
@@ -51,15 +52,15 @@ async def get_dashboard_stats():
         avg_slippage_pct = (sum(slippages) / len(slippages)) if slippages else 0.0
         max_slippage_pct = max(slippages) if slippages else 0.0
         
-        # 3. Active alerts count
-        alerts_res = db.table("alerts").select("id", count="exact").eq("is_resolved", False).execute()
-        active_alerts_count = alerts_res.count or len(db.table("alerts").select("id").eq("is_resolved", False).execute().data or [])
-        
+        # 3. Active alerts count (caller-scoped)
+        alerts_res = scope_owned(db.table("alerts").select("id"), user).eq("is_resolved", False).execute()
+        active_alerts_count = len(alerts_res.data or [])
+
         # 4. WebSocket connections
         ws_conn_count = len(connection_manager.connected_account_ids)
-        
-        # Total parent trades today
-        trades_res = db.table("trades").select("id").gte("created_at", today_iso).execute()
+
+        # Total parent trades today (caller-scoped)
+        trades_res = scope_owned(db.table("trades").select("id"), user).gte("created_at", today_iso).execute()
         total_trades_today = len(trades_res.data or [])
         
         return {

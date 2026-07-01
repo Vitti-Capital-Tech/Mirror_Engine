@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from typing import List, Dict
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from app.database import db
 from app.models.position import PositionResponse
 from app.services.delta_client import DeltaClient
+from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_account_or_404
 
 logger = logging.getLogger(__name__)
 
@@ -96,14 +97,14 @@ async def _fetch_account_positions(acc: dict) -> List[dict]:
 
 
 @router.get("", response_model=List[PositionResponse])
-async def list_positions():
-    """List open positions for all accounts, fetched LIVE from Delta Exchange.
+async def list_positions(user: CurrentUser = Depends(get_current_user)):
+    """List open positions for the caller's accounts, fetched LIVE from Delta.
 
     Reads directly from the exchange (not the DB) so the view always matches
     exactly what Delta shows, with no flicker from background writers.
     """
     try:
-        acc_res = db.table("accounts").select("*").execute()
+        acc_res = scope_owned(db.table("accounts").select("*"), user).execute()
         accounts = acc_res.data or []
         if not accounts:
             return []
@@ -125,10 +126,10 @@ async def list_positions():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/sync-status")
-async def get_sync_status() -> Dict[str, int]:
+async def get_sync_status(user: CurrentUser = Depends(get_current_user)) -> Dict[str, int]:
     """Retrieve summary of master vs followers position synchronization states."""
     try:
-        res = db.table("positions").select("sync_status").execute()
+        res = scope_owned(db.table("positions").select("sync_status"), user).execute()
         positions = res.data or []
         
         # Calculate status counts
@@ -148,9 +149,10 @@ async def get_sync_status() -> Dict[str, int]:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{account_id}", response_model=List[PositionResponse])
-async def list_account_positions(account_id: str):
-    """List open positions specifically for one account."""
+async def list_account_positions(account_id: str, user: CurrentUser = Depends(get_current_user)):
+    """List open positions specifically for one account (must be owned)."""
     try:
+        owned_account_or_404(account_id, user)
         res = db.table("positions").select("*, accounts(name)").eq("account_id", account_id).execute()
         positions = res.data or []
         
@@ -182,14 +184,10 @@ async def list_account_positions(account_id: str):
         logger.error(f"Error querying positions for account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sync-live")
-async def sync_live_positions():
-    """Fetch live positions directly from Delta Exchange for all active accounts and update DB."""
-    try:
-        acc_res = db.table("accounts").select("*").eq("status", "active").execute()
-        accounts = acc_res.data or []
-        
-        sync_results = []
+async def _sync_accounts(accounts: list) -> list:
+    """Sync live balance + positions for the given accounts into the DB."""
+    sync_results = []
+    if True:
         for acc in accounts:
             client = DeltaClient(
                 api_key=acc["api_key"],
@@ -246,20 +244,33 @@ async def sync_live_positions():
                 sync_results.append({"account_name": acc["name"], "status": "failed", "error": str(e)})
             finally:
                 await client.close()
-                
-        return {"success": True, "results": sync_results}
+    return sync_results
+
+
+async def sync_live_positions():
+    """Internal: sync ALL active accounts (used by the background poller/startup)."""
+    acc_res = db.table("accounts").select("*").eq("status", "active").execute()
+    return {"success": True, "results": await _sync_accounts(acc_res.data or [])}
+
+
+@router.post("/sync-live")
+async def sync_live_endpoint(user: CurrentUser = Depends(get_current_user)):
+    """Sync the caller's active accounts (admins: all)."""
+    try:
+        acc_res = scope_owned(db.table("accounts").select("*"), user).eq("status", "active").execute()
+        return {"success": True, "results": await _sync_accounts(acc_res.data or [])}
     except Exception as e:
-        logger.error(f"Error in sync_live_positions: {e}")
+        logger.error(f"Error in sync-live: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/master/open-orders")
-async def get_master_open_orders():
-    """Fetch live open orders directly from Delta Exchange for the Master account."""
+async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
+    """Fetch live open orders directly from Delta for the caller's Master account."""
     try:
-        master_res = db.table("accounts").select("*").eq("is_master", True).execute()
+        master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
         if not master_res.data:
             return []
-            
+
         master = master_res.data[0]
         client = DeltaClient(
             api_key=master["api_key"],

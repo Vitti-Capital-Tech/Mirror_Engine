@@ -41,7 +41,8 @@ class OrderExecutor:
             "trade_id": trade_id,
             "account_id": account_id,
             "status": "pending",
-            "quantity": quantity
+            "quantity": quantity,
+            "owner_id": account.get("owner_id"),
         }
         insert_res = db.table("trade_copies").insert(copy_data).execute()
         if not insert_res.data:
@@ -172,6 +173,7 @@ class OrderExecutor:
                 "level": "warning", "type": "liquidity_unavailable", "account_id": account_id,
                 "message": f"{account_name} on {symbol}: {reason}",
                 "metadata": {"symbol": symbol, "requested": order_size},
+                "owner_id": account.get("owner_id"),
             }).execute()
             if alert.data:
                 await socket_manager.emit_alert(alert.data[0])

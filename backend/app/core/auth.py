@@ -74,6 +74,25 @@ async def require_admin(user: CurrentUser = Depends(get_current_user)) -> Curren
     return user
 
 
+def scope_owned(query, user: "CurrentUser", column: str = "owner_id"):
+    """Apply an owner filter to a Supabase query — unless the user is admin
+    (admins see all tenants)."""
+    if user.is_admin:
+        return query
+    return query.eq(column, user.id)
+
+
+def owned_account_or_404(account_id: str, user: "CurrentUser") -> dict:
+    """Fetch an account and ensure the caller owns it (or is admin)."""
+    res = db.table("accounts").select("*").eq("id", account_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    acc = res.data[0]
+    if not user.is_admin and acc.get("owner_id") != user.id:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    return acc
+
+
 # ---------------------------------------------------------------------------
 # Email-OTP 2FA
 # ---------------------------------------------------------------------------

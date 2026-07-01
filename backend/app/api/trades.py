@@ -1,8 +1,9 @@
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.database import db
 from app.models.trade import TradeResponse, TradeStatsResponse
+from app.core.auth import get_current_user, CurrentUser, scope_owned
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +14,14 @@ async def list_trades(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
-    symbol: Optional[str] = None
+    symbol: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """List trades with pagination, optional filters, and joined trade copy details."""
+    """List the caller's trades with pagination and joined copy details."""
     try:
         # Construct query
-        query = db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)")
-        
+        query = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)"), user)
+
         if symbol:
             query = query.eq("symbol", symbol.upper())
         if status:
@@ -55,11 +57,11 @@ async def list_trades(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/stats", response_model=TradeStatsResponse)
-async def get_trade_stats():
-    """Aggregate statistics for all copy trades."""
+async def get_trade_stats(user: CurrentUser = Depends(get_current_user)):
+    """Aggregate statistics for the caller's copy trades."""
     try:
         # Fetch copies for stats
-        copies_res = db.table("trade_copies").select("status, slippage_pct, execution_time_ms").execute()
+        copies_res = scope_owned(db.table("trade_copies").select("status, slippage_pct, execution_time_ms"), user).execute()
         copies = copies_res.data or []
         
         total_copies = len(copies)
@@ -86,7 +88,7 @@ async def get_trade_stats():
         avg_execution_time_ms = (sum(latencies) / len(latencies)) if latencies else 0.0
         
         # Total parent trades
-        trades_res = db.table("trades").select("id").execute()
+        trades_res = scope_owned(db.table("trades").select("id"), user).execute()
         total_trades = len(trades_res.data or [])
         
         return {
@@ -103,10 +105,10 @@ async def get_trade_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{id}", response_model=TradeResponse)
-async def get_trade(id: str):
-    """Fetch details of a single trade by ID."""
+async def get_trade(id: str, user: CurrentUser = Depends(get_current_user)):
+    """Fetch details of a single trade by ID (must be owned)."""
     try:
-        res = db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)").eq("id", id).execute()
+        res = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)").eq("id", id), user).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Trade not found.")
             

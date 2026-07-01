@@ -116,7 +116,9 @@ class TradeListener:
             raw_payload=order,
         )
         logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
-        await self.redis.lpush("trade_events", json.dumps(trade_event.dict()))
+        payload = trade_event.dict()
+        payload["owner_id"] = (self.master_account or {}).get("owner_id")
+        await self.redis.lpush("trade_events", json.dumps(payload))
 
     async def _push_order_event(self, order: dict, action: str) -> None:
         """Push a resting-order place/cancel event to Redis for the copy engine."""
@@ -138,6 +140,7 @@ class TradeListener:
             "is_bracket": bool(order.get("bracket_order")) or str((order.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL"),
             # stop_update / action 'update' => the master EDITED an existing SL/TP.
             "is_update": order.get("reason") == "stop_update" or order.get("action") == "update",
+            "owner_id": (self.master_account or {}).get("owner_id"),
         }
         logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")
         await self.redis.lpush("order_events", json.dumps(payload))

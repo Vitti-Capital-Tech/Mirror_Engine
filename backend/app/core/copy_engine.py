@@ -33,6 +33,7 @@ class CopyEngine:
         entry_price = float(event_dict.get("entry_price", 0))
         trade_type = event_dict.get("trade_type", "entry")
         raw_payload = event_dict.get("raw_payload")
+        owner_id = event_dict.get("owner_id")
 
         logger.info(f"Processing master fill: {side.upper()} {quantity} {symbol} @ {entry_price} (ID: {master_trade_id})")
 
@@ -52,7 +53,8 @@ class CopyEngine:
                 "entry_price": entry_price,
                 "trade_type": trade_type,
                 "status": "processing",
-                "raw_payload": raw_payload
+                "raw_payload": raw_payload,
+                "owner_id": owner_id,
             }
             insert_res = self.db.table("trades").insert(trade_data).execute()
             if not insert_res.data:
@@ -65,9 +67,12 @@ class CopyEngine:
             logger.error(f"Failed to save master trade to DB: {e}")
             return
 
-        # 2. Get active follower accounts
+        # 2. Get active follower accounts (scoped to the master's owner)
         try:
-            followers_res = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active").execute()
+            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            if owner_id:
+                fq = fq.eq("owner_id", owner_id)
+            followers_res = fq.execute()
             followers = followers_res.data or []
         except Exception as e:
             logger.error(f"Failed to query follower accounts: {e}")
@@ -96,7 +101,10 @@ class CopyEngine:
         # 3. Create execution tasks for each follower
         master_balance = 0.0
         try:
-            master_acc = self.db.table("accounts").select("*").eq("is_master", True).execute()
+            mq = self.db.table("accounts").select("*").eq("is_master", True)
+            if owner_id:
+                mq = mq.eq("owner_id", owner_id)
+            master_acc = mq.execute()
             if master_acc.data:
                 master_balance = float(master_acc.data[0].get("allocated_balance") or master_acc.data[0].get("available_margin") or master_acc.data[0].get("balance") or 0.0)
         except Exception as e:
@@ -123,7 +131,8 @@ class CopyEngine:
                         "account_id": follower["id"],
                         "status": "failed",
                         "quantity": follower_qty,
-                        "failure_reason": f"Connection error: {e}"
+                        "failure_reason": f"Connection error: {e}",
+                        "owner_id": follower.get("owner_id"),
                     }).execute()
                     continue
 
@@ -216,12 +225,16 @@ class CopyEngine:
         limit_price = float(event["limit_price"]) if event.get("limit_price") else None
         stop_price = float(event["stop_price"]) if event.get("stop_price") else None
         reduce_only = bool(event.get("reduce_only"))
+        owner_id = event.get("owner_id")
         if not symbol or not side or master_qty <= 0:
             return
 
-        # Active followers
+        # Active followers (scoped to the master's owner)
         try:
-            followers = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active").execute().data or []
+            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            if owner_id:
+                fq = fq.eq("owner_id", owner_id)
+            followers = fq.execute().data or []
         except Exception as e:
             logger.error(f"Failed to query followers for order mirror: {e}")
             return
@@ -231,7 +244,10 @@ class CopyEngine:
         # Master balance for the ratio
         master_balance = 0.0
         try:
-            m = self.db.table("accounts").select("*").eq("is_master", True).execute()
+            mq = self.db.table("accounts").select("*").eq("is_master", True)
+            if owner_id:
+                mq = mq.eq("owner_id", owner_id)
+            m = mq.execute()
             if m.data:
                 master_balance = float(m.data[0].get("allocated_balance") or m.data[0].get("available_margin") or m.data[0].get("balance") or 0.0)
         except Exception:
