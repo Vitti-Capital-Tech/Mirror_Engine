@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Optional
 
-import jwt
+import httpx
 from fastapi import Depends, Header, HTTPException, status
 
 from app.config import settings
@@ -28,24 +28,8 @@ class CurrentUser:
 
 
 # ---------------------------------------------------------------------------
-# JWT verification (Supabase HS256 tokens)
+# Token verification (via Supabase GoTrue introspection — no JWT secret needed)
 # ---------------------------------------------------------------------------
-
-def _decode_jwt(token: str) -> dict:
-    if not settings.SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=500, detail="Auth not configured (missing JWT secret).")
-    try:
-        return jwt.decode(
-            token,
-            settings.SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}")
-
 
 def _role_for(user_id: str) -> str:
     try:
@@ -58,20 +42,30 @@ def _role_for(user_id: str) -> str:
 
 
 async def get_current_user(authorization: str = Header(None)) -> CurrentUser:
-    """FastAPI dependency: resolve the authenticated user from the Bearer JWT.
+    """FastAPI dependency: resolve the authenticated user from the Bearer token.
 
-    Note: the token must be 2FA-complete (see login flow) — we mint the app's
-    usable session only after OTP verification, so any valid Supabase token
-    presented here already passed 2FA in our flow.
+    Validates the token by calling Supabase's /auth/v1/user endpoint (works for
+    any signing scheme, no local JWT secret required). The token is only issued
+    by our /verify-2fa step, so any valid token here already passed 2FA.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    claims = _decode_jwt(token)
-    uid = claims.get("sub")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.SUPABASE_URL}/auth/v1/user",
+                headers={"apikey": settings.SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Auth service unreachable: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    u = resp.json()
+    uid = u.get("id")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject")
-    return CurrentUser(id=uid, email=claims.get("email"), role=_role_for(uid))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    return CurrentUser(id=uid, email=u.get("email"), role=_role_for(uid))
 
 
 async def require_admin(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
@@ -85,7 +79,7 @@ async def require_admin(user: CurrentUser = Depends(get_current_user)) -> Curren
 # ---------------------------------------------------------------------------
 
 def _hash_code(code: str) -> str:
-    return hashlib.sha256(f"{settings.SUPABASE_JWT_SECRET}:{code}".encode()).hexdigest()
+    return hashlib.sha256(f"{settings.SUPABASE_SERVICE_KEY}:{code}".encode()).hexdigest()
 
 
 def generate_and_store_otp(user_id: str, purpose: str = "login_2fa") -> str:

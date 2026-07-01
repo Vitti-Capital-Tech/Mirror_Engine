@@ -1,5 +1,17 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+export const TOKEN_KEY = 'me_access_token';
+
+export function getToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem(TOKEN_KEY);
+}
+export function setToken(t: string | null) {
+  if (typeof window === 'undefined') return;
+  if (t) localStorage.setItem(TOKEN_KEY, t);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
 function buildQuery(params?: Record<string, any>): string {
   if (!params) return '';
   const clean: Record<string, string> = {};
@@ -11,10 +23,20 @@ function buildQuery(params?: Record<string, any>): string {
 }
 
 async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = getToken();
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options?.headers || {}),
+    },
   });
+  if (res.status === 401 && typeof window !== 'undefined' && !path.startsWith('/api/auth')) {
+    // Session expired/invalid — drop token and bounce to login.
+    setToken(null);
+    if (!window.location.pathname.startsWith('/login')) window.location.href = '/login';
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `HTTP Error ${res.status}`);
@@ -23,6 +45,17 @@ async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  auth: {
+    signup: (email: string, password: string) =>
+      fetchAPI<any>('/api/auth/signup', { method: 'POST', body: JSON.stringify({ email, password }) }),
+    login: (email: string, password: string) =>
+      fetchAPI<any>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+    verify2fa: (pending_id: string, code: string) =>
+      fetchAPI<any>('/api/auth/verify-2fa', { method: 'POST', body: JSON.stringify({ pending_id, code }) }),
+    resend2fa: (pending_id: string) =>
+      fetchAPI<any>('/api/auth/resend-2fa', { method: 'POST', body: JSON.stringify({ pending_id }) }),
+    me: () => fetchAPI<any>('/api/auth/me'),
+  },
   accounts: {
     list: () => fetchAPI<any[]>('/api/accounts'),
     create: (data: any) => fetchAPI<any>('/api/accounts', { method: 'POST', body: JSON.stringify(data) }),

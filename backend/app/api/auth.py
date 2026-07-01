@@ -48,11 +48,25 @@ class ResendIn(BaseModel):
 
 @router.post("/signup")
 async def signup(body: SignupIn):
+    # Create the user via the admin API with email pre-confirmed. Our email-OTP
+    # 2FA at login is what actually proves inbox ownership, so Supabase's own
+    # email-confirmation step is redundant here.
+    admin_headers = {
+        "apikey": settings.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(_gotrue("/signup"), headers=_headers(),
-                         json={"email": body.email, "password": body.password})
+        r = await c.post(
+            f"{settings.SUPABASE_URL}/auth/v1/admin/users",
+            headers=admin_headers,
+            json={"email": body.email, "password": body.password, "email_confirm": True},
+        )
     if r.status_code >= 400:
-        detail = (r.json().get("msg") or r.json().get("error_description") or "Signup failed") if r.content else "Signup failed"
+        body_json = r.json() if r.content else {}
+        detail = body_json.get("msg") or body_json.get("error_description") or body_json.get("error") or "Signup failed"
+        if "already" in str(detail).lower() or "registered" in str(detail).lower():
+            detail = "An account with this email already exists."
         raise HTTPException(status_code=400, detail=detail)
     return {"success": True, "message": "Account created. You can now log in."}
 

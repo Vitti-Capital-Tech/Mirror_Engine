@@ -2,9 +2,10 @@
 import React from 'react';
 import { usePathname } from 'next/navigation';
 import { useAlerts } from '@/hooks/useAlerts';
-import { Bell, Sun, Moon, AlertTriangle, ShieldAlert, Info, CheckCircle, ArrowRight } from 'lucide-react';
+import { Bell, Sun, Moon, AlertTriangle, ShieldAlert, Info, CheckCircle, ArrowRight, LogOut } from 'lucide-react';
 import Link from 'next/link';
 import { useSocket } from '@/hooks/useSocket';
+import { useAuth } from '@/context/AuthContext';
 
 function relTime(iso: string): string {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -19,6 +20,7 @@ export function TopBar() {
   const { data: alerts = [] } = useAlerts({ is_resolved: false });
   const activeAlertsCount = alerts.length;
   const { isConnected } = useSocket();
+  const { user, logout } = useAuth();
 
   const [theme, setTheme] = React.useState('dark');
   const [bellOpen, setBellOpen] = React.useState(false);
@@ -207,6 +209,25 @@ export function TopBar() {
               </Link>
             </div>
           )}
+        </div>
+
+        {/* User + logout */}
+        <div className="flex items-center gap-2 pl-1.5 ml-0.5 border-l border-bg-border">
+          {user?.email && (
+            <span className="hidden sm:flex items-center gap-2">
+              <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-[11px] font-bold text-text-primary">
+                {user.email.charAt(0).toUpperCase()}
+              </span>
+              <span className="text-[11px] font-medium text-text-secondary max-w-[140px] truncate">{user.email}</span>
+            </span>
+          )}
+          <button
+            onClick={logout}
+            title="Sign out"
+            className="p-1.5 text-text-muted hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all border border-transparent hover:border-red-500/20"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </div>
     </header>
