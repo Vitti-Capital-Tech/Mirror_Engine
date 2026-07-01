@@ -52,6 +52,37 @@ create table profiles (
 ```
 A trigger on `auth.users` insert creates the matching `profiles` row.
 
+### Two-Factor Authentication (email OTP via Resend)
+
+2FA is **mandatory** and delivered as an emailed one-time code using **Resend** (sending domain already configured).
+
+**Flow:**
+1. User submits email + password → Supabase Auth validates the password but the app treats the session as **not yet fully authenticated** (2FA pending).
+2. Backend generates a **6-digit OTP**, stores its **hash** with a short expiry (e.g. 5 min) and attempt counter, and sends the code via the **Resend API** from the verified domain.
+3. User enters the code → backend verifies (hash match, not expired, attempts < limit) → marks the session **2FA-complete** and issues/*elevates* the app session.
+4. On success the OTP row is consumed (deleted); on too many wrong attempts it's invalidated and a new one must be requested.
+
+**Storage:**
+```sql
+create table auth_otps (
+  id uuid primary key default uuid_generate_v4(),
+  user_id uuid references auth.users(id) on delete cascade,
+  code_hash text not null,          -- hashed OTP, never plaintext
+  purpose text not null default 'login_2fa',
+  expires_at timestamptz not null,
+  attempts int not null default 0,
+  consumed_at timestamptz,
+  created_at timestamptz default now()
+);
+create index idx_auth_otps_user on auth_otps(user_id);
+```
+
+**Notes:**
+- OTP generation/verification lives in the **backend** (never trust the client); Resend is only the delivery channel.
+- Rate-limit OTP requests (cooldown between sends, max sends/hour) to prevent email flooding.
+- Resend is *also* set as the SMTP provider for Supabase's own auth emails (verification, password reset) so all mail goes through the same domain.
+- Optional later: allow **TOTP (authenticator app)** via Supabase native MFA as an alternative second factor.
+
 ---
 
 ## 4. Data model changes
