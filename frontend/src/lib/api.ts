@@ -94,4 +94,9 @@ export const api = {
     stats: () => fetchAPI<any>('/api/dashboard/stats'),
     system: () => fetchAPI<any>('/api/dashboard/system'),
   },
+  admin: {
+    overview: () => fetchAPI<any>('/api/admin/overview'),
+    setRole: (userId: string, role: 'user' | 'admin') =>
+      fetchAPI<any>(`/api/admin/users/${userId}/role?role=${role}`, { method: 'POST' }),
+  },
 };

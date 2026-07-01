@@ -2,9 +2,11 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield } from 'lucide-react';
+import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
   const pathname = usePathname();
+  const { user } = useAuth();
   const [isCollapsed, setIsCollapsed] = React.useState(false);
 
   const links = [
@@ -12,6 +14,7 @@ export function Sidebar() {
     { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/trades', label: 'Trades Log', icon: FileText },
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
+    ...(user?.role === 'admin' ? [{ href: '/admin', label: 'Admin', icon: Shield }] : []),
   ];
 
   return (

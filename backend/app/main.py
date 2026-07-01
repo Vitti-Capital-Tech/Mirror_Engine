@@ -12,7 +12,7 @@ from app.core.trade_listener import listener_manager
 from app.core.copy_engine import CopyEngine
 from app.core.position_monitor import position_monitor
 from app.core.connection_manager import connection_manager
-from app.api import accounts, trades, positions, alerts, dashboard, auth
+from app.api import accounts, trades, positions, alerts, dashboard, auth, admin
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -200,6 +200,7 @@ app.include_router(trades.router)
 app.include_router(positions.router)
 app.include_router(alerts.router)
 app.include_router(dashboard.router)
+app.include_router(admin.router)
 
 @app.get("/health")
 async def health():

@@ -33,6 +33,14 @@ async def start_account_ws(account: dict) -> None:
     except Exception as e:
         logger.error(f"Failed to start WebSocket for account {account.get('name')}: {e}")
 
+def _mask_secrets(acc: dict) -> dict:
+    """Redact secrets for API responses; show real last-4 of the (decrypted) key."""
+    from app.core.crypto import decrypt
+    k = decrypt(acc.get("api_key") or "")
+    acc["api_key"] = f"...{k[-4:]}" if len(k) >= 4 else "..."
+    acc["api_secret"] = "******"
+    return acc
+
 async def stop_account_ws(account: dict) -> None:
     """Tear down an account's live feed based on its role."""
     try:
@@ -50,13 +58,10 @@ async def list_accounts(user: CurrentUser = Depends(get_current_user)):
         res = scope_owned(db.table("accounts").select("*"), user).order("created_at").execute()
         accounts = res.data or []
         
-        # Mask secrets
+        # Mask secrets (decrypts for accurate last-4 display)
         for acc in accounts:
-            if acc.get("api_key"):
-                key = acc["api_key"]
-                acc["api_key"] = f"...{key[-4:]}" if len(key) >= 4 else "..."
-            acc["api_secret"] = "******"
-            
+            _mask_secrets(acc)
+
         return accounts
     except Exception as e:
         logger.error(f"Error listing accounts: {e}")
@@ -72,9 +77,14 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
             if existing_master.data:
                 raise HTTPException(status_code=400, detail="You already have a master account. Only one master per user is supported.")
 
-        # Save to DB (stamped with owner)
+        # Save to DB (stamped with owner; secrets encrypted at rest)
+        from app.core.crypto import encrypt
         data = account_data.model_dump()
         data["owner_id"] = user.id
+        if data.get("api_key"):
+            data["api_key"] = encrypt(data["api_key"])
+        if data.get("api_secret"):
+            data["api_secret"] = encrypt(data["api_secret"])
         res = db.table("accounts").insert(data).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Failed to create account in database.")
@@ -86,9 +96,7 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
             await start_account_ws(new_account)
             
         resp_acc = dict(new_account)
-        resp_acc["api_key"] = f"...{resp_acc['api_key'][-4:]}" if len(resp_acc['api_key']) >= 4 else "..."
-        resp_acc["api_secret"] = "******"
-        return resp_acc
+        return _mask_secrets(resp_acc)
     except HTTPException:
         raise
     except Exception as e:
@@ -99,9 +107,7 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
 async def get_account(id: str, user: CurrentUser = Depends(get_current_user)):
     """Get a single account by ID (must be owned by the caller)."""
     acc = owned_account_or_404(id, user)
-    acc["api_key"] = f"...{acc['api_key'][-4:]}" if len(acc['api_key']) >= 4 else "..."
-    acc["api_secret"] = "******"
-    return acc
+    return _mask_secrets(acc)
 
 @router.put("/{id}", response_model=AccountResponse)
 async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser = Depends(get_current_user)):
@@ -118,7 +124,14 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
         update_data = account_data.model_dump(exclude_unset=True)
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update.")
-            
+
+        # Encrypt any secret fields being changed
+        from app.core.crypto import encrypt
+        if update_data.get("api_key"):
+            update_data["api_key"] = encrypt(update_data["api_key"])
+        if update_data.get("api_secret"):
+            update_data["api_secret"] = encrypt(update_data["api_secret"])
+
         update_res = db.table("accounts").update(update_data).eq("id", id).execute()
         if not update_res.data:
             raise HTTPException(status_code=500, detail="Failed to update account in database.")
@@ -133,9 +146,7 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
             await start_account_ws(updated)
             
         resp_acc = dict(updated)
-        resp_acc["api_key"] = f"...{resp_acc['api_key'][-4:]}" if len(resp_acc['api_key']) >= 4 else "..."
-        resp_acc["api_secret"] = "******"
-        return resp_acc
+        return _mask_secrets(resp_acc)
     except HTTPException:
         raise
     except Exception as e:
@@ -170,9 +181,7 @@ async def pause_account(id: str, user: CurrentUser = Depends(get_current_user)):
         await stop_account_ws(res.data[0])
 
         acc = res.data[0]
-        acc["api_key"] = f"...{acc['api_key'][-4:]}" if len(acc['api_key']) >= 4 else "..."
-        acc["api_secret"] = "******"
-        return acc
+        return _mask_secrets(acc)
     except Exception as e:
         logger.error(f"Error pausing account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -189,9 +198,7 @@ async def resume_account(id: str, user: CurrentUser = Depends(get_current_user))
         acc = res.data[0]
         await start_account_ws(acc)
         
-        acc["api_key"] = f"...{acc['api_key'][-4:]}" if len(acc['api_key']) >= 4 else "..."
-        acc["api_secret"] = "******"
-        return acc
+        return _mask_secrets(acc)
     except Exception as e:
         logger.error(f"Error resuming account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -208,9 +215,7 @@ async def reset_account(id: str, user: CurrentUser = Depends(get_current_user)):
         acc = res.data[0]
         await start_account_ws(acc)
         
-        acc["api_key"] = f"...{acc['api_key'][-4:]}" if len(acc['api_key']) >= 4 else "..."
-        acc["api_secret"] = "******"
-        return acc
+        return _mask_secrets(acc)
     except Exception as e:
         logger.error(f"Error resetting account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -255,9 +260,7 @@ async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)
             await start_account_ws(demoted)  # follower -> position callback
 
         resp_acc = dict(new_master)
-        resp_acc["api_key"] = f"...{resp_acc['api_key'][-4:]}" if len(resp_acc['api_key']) >= 4 else "..."
-        resp_acc["api_secret"] = "******"
-        return resp_acc
+        return _mask_secrets(resp_acc)
     except HTTPException:
         raise
     except Exception as e:

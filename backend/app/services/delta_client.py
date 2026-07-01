@@ -29,8 +29,11 @@ class DeltaClient:
     """Async client for Delta Exchange.  One instance per account."""
 
     def __init__(self, api_key: str, api_secret: str, environment: str = "demo") -> None:
-        self.api_key = api_key
-        self.api_secret = api_secret
+        # Secrets are stored encrypted at rest; decrypt transparently on use.
+        # decrypt() is a no-op for legacy plaintext values.
+        from app.core.crypto import decrypt
+        self.api_key = decrypt(api_key)
+        self.api_secret = decrypt(api_secret)
         self.environment = environment
         self.rest_url = (
             settings.DELTA_DEMO_REST_URL if environment == "demo" else settings.DELTA_LIVE_REST_URL

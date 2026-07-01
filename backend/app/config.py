@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     OTP_TTL_SECONDS: int = 300
     OTP_MAX_ATTEMPTS: int = 5
 
+    # Encryption at rest for Delta API keys/secrets.
+    # If unset, a stable key is derived from SUPABASE_SERVICE_KEY (see crypto.py).
+    ENCRYPTION_KEY: str = ""
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 

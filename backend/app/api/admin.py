@@ -1,0 +1,84 @@
+"""Admin-only endpoints: cross-tenant visibility over all users and their data."""
+
+import logging
+from datetime import date
+from fastapi import APIRouter, HTTPException, Depends
+
+from app.database import db
+from app.core.auth import require_admin, CurrentUser
+from app.core.trade_listener import listener_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+@router.get("/overview")
+async def admin_overview(user: CurrentUser = Depends(require_admin)):
+    """Aggregate view of every tenant: users with their account/master/PnL rollups."""
+    try:
+        profiles = (db.table("profiles").select("*").order("created_at").execute().data) or []
+        accounts = (db.table("accounts").select("*").execute().data) or []
+
+        today_iso = date.today().isoformat()
+        copies = (db.table("trade_copies").select("owner_id, status").gte("created_at", today_iso).execute().data) or []
+
+        # Index accounts + copies by owner
+        by_owner: dict = {}
+        for a in accounts:
+            by_owner.setdefault(a.get("owner_id"), []).append(a)
+        copies_by_owner: dict = {}
+        for c in copies:
+            copies_by_owner.setdefault(c.get("owner_id"), []).append(c)
+
+        users = []
+        for p in profiles:
+            uid = p["id"]
+            accs = by_owner.get(uid, [])
+            master = next((a for a in accs if a.get("is_master")), None)
+            followers = [a for a in accs if not a.get("is_master")]
+            ucopies = copies_by_owner.get(uid, [])
+            users.append({
+                "id": uid,
+                "email": p.get("email"),
+                "role": p.get("role", "user"),
+                "created_at": p.get("created_at"),
+                "total_accounts": len(accs),
+                "active_accounts": sum(1 for a in accs if a.get("status") == "active"),
+                "master_name": master["name"] if master else None,
+                "master_live": bool(master) and listener_manager.is_running(master["id"]),
+                "follower_count": len(followers),
+                "today_pnl": round(sum(float(f.get("today_pnl") or 0) for f in followers), 2),
+                "copies_today": len(ucopies),
+                "copies_filled_today": sum(1 for c in ucopies if c.get("status") == "filled"),
+            })
+
+        # Accounts with no matching profile (orphans / pre-auth data)
+        known = {p["id"] for p in profiles}
+        orphan_accounts = sum(1 for a in accounts if a.get("owner_id") not in known)
+
+        return {
+            "totals": {
+                "users": len(profiles),
+                "admins": sum(1 for p in profiles if p.get("role") == "admin"),
+                "accounts": len(accounts),
+                "masters": sum(1 for a in accounts if a.get("is_master")),
+                "active_listeners": listener_manager.active_count,
+                "orphan_accounts": orphan_accounts,
+            },
+            "users": users,
+        }
+    except Exception as e:
+        logger.error(f"Error building admin overview: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/users/{user_id}/role")
+async def set_user_role(user_id: str, role: str, user: CurrentUser = Depends(require_admin)):
+    """Promote/demote a user between 'user' and 'admin'."""
+    if role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
+    res = db.table("profiles").update({"role": role}).eq("id", user_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"success": True, "id": user_id, "role": role}
