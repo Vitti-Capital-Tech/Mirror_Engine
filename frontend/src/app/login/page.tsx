@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
+import { GoogleButton } from '@/components/auth/GoogleButton';
 import { Mail, Lock, ShieldCheck, RefreshCw, ArrowRight } from 'lucide-react';
 
 export default function LoginPage() {
@@ -63,6 +64,7 @@ export default function LoginPage() {
             <>
               <h1 className="text-base font-bold text-text-primary">Sign in</h1>
               <p className="text-xs text-text-muted mt-1 mb-5">Enter your credentials to continue.</p>
+              <GoogleButton />
               <form onSubmit={submitCreds} className="space-y-3">
                 <Field icon={<Mail className="w-4 h-4" />}>
                   <input type="email" required placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}

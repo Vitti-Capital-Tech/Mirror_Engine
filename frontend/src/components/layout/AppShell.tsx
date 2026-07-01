@@ -6,7 +6,7 @@ import { TopBar } from '@/components/layout/TopBar';
 import { LogsConsole } from '@/components/layout/LogsConsole';
 import { useAuth } from '@/context/AuthContext';
 
-const PUBLIC_ROUTES = ['/login', '/signup'];
+const PUBLIC_ROUTES = ['/login', '/signup', '/auth/callback'];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();

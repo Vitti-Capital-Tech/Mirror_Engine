@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import { GoogleButton } from '@/components/auth/GoogleButton';
 import { Mail, Lock, RefreshCw, ArrowRight, CheckCircle } from 'lucide-react';
 
 export default function SignupPage() {
@@ -50,6 +51,7 @@ export default function SignupPage() {
             <>
               <h1 className="text-base font-bold text-text-primary">Create account</h1>
               <p className="text-xs text-text-muted mt-1 mb-5">Set up your Mirror Engine login.</p>
+              <GoogleButton />
               <form onSubmit={submit} className="space-y-3">
                 <Field icon={<Mail className="w-4 h-4" />}>
                   <input type="email" required placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
