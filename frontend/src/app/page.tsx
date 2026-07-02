@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthContext';
 import { MirrorGraphic } from '@/components/auth/AuthShell';
-import { Radio, Scale, ShieldCheck, TrendingUp, ArrowRight, Zap } from 'lucide-react';
+import { Radio, Scale, ShieldCheck, TrendingUp, ArrowRight } from 'lucide-react';
 
 const FEATURES = [
   { icon: Radio, anim: 'icon-pulse', title: 'Real-time mirroring', desc: 'Master fills replicate to every follower in milliseconds — positions, closes, and bracket orders.' },
@@ -107,45 +107,15 @@ export default function Landing() {
         </section>
 
         {/* CTA strip */}
-        <section className="relative mt-8 mb-16 overflow-hidden rounded-2xl border border-blue-500/25 p-10 lg:p-14 text-center">
-          {/* Gradient backdrop + glow */}
-          <div className="pointer-events-none absolute inset-0"
-            style={{ background: 'linear-gradient(135deg, rgba(37,99,235,0.18), rgba(139,92,246,0.12) 55%, transparent)' }} />
-          <div className="pointer-events-none absolute -top-24 left-1/2 -translate-x-1/2 w-[36rem] h-[24rem] rounded-full blur-3xl"
-            style={{ background: 'radial-gradient(circle, rgba(59,130,246,0.22), transparent 60%)' }} />
-          {/* Faint grid */}
-          <div className="pointer-events-none absolute inset-0 opacity-[0.12]"
-            style={{
-              backgroundImage:
-                'linear-gradient(to right, rgba(148,163,184,0.15) 1px, transparent 1px),' +
-                'linear-gradient(to bottom, rgba(148,163,184,0.15) 1px, transparent 1px)',
-              backgroundSize: '40px 40px',
-              maskImage: 'radial-gradient(circle at 50% 0%, black, transparent 70%)',
-            }} />
-
-          <div className="relative z-10 max-w-xl mx-auto">
-            <div className="inline-flex items-center gap-1.5 rounded-full border border-blue-500/30 bg-blue-500/10 px-3 py-1 text-[11px] font-semibold text-blue-300 mb-5">
-              <Zap className="w-3.5 h-3.5" /> Get started free
-            </div>
-            <h2 className="text-2xl sm:text-3xl font-extrabold text-text-primary tracking-tight">
-              Ready to mirror your trades?
-            </h2>
-            <p className="text-sm text-text-secondary mt-3 leading-relaxed">
-              Connect your master account, add followers, and start replicating every fill in
-              real time — set up in minutes.
-            </p>
-            <div className="flex flex-wrap items-center justify-center gap-3 mt-7">
-              <Link href="/signup"
-                className="group relative inline-flex items-center gap-2 py-3 px-7 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white text-sm font-semibold shadow-lg shadow-blue-600/30 transition-all overflow-hidden">
-                <span className="pointer-events-none absolute top-0 left-0 h-full w-1/3 bg-gradient-to-r from-transparent via-white/25 to-transparent -translate-x-full group-hover:translate-x-[400%] transition-transform duration-700" />
-                Get started <ArrowRight className="w-4 h-4" />
-              </Link>
-              <Link href="/login"
-                className="inline-flex items-center gap-2 py-3 px-6 rounded-xl border border-bg-border hover:border-blue-500/50 bg-bg-panel/40 text-sm font-semibold text-text-primary transition-colors">
-                Sign in
-              </Link>
-            </div>
+        <section className="card-premium mt-8 mb-16 p-8 lg:p-10 flex flex-col sm:flex-row items-center justify-between gap-5 text-center sm:text-left">
+          <div>
+            <h2 className="text-xl font-bold text-text-primary tracking-tight">Ready to mirror your trades?</h2>
+            <p className="text-sm text-text-muted mt-1">Set up your master and followers in minutes.</p>
           </div>
+          <Link href="/signup"
+            className="inline-flex items-center gap-2 py-3 px-6 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white text-sm font-semibold shadow-lg shadow-blue-600/25 transition-all shrink-0">
+            Get started <ArrowRight className="w-4 h-4" />
+          </Link>
         </section>
       </main>
 
