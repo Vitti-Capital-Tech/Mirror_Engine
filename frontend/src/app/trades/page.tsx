@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useTrades } from '@/hooks/useTrades';
 import { useSocket } from '@/hooks/useSocket';
 import { TradeLogTable } from '@/components/trades/TradeLogTable';
+import { Loader } from '@/components/shared/Loader';
 
 export default function TradesPage() {
   const queryClient = useQueryClient();
@@ -24,13 +25,17 @@ export default function TradesPage() {
   return (
     <div className="space-y-6">
       {/* Trade log table */}
-      <TradeLogTable 
-        trades={trades} 
-        isLoading={isLoading} 
-        page={page} 
-        setPage={setPage} 
-        hasMore={trades.length === limit} 
-      />
+      {isLoading ? (
+        <Loader label="Loading trades…" />
+      ) : (
+        <TradeLogTable
+          trades={trades}
+          isLoading={false}
+          page={page}
+          setPage={setPage}
+          hasMore={trades.length === limit}
+        />
+      )}
     </div>
   );
 }

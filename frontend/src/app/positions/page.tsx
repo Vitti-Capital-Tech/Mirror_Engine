@@ -6,10 +6,11 @@ import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw, ArrowUpRight, ArrowDownRight, Crown } from 'lucide-react';
+import { Loader } from '@/components/shared/Loader';
 
 export default function PositionsPage() {
   const queryClient = useQueryClient();
-  const { data: accounts = [] } = useAccounts();
+  const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
   const { data: positions = [], isLoading: positionsLoading } = usePositions();
   const { data: masterOrders = [], isLoading: masterOrdersLoading } = useMasterOpenOrders();
   const { latestPosition } = useSocket();
@@ -58,7 +59,7 @@ export default function PositionsPage() {
 
       {/* Grouped account cards: master on top, active followers below.
           Paused accounts are intentionally hidden from the positions view. */}
-      {(() => {
+      {(accountsLoading || positionsLoading) && accounts.length === 0 ? <Loader label="Loading positions…" /> : (() => {
         const visible = accounts.filter((a: any) => a.status !== 'paused');
         const masterAccts = visible.filter((a: any) => a.is_master);
         const followerAccts = visible.filter((a: any) => !a.is_master);

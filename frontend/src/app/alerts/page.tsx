@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useAlerts, useClearAlerts } from '@/hooks/useAlerts';
 import { useSocket } from '@/hooks/useSocket';
 import { AlertsFeed } from '@/components/alerts/AlertsFeed';
+import { Loader } from '@/components/shared/Loader';
 import { Trash2 } from 'lucide-react';
 import { Select } from '@/components/shared/Select';
 
@@ -60,7 +61,7 @@ export default function AlertsPage() {
       </div>
 
       {/* Alerts Feed */}
-      <AlertsFeed alerts={alerts} isLoading={isLoading} />
+      {isLoading ? <Loader label="Loading alerts…" /> : <AlertsFeed alerts={alerts} isLoading={false} />}
     </div>
   );
 }

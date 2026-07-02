@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
 import { AccountsTable } from '@/components/accounts/AccountsTable';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
+import { Loader } from '@/components/shared/Loader';
 import { Plus } from 'lucide-react';
 
 export default function AccountsPage() {
@@ -43,7 +44,7 @@ export default function AccountsPage() {
       </div>
 
       {/* Accounts Table */}
-      <AccountsTable accounts={accounts} isLoading={isLoading} />
+      {isLoading ? <Loader label="Loading accounts…" /> : <AccountsTable accounts={accounts} isLoading={false} />}
 
       {/* Add Account Modal */}
       {isAddModalOpen && (
