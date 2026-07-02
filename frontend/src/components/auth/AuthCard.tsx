@@ -63,13 +63,14 @@ export function AuthCard({ initialMode = 'login' }: { initialMode?: Mode }) {
   );
 }
 
-async function redirectAfterLogin(router: any, fallbackUser?: any) {
-  // Send admins to the admin panel, everyone else to positions.
-  let role = fallbackUser?.role;
-  if (!role) {
-    try { role = (await api.auth.me())?.role; } catch { /* ignore */ }
-  }
-  router.replace(role === 'admin' ? '/admin' : '/positions');
+async function finishLogin(router: any, setSession: any, token: string) {
+  // Store the token, then resolve the FULL user (incl. role) before navigating,
+  // so the correct panel (admin vs trader) shows immediately — no refresh needed.
+  setSession(token);
+  let me: any = null;
+  try { me = await api.auth.me(); } catch { /* ignore */ }
+  if (me) setSession(token, { id: me.id, email: me.email, role: me.role });
+  router.replace(me?.role === 'admin' ? '/admin' : '/positions');
 }
 
 function LoginForm({ onSwitch, setSession, router, active }: any) {
@@ -87,7 +88,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     try {
       const res = await api.auth.login(email, password);
       if (res.twofa_required) { setPendingId(res.pending_id); setStep('otp'); }
-      else { setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined); await redirectAfterLogin(router); }
+      else { await finishLogin(router, setSession, res.access_token); }
     } catch (err: any) {
       const msg = err.message || 'Login failed';
       setError(/invalid email or password/i.test(msg)
@@ -101,8 +102,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     setError(''); setBusy(true);
     try {
       const res = await api.auth.verify2fa(pendingId, code.trim());
-      setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined);
-      await redirectAfterLogin(router);
+      await finishLogin(router, setSession, res.access_token);
     } catch (err: any) { setError(err.message || 'Verification failed'); } finally { setBusy(false); }
   };
 
