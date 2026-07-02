@@ -1,6 +1,7 @@
 'use client';
 import React, { useState } from 'react';
-import { Radio, Scale, ShieldCheck, TrendingUp, Eye, EyeOff, Lock, AlertCircle } from 'lucide-react';
+import Link from 'next/link';
+import { Radio, Scale, ShieldCheck, TrendingUp, Eye, EyeOff, Lock, AlertCircle, ArrowLeft } from 'lucide-react';
 
 const FEATURES = [
   { icon: Radio, anim: 'icon-pulse', title: 'Real-time mirroring', desc: 'Master fills copy to every follower in milliseconds.' },
@@ -150,6 +151,11 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
 
       {/* Right — form area */}
       <main className="relative flex-1 flex items-center justify-center p-6 sm:p-10">
+        {/* Back to landing */}
+        <Link href="/"
+          className="absolute top-6 left-6 sm:top-8 sm:left-8 inline-flex items-center gap-1.5 text-xs font-semibold text-text-muted hover:text-text-primary transition-colors">
+          <ArrowLeft className="w-4 h-4" /> Back
+        </Link>
         <div className="w-full max-w-[400px]">
           <div className="lg:hidden flex items-center gap-3 justify-center mb-7">
             <img src="/logo.jpg" alt="Mirror Engine" className="w-10 h-10 rounded-xl ring-1 ring-bg-border" />
