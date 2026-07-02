@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
-import { setToken } from '@/lib/api';
+import { setToken, api } from '@/lib/api';
 
 export default function AuthCallback() {
   const router = useRouter();
@@ -11,12 +11,14 @@ export default function AuthCallback() {
   useEffect(() => {
     if (!supabase) { router.replace('/login'); return; }
     let done = false;
-    const finish = (token?: string | null) => {
+    const finish = async (token?: string | null) => {
       if (done) return;
       if (token) {
         done = true;
         setToken(token);
-        router.replace('/positions');
+        let role: string | undefined;
+        try { role = (await api.auth.me())?.role; } catch { /* ignore */ }
+        router.replace(role === 'admin' ? '/admin' : '/positions');
       }
     };
 

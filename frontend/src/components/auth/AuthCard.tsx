@@ -63,6 +63,15 @@ export function AuthCard({ initialMode = 'login' }: { initialMode?: Mode }) {
   );
 }
 
+async function redirectAfterLogin(router: any, fallbackUser?: any) {
+  // Send admins to the admin panel, everyone else to positions.
+  let role = fallbackUser?.role;
+  if (!role) {
+    try { role = (await api.auth.me())?.role; } catch { /* ignore */ }
+  }
+  router.replace(role === 'admin' ? '/admin' : '/positions');
+}
+
 function LoginForm({ onSwitch, setSession, router, active }: any) {
   const [step, setStep] = useState<'creds' | 'otp'>('creds');
   const [email, setEmail] = useState('');
@@ -78,7 +87,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     try {
       const res = await api.auth.login(email, password);
       if (res.twofa_required) { setPendingId(res.pending_id); setStep('otp'); }
-      else { setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined); router.replace('/positions'); }
+      else { setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined); await redirectAfterLogin(router); }
     } catch (err: any) {
       const msg = err.message || 'Login failed';
       setError(/invalid email or password/i.test(msg)
@@ -93,7 +102,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     try {
       const res = await api.auth.verify2fa(pendingId, code.trim());
       setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined);
-      router.replace('/positions');
+      await redirectAfterLogin(router);
     } catch (err: any) { setError(err.message || 'Verification failed'); } finally { setBusy(false); }
   };
 
