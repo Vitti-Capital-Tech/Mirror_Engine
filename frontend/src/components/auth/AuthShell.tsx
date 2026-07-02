@@ -1,0 +1,116 @@
+'use client';
+import React from 'react';
+import { ShieldCheck, Zap, Layers, TrendingUp } from 'lucide-react';
+
+const FEATURES = [
+  { icon: Zap, title: 'Real-time mirroring', desc: 'Master fills copy to every follower in milliseconds.' },
+  { icon: Layers, title: 'Balance-ratio sizing', desc: 'Each account sized precisely to its own capital.' },
+  { icon: ShieldCheck, title: 'Encrypted & isolated', desc: 'Keys encrypted at rest, per-user data isolation.' },
+];
+
+/** Premium split-screen wrapper for the auth pages. */
+export function AuthShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="min-h-screen w-screen flex bg-bg-primary overflow-hidden">
+      {/* Left — brand / hero (hidden on small screens) */}
+      <aside className="relative hidden lg:flex flex-col justify-between w-[46%] max-w-[620px] p-12 xl:p-16 overflow-hidden border-r border-bg-border">
+        {/* Ambient gradient wash */}
+        <div className="pointer-events-none absolute inset-0 opacity-90"
+          style={{
+            backgroundImage:
+              'radial-gradient(700px circle at 15% 10%, rgba(59,130,246,0.14), transparent 55%),' +
+              'radial-gradient(600px circle at 90% 90%, rgba(139,92,246,0.12), transparent 55%)',
+          }} />
+        {/* Faint grid */}
+        <div className="pointer-events-none absolute inset-0 opacity-[0.15]"
+          style={{
+            backgroundImage:
+              'linear-gradient(to right, rgba(148,163,184,0.12) 1px, transparent 1px),' +
+              'linear-gradient(to bottom, rgba(148,163,184,0.12) 1px, transparent 1px)',
+            backgroundSize: '44px 44px',
+            maskImage: 'radial-gradient(circle at 30% 30%, black, transparent 75%)',
+          }} />
+
+        <div className="relative z-10 flex items-center gap-3">
+          <div className="relative w-11 h-11 rounded-2xl overflow-hidden ring-1 ring-bg-border shadow-lg shadow-blue-500/20">
+            <img src="/logo.jpg" alt="Mirror Engine" className="w-full h-full object-cover" />
+            <span className="pointer-events-none absolute top-0 left-0 h-full w-2/3 bg-gradient-to-r from-transparent via-white/55 to-transparent animate-shimmer" />
+          </div>
+          <span className="font-extrabold text-xl bg-gradient-to-r from-white via-sky-200 to-blue-400 bg-clip-text text-transparent tracking-tight">
+            Mirror Engine
+          </span>
+        </div>
+
+        <div className="relative z-10 max-w-md">
+          <div className="inline-flex items-center gap-1.5 rounded-full border border-bg-border bg-bg-panel/50 px-3 py-1 text-[11px] font-semibold text-text-secondary mb-6">
+            <TrendingUp className="w-3.5 h-3.5 text-emerald-400" /> Copy-trading for Delta Exchange
+          </div>
+          <h1 className="text-3xl xl:text-4xl font-extrabold text-text-primary leading-tight tracking-tight">
+            One master.<br />
+            <span className="bg-gradient-to-r from-sky-300 to-blue-500 bg-clip-text text-transparent">Infinite mirrors.</span>
+          </h1>
+          <p className="text-sm text-text-secondary mt-4 leading-relaxed">
+            Trade once on your master account and watch it replicate across every follower,
+            sized to the last contract — automatically.
+          </p>
+
+          <div className="mt-9 space-y-4">
+            {FEATURES.map((f) => {
+              const Icon = f.icon;
+              return (
+                <div key={f.title} className="flex items-start gap-3">
+                  <div className="mt-0.5 flex items-center justify-center w-9 h-9 rounded-xl bg-blue-500/10 ring-1 ring-blue-500/20 shrink-0">
+                    <Icon className="w-[18px] h-[18px] text-blue-400" />
+                  </div>
+                  <div>
+                    <div className="text-sm font-semibold text-text-primary">{f.title}</div>
+                    <div className="text-xs text-text-muted mt-0.5">{f.desc}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="relative z-10 text-[11px] text-text-muted">
+          © {new Date().getFullYear()} Vitti Capital · Mirror Engine
+        </div>
+      </aside>
+
+      {/* Right — form area */}
+      <main className="relative flex-1 flex items-center justify-center p-6 sm:p-10">
+        <div className="w-full max-w-[400px] animate-fade-in">
+          {/* Compact logo shown only when hero is hidden */}
+          <div className="lg:hidden flex items-center gap-3 justify-center mb-7">
+            <img src="/logo.jpg" alt="Mirror Engine" className="w-10 h-10 rounded-xl ring-1 ring-bg-border" />
+            <span className="font-extrabold text-lg bg-gradient-to-r from-white via-sky-200 to-blue-400 bg-clip-text text-transparent tracking-tight">
+              Mirror Engine
+            </span>
+          </div>
+          {children}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export function Field({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="group flex items-center gap-2.5 bg-bg-primary/70 border border-bg-border rounded-xl px-3.5 py-3 transition-all focus-within:border-blue-500/70 focus-within:ring-2 focus-within:ring-blue-500/15 focus-within:bg-bg-primary">
+      <span className="text-text-muted group-focus-within:text-blue-400 shrink-0 transition-colors">{icon}</span>
+      {children}
+    </div>
+  );
+}
+
+export function SubmitButton({ busy, children }: { busy: boolean; children: React.ReactNode }) {
+  return (
+    <button
+      disabled={busy}
+      className="group relative w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white text-sm font-semibold shadow-lg shadow-blue-600/25 transition-all disabled:opacity-60 overflow-hidden"
+    >
+      <span className="pointer-events-none absolute top-0 left-0 h-full w-1/3 bg-gradient-to-r from-transparent via-white/25 to-transparent -translate-x-full group-hover:translate-x-[400%] transition-transform duration-700" />
+      {children}
+    </button>
+  );
+}
