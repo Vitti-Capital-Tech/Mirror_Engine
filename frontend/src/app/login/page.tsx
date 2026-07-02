@@ -5,8 +5,8 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { GoogleButton } from '@/components/auth/GoogleButton';
-import { AuthShell, Field, SubmitButton } from '@/components/auth/AuthShell';
-import { Mail, Lock, ShieldCheck, RefreshCw, ArrowRight, ArrowLeft } from 'lucide-react';
+import { AuthShell, Field, PasswordField, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
+import { Mail, ShieldCheck, RefreshCw, ArrowRight, ArrowLeft } from 'lucide-react';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -33,7 +33,12 @@ export default function LoginPage() {
         router.replace('/positions');
       }
     } catch (err: any) {
-      setError(err.message || 'Login failed');
+      const msg = err.message || 'Login failed';
+      setError(
+        /invalid email or password/i.test(msg)
+          ? "We couldn't sign you in — check your email and password, or create an account if you don't have one yet."
+          : msg
+      );
     } finally { setBusy(false); }
   };
 
@@ -57,7 +62,7 @@ export default function LoginPage() {
 
   return (
     <AuthShell>
-      <div className="card-premium p-8">
+      <div className="card-premium p-8 animate-slide-in">
         {step === 'creds' ? (
           <>
             <h1 className="text-xl font-bold text-text-primary tracking-tight">Welcome back</h1>
@@ -68,11 +73,8 @@ export default function LoginPage() {
                 <input type="text" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
                   className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
               </Field>
-              <Field icon={<Lock className="w-4 h-4" />}>
-                <input type="password" required placeholder="Password" value={password} onChange={e => setPassword(e.target.value)}
-                  className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
-              </Field>
-              {error && <p className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{error}</p>}
+              <PasswordField value={password} onChange={setPassword} />
+              <ErrorBanner message={error} />
               <SubmitButton busy={busy}>
                 {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Sign in <ArrowRight className="w-4 h-4" /></>}
               </SubmitButton>
@@ -94,7 +96,7 @@ export default function LoginPage() {
               <input inputMode="numeric" maxLength={6} required placeholder="••••••" value={code}
                 onChange={e => setCode(e.target.value.replace(/\D/g, ''))}
                 className="w-full bg-bg-primary border border-bg-border rounded-xl px-3 py-3.5 text-center text-2xl font-bold tracking-[0.4em] font-mono text-text-primary outline-none focus:border-blue-500/70 focus:ring-2 focus:ring-blue-500/15 transition-all" />
-              {error && <p className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{error}</p>}
+              <ErrorBanner message={error} />
               <SubmitButton busy={busy || code.length < 6}>
                 {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : 'Verify & sign in'}
               </SubmitButton>

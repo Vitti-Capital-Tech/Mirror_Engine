@@ -4,8 +4,8 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { GoogleButton } from '@/components/auth/GoogleButton';
-import { AuthShell, Field, SubmitButton } from '@/components/auth/AuthShell';
-import { Mail, Lock, RefreshCw, ArrowRight, CheckCircle } from 'lucide-react';
+import { AuthShell, Field, PasswordField, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
+import { Mail, RefreshCw, ArrowRight, CheckCircle } from 'lucide-react';
 
 export default function SignupPage() {
   const router = useRouter();
@@ -33,7 +33,7 @@ export default function SignupPage() {
 
   return (
     <AuthShell>
-      <div className="card-premium p-8">
+      <div className="card-premium p-8 animate-slide-in">
         {done ? (
           <div className="text-center py-8">
             <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-emerald-500/10 ring-1 ring-emerald-500/20 mb-4 mx-auto glow-green">
@@ -52,15 +52,9 @@ export default function SignupPage() {
                 <input type="email" required placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
                   className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
               </Field>
-              <Field icon={<Lock className="w-4 h-4" />}>
-                <input type="password" required placeholder="Password" value={password} onChange={e => setPassword(e.target.value)}
-                  className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
-              </Field>
-              <Field icon={<Lock className="w-4 h-4" />}>
-                <input type="password" required placeholder="Confirm password" value={confirm} onChange={e => setConfirm(e.target.value)}
-                  className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
-              </Field>
-              {error && <p className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{error}</p>}
+              <PasswordField value={password} onChange={setPassword} />
+              <PasswordField value={confirm} onChange={setConfirm} placeholder="Confirm password" />
+              <ErrorBanner message={error} />
               <SubmitButton busy={busy}>
                 {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Create account <ArrowRight className="w-4 h-4" /></>}
               </SubmitButton>
