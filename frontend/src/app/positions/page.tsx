@@ -88,12 +88,19 @@ export default function PositionsPage() {
                 
                 <div className="flex items-center gap-6 font-mono text-xs font-bold">
                   <div className="flex items-center gap-2">
+                    <span className="text-text-muted text-[10px] uppercase font-semibold">Today P&L:</span>
+                    <span className={Number(acc.today_pnl) > 0 ? 'text-emerald-400' : Number(acc.today_pnl) < 0 ? 'text-red-400' : 'text-text-secondary'}>
+                      {Number(acc.today_pnl || 0) >= 0 ? '+' : ''}{Number(acc.today_pnl || 0).toFixed(2)} USDT
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
                     <span className="text-text-muted text-[10px] uppercase font-semibold">Active P&L:</span>
                     <span className={activePnL > 0 ? 'text-emerald-400' : activePnL < 0 ? 'text-red-400' : 'text-text-secondary'}>
                       {activePnL >= 0 ? '+' : ''}{activePnL.toFixed(2)} USDT
                     </span>
                   </div>
-                  
+
                   <div className="flex items-center gap-2">
                     <span className="text-text-muted text-[10px] uppercase font-semibold">Balance:</span>
                     <span className="text-text-primary">

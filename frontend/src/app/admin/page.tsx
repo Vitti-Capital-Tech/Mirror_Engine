@@ -44,20 +44,10 @@ export default function AdminPositions() {
               <div className="flex items-center gap-2.5 min-w-0">
                 <ChevronDown className={`w-4 h-4 text-text-muted transition-transform ${isOpen(u.id) ? '' : '-rotate-90'}`} />
                 <span className="font-semibold text-text-primary truncate">{u.email}</span>
-                <span className="text-[11px] text-text-muted">
-                  {u.accounts.length} account{u.accounts.length === 1 ? '' : 's'} · {u.total_positions} position{u.total_positions === 1 ? '' : 's'}
-                </span>
               </div>
-              <div className="flex items-center gap-5 font-mono text-xs font-bold">
-                <span className="flex items-center gap-1.5">
-                  <span className="text-text-muted text-[10px] uppercase font-semibold">Today:</span>
-                  <span className={pnlClass(u.today_pnl)}>{u.today_pnl >= 0 ? '+' : ''}{Number(u.today_pnl).toFixed(2)}</span>
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="text-text-muted text-[10px] uppercase font-semibold">Active P&L:</span>
-                  <span className={pnlClass(u.total_upnl)}>{u.total_upnl >= 0 ? '+' : ''}{Number(u.total_upnl).toFixed(2)}</span>
-                </span>
-              </div>
+              <span className="text-[11px] text-text-muted">
+                {u.accounts.length} account{u.accounts.length === 1 ? '' : 's'} · {u.total_positions} position{u.total_positions === 1 ? '' : 's'}
+              </span>
             </button>
 
             {isOpen(u.id) && (
