@@ -187,11 +187,21 @@ body {
 .glow-yellow { box-shadow: 0 0 24px rgba(245, 158, 11, 0.18); }
 .glow-purple { box-shadow: 0 0 24px rgba(139, 92, 246, 0.18); }
 
-/* Smooth global focus ring */
+/* Smooth global focus ring — for buttons/links/interactive elements only.
+   Form fields style their own focus (border + soft ring), so exclude them to
+   avoid a doubled outline. */
 :focus-visible {
   outline: 2px solid rgba(59, 130, 246, 0.6);
   outline-offset: 2px;
   border-radius: 6px;
+}
+input:focus,
+input:focus-visible,
+textarea:focus,
+textarea:focus-visible,
+select:focus,
+select:focus-visible {
+  outline: none;
 }
 
 /* Native <select> styling — custom chevron + dark dropdown options */
