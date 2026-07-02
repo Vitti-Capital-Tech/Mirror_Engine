@@ -117,15 +117,9 @@ export default function Landing() {
 
       {/* Footer */}
       <footer className="relative z-10 border-t border-bg-border">
-        <div className="max-w-6xl mx-auto px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-[11px] text-text-muted">
-          <span>
-            © {new Date().getFullYear()}{' '}
-            <a href="https://vitti.capital" target="_blank" rel="noopener noreferrer" className="text-text-secondary hover:text-blue-400 font-medium transition-colors">Vitti Capital</a>{' '}· Mirror Engine
-          </span>
-          <div className="flex items-center gap-4">
-            <Link href="/login" className="hover:text-text-secondary transition-colors">Sign in</Link>
-            <Link href="/signup" className="hover:text-text-secondary transition-colors">Create account</Link>
-          </div>
+        <div className="max-w-6xl mx-auto px-6 py-6 text-[11px] text-text-muted text-center">
+          © {new Date().getFullYear()}{' '}
+          <a href="https://vitti.capital" target="_blank" rel="noopener noreferrer" className="text-text-secondary hover:text-blue-400 font-medium transition-colors">Vitti Capital</a>{' '}· Mirror Engine
         </div>
       </footer>
     </div>

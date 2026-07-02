@@ -148,7 +148,7 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
       <main className="relative flex-1 flex items-center justify-center p-6 sm:p-10">
         {/* Back to landing */}
         <Link href="/"
-          className="absolute top-6 left-6 sm:top-8 sm:left-8 inline-flex items-center gap-1.5 text-xs font-semibold text-text-muted hover:text-text-primary transition-colors">
+          className="absolute top-6 left-6 sm:top-8 sm:left-8 inline-flex items-center gap-1.5 text-sm font-semibold text-text-secondary hover:text-text-primary px-4 py-2 rounded-lg border border-bg-border hover:border-blue-500/50 transition-colors">
           <ArrowLeft className="w-4 h-4" /> Back
         </Link>
         <div className="w-full max-w-[400px]">
