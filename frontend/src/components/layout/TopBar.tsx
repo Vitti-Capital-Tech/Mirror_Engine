@@ -103,15 +103,18 @@ export function TopBar() {
   const { title, subtitle } = meta[pathname] || { title: 'Mirror Engine', subtitle: 'Delta Exchange India · Copy Trading' };
 
   return (
-    <header className="relative z-30 h-16 border-b border-bg-border bg-bg-panel/70 backdrop-blur-xl flex items-center justify-between px-6 select-none shrink-0">
-      <div className="flex flex-col">
-        <h1 className="text-[17px] font-bold text-text-primary tracking-tight leading-tight">{title}</h1>
-        <span className="text-[11px] text-text-muted font-medium leading-tight mt-0.5">{subtitle}</span>
+    <header className="relative z-30 h-16 border-b border-bg-border bg-bg-panel/70 backdrop-blur-xl flex items-center justify-between px-4 sm:px-6 gap-3 select-none shrink-0">
+      <div className="flex items-center gap-2.5 min-w-0">
+        <img src="/logo.jpg" alt="Mirror Engine" className="lg:hidden w-8 h-8 rounded-lg ring-1 ring-bg-border shrink-0" />
+        <div className="flex flex-col min-w-0">
+          <h1 className="text-[15px] sm:text-[17px] font-bold text-text-primary tracking-tight leading-tight truncate">{title}</h1>
+          <span className="hidden sm:block text-[11px] text-text-muted font-medium leading-tight mt-0.5 truncate">{subtitle}</span>
+        </div>
       </div>
 
-      <div className="flex items-center gap-2.5">
+      <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
         {/* Connection Status Indicator */}
-        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-bold tracking-wide select-none border transition-colors ${
+        <div className={`flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-full text-[11px] font-bold tracking-wide select-none border transition-colors ${
           isConnected
             ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/25 shadow-[0_0_16px_-4px_rgba(16,185,129,0.4)]'
             : 'bg-red-500/10 text-red-400 border-red-500/25'
@@ -120,7 +123,7 @@ export function TopBar() {
             {isConnected && <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping" />}
             <span className={`relative inline-flex h-2 w-2 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-red-400'}`} />
           </span>
-          {isConnected ? 'LIVE' : 'DISCONNECTED'}
+          <span className="hidden sm:inline">{isConnected ? 'LIVE' : 'DISCONNECTED'}</span>
         </div>
 
         {/* Theme Toggle */}

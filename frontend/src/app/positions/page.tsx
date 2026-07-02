@@ -73,7 +73,7 @@ export default function PositionsPage() {
           return (
             <div key={acc.id} className="card-premium overflow-hidden shadow-md">
               {/* Card Header */}
-              <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-6 py-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-bg-border bg-bg-panel/40 px-4 sm:px-6 py-4">
                 <div className="flex items-center gap-3 min-w-0">
                   <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
                     {acc.name?.charAt(0)?.toUpperCase() || '?'}
@@ -86,7 +86,7 @@ export default function PositionsPage() {
                   <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
                 </div>
                 
-                <div className="flex items-center gap-6 font-mono text-xs font-bold">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs font-bold">
                   <div className="flex items-center gap-2">
                     <span className="text-text-muted text-[10px] uppercase font-semibold">Today P&L:</span>
                     <span className={Number(acc.today_pnl) > 0 ? 'text-emerald-400' : Number(acc.today_pnl) < 0 ? 'text-red-400' : 'text-text-secondary'}>

@@ -2,6 +2,7 @@
 import React, { useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/layout/Sidebar';
+import { MobileNav } from '@/components/layout/MobileNav';
 import { TopBar } from '@/components/layout/TopBar';
 import { LogsConsole } from '@/components/layout/LogsConsole';
 import { useAuth } from '@/context/AuthContext';
@@ -37,9 +38,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <Sidebar />
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         <TopBar />
-        <main className="flex-1 overflow-auto p-6 bg-bg-primary">{children}</main>
-        <LogsConsole />
+        <main className="flex-1 overflow-auto p-4 sm:p-6 pb-24 lg:pb-6 bg-bg-primary">{children}</main>
+        <div className="hidden lg:block"><LogsConsole /></div>
       </div>
+      <MobileNav />
     </div>
   );
 }

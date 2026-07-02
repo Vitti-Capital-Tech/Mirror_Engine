@@ -30,7 +30,7 @@ export function Sidebar() {
   const links = isAdmin ? adminLinks : traderLinks;
 
   return (
-    <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border flex flex-col h-full select-none transition-all duration-300 ${
+    <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border hidden lg:flex flex-col h-full select-none transition-all duration-300 ${
       isCollapsed ? 'w-20' : 'w-64'
     }`}>
       {/* Top logo */}
