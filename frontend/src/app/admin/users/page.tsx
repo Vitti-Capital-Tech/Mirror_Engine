@@ -1,8 +1,13 @@
 'use client';
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
-import { AdminHeader, pnlClass } from '@/components/admin/AdminUI';
+import { AdminHeader } from '@/components/admin/AdminUI';
 import { Crown, Search } from 'lucide-react';
+
+function fmtDate(iso?: string) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
 
 export default function AdminUsers() {
   const [users, setUsers] = useState<any[]>([]);
@@ -45,8 +50,9 @@ export default function AdminUsers() {
                 <th className="px-4 py-3 font-bold">Master</th>
                 <th className="px-4 py-3 font-bold text-right">Followers</th>
                 <th className="px-4 py-3 font-bold text-right">Active</th>
-                <th className="px-4 py-3 font-bold text-right">Today PnL</th>
+                <th className="px-4 py-3 font-bold text-right">Total Balance</th>
                 <th className="px-4 py-3 font-bold text-right">Copies (Filled)</th>
+                <th className="px-4 py-3 font-bold text-right">Joined</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/[0.04]">
@@ -67,12 +73,13 @@ export default function AdminUsers() {
                   </td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.follower_count}</td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.active_accounts}/{u.total_accounts}</td>
-                  <td className={`px-4 py-3 text-right font-mono font-semibold ${pnlClass(u.today_pnl)}`}>{Number(u.today_pnl).toFixed(2)}</td>
+                  <td className="px-4 py-3 text-right font-mono text-text-primary">{u.total_balance != null ? Number(u.total_balance).toFixed(2) : '—'}</td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.copies_filled_today}/{u.copies_today}</td>
+                  <td className="px-4 py-3 text-right text-text-muted whitespace-nowrap">{fmtDate(u.created_at)}</td>
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
-                <tr><td colSpan={6} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
+                <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
               )}
             </tbody>
           </table>

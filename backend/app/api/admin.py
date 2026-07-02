@@ -50,6 +50,7 @@ async def admin_overview(user: CurrentUser = Depends(require_admin)):
                 "master_live": bool(master) and listener_manager.is_running(master["id"]),
                 "follower_count": len(followers),
                 "today_pnl": round(sum(float(a.get("today_pnl") or 0) for a in accs), 2),
+                "total_balance": round(sum(float(a.get("balance") or 0) for a in accs), 2),
                 "copies_today": len(ucopies),
                 "copies_filled_today": sum(1 for c in ucopies if c.get("status") == "filled"),
             })
@@ -140,6 +141,9 @@ async def admin_positions(user: CurrentUser = Depends(require_admin)):
                 "status": acc.get("status"),
                 "environment": acc.get("environment"),
                 "live": bool(acc.get("is_master")) and listener_manager.is_running(acc["id"]),
+                "balance": acc.get("balance"),
+                "allocated_balance": acc.get("allocated_balance"),
+                "today_pnl": acc.get("today_pnl"),
                 "positions": positions,
             })
 
@@ -150,6 +154,7 @@ async def admin_positions(user: CurrentUser = Depends(require_admin)):
             e["total_upnl"] = round(sum(
                 float(p.get("unrealized_pnl") or 0) for a in e["accounts"] for p in a["positions"]
             ), 2)
+            e["today_pnl"] = round(sum(float(a.get("today_pnl") or 0) for a in e["accounts"]), 2)
             users.append(e)
         users.sort(key=lambda u: (u["email"] or "").lower())
         return {"users": users}
