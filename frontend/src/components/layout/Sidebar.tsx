@@ -3,6 +3,7 @@ import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Wallet } from 'lucide-react';
+// (Activity reused for admin Positions)
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
   const pathname = usePathname();
@@ -21,6 +22,7 @@ export function Sidebar() {
   const adminLinks = [
     { href: '/admin', label: 'Overview', icon: LayoutGrid },
     { href: '/admin/users', label: 'Users', icon: Users },
+    { href: '/admin/positions', label: 'Positions', icon: Activity },
     { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
   ];
 

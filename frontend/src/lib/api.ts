@@ -97,6 +97,7 @@ export const api = {
   admin: {
     overview: () => fetchAPI<any>('/api/admin/overview'),
     accounts: () => fetchAPI<any[]>('/api/admin/accounts'),
+    positions: () => fetchAPI<any>('/api/admin/positions'),
     setRole: (userId: string, role: 'user' | 'admin') =>
       fetchAPI<any>(`/api/admin/users/${userId}/role?role=${role}`, { method: 'POST' }),
   },

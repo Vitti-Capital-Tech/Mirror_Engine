@@ -1,5 +1,6 @@
 """Admin-only endpoints: cross-tenant visibility over all users and their data."""
 
+import asyncio
 import logging
 from datetime import date
 from fastapi import APIRouter, HTTPException, Depends
@@ -102,6 +103,58 @@ async def admin_accounts(user: CurrentUser = Depends(require_admin)):
         return out
     except Exception as e:
         logger.error(f"Error listing admin accounts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/positions")
+async def admin_positions(user: CurrentUser = Depends(require_admin)):
+    """Live positions for every tenant, grouped by user → master + followers.
+
+    Fetches straight from Delta (same source as the trader Positions page) so it
+    always matches the exchange."""
+    try:
+        from app.api.positions import _fetch_account_positions
+
+        profiles = (db.table("profiles").select("id, email").execute().data) or []
+        email_by_id = {p["id"]: p.get("email") for p in profiles}
+        accounts = (db.table("accounts").select("*").execute().data) or []
+
+        results = await asyncio.gather(
+            *[_fetch_account_positions(a) for a in accounts],
+            return_exceptions=True,
+        )
+
+        by_owner: dict = {}
+        for acc, res in zip(accounts, results):
+            positions = res if isinstance(res, list) else []
+            owner = acc.get("owner_id")
+            entry = by_owner.setdefault(owner, {
+                "id": owner,
+                "email": email_by_id.get(owner) or "—",
+                "accounts": [],
+            })
+            entry["accounts"].append({
+                "id": acc["id"],
+                "name": acc.get("name"),
+                "is_master": bool(acc.get("is_master")),
+                "status": acc.get("status"),
+                "environment": acc.get("environment"),
+                "live": bool(acc.get("is_master")) and listener_manager.is_running(acc["id"]),
+                "positions": positions,
+            })
+
+        users = []
+        for e in by_owner.values():
+            e["accounts"].sort(key=lambda a: (not a["is_master"], a["name"] or ""))
+            e["total_positions"] = sum(len(a["positions"]) for a in e["accounts"])
+            e["total_upnl"] = round(sum(
+                float(p.get("unrealized_pnl") or 0) for a in e["accounts"] for p in a["positions"]
+            ), 2)
+            users.append(e)
+        users.sort(key=lambda u: (u["email"] or "").lower())
+        return {"users": users}
+    except Exception as e:
+        logger.error(f"Error building admin positions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
