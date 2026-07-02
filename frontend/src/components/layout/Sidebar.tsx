@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Server, Wallet } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Wallet } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
   const pathname = usePathname();
@@ -22,7 +22,6 @@ export function Sidebar() {
     { href: '/admin', label: 'Overview', icon: LayoutGrid },
     { href: '/admin/users', label: 'Users', icon: Users },
     { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
-    { href: '/admin/system', label: 'System', icon: Server },
   ];
 
   const links = isAdmin ? adminLinks : traderLinks;

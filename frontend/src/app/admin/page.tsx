@@ -58,9 +58,6 @@ export default function AdminOverview() {
             <span className="text-text-muted">WS conns:</span>
             <span className="font-mono text-text-primary">{system.total_ws_connections}</span>
           </div>
-          <Link href="/admin/system" className="ml-auto text-xs font-semibold text-blue-400 hover:text-blue-300 flex items-center gap-1">
-            Details <ArrowRight className="w-3.5 h-3.5" />
-          </Link>
         </div>
       )}
 

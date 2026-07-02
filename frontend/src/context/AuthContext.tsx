@@ -12,11 +12,30 @@ interface AuthState {
   refresh: () => Promise<void>;
 }
 
+const USER_KEY = 'me_user';
+
+function readCachedUser(): User | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as User) : null;
+  } catch { return null; }
+}
+function writeCachedUser(u: User | null) {
+  if (typeof window === 'undefined') return;
+  if (u) localStorage.setItem(USER_KEY, JSON.stringify(u));
+  else localStorage.removeItem(USER_KEY);
+}
+
 const AuthContext = createContext<AuthState | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  // Hydrate synchronously from cache so role (admin/user) is known on first
+  // paint after a refresh — avoids briefly showing the wrong panel.
+  const [user, setUserState] = useState<User | null>(() => (getToken() ? readCachedUser() : null));
   const [loading, setLoading] = useState(true);
+
+  const setUser = (u: User | null) => { setUserState(u); writeCachedUser(u); };
 
   const refresh = useCallback(async () => {
     if (!getToken()) { setUser(null); setLoading(false); return; }

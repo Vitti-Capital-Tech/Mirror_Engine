@@ -1,5 +1,16 @@
-import { redirect } from 'next/navigation';
+'use client';
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/context/AuthContext';
 
 export default function Home() {
-  redirect('/positions');
+  const { user, loading } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (loading) return;
+    router.replace(user?.role === 'admin' ? '/admin' : '/positions');
+  }, [user, loading, router]);
+
+  return null;
 }
