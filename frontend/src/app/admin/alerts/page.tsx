@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { api } from '@/lib/api';
-import { AdminHeader } from '@/components/admin/AdminUI';
+import { AdminHeader, Loader } from '@/components/admin/AdminUI';
 import { AlertTriangle, ShieldAlert, Info, Search } from 'lucide-react';
 
 function timeAgo(iso?: string) {
@@ -100,6 +100,7 @@ export default function AdminAlerts() {
             </div>
           );
         })}
+        {loading && filtered.length === 0 && <Loader label="Loading alerts…" />}
         {!loading && filtered.length === 0 && (
           <div className="card-premium p-10 text-center text-text-muted">No alerts found.</div>
         )}

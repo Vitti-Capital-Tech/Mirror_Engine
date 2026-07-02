@@ -84,6 +84,11 @@ export default function AdminAccounts() {
               {!loading && filtered.length === 0 && (
                 <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">No accounts found.</td></tr>
               )}
+              {loading && filtered.length === 0 && (
+                <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">
+                  <span className="inline-flex items-center gap-2"><span className="inline-block w-4 h-4 rounded-full border-2 border-blue-500/30 border-t-blue-500 animate-spin" /> Loading…</span>
+                </td></tr>
+              )}
             </tbody>
           </table>
         </div>

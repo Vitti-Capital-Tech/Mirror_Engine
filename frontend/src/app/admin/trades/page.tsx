@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
-import { AdminHeader } from '@/components/admin/AdminUI';
+import { AdminHeader, Loader } from '@/components/admin/AdminUI';
 import { TradeLogTable } from '@/components/trades/TradeLogTable';
 import { Search, ChevronDown } from 'lucide-react';
 
@@ -35,6 +35,7 @@ export default function AdminTrades() {
 
       {error && <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-sm rounded-lg px-4 py-3 mb-5">{error}</div>}
 
+      {loading && filtered.length === 0 && <Loader label="Loading trades…" />}
       {!loading && filtered.length === 0 && (
         <div className="card-premium p-10 text-center text-text-muted">No trades found.</div>
       )}

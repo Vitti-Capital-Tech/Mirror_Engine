@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
-import { AdminHeader, pnlClass } from '@/components/admin/AdminUI';
+import { AdminHeader, pnlClass, Loader } from '@/components/admin/AdminUI';
 import { Crown, ChevronDown, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 
 export default function AdminPositions() {
@@ -31,6 +31,7 @@ export default function AdminPositions() {
 
       {error && <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-sm rounded-lg px-4 py-3 mb-5">{error}</div>}
 
+      {loading && users.length === 0 && <Loader label="Loading positions…" />}
       {!loading && users.length === 0 && (
         <div className="card-premium p-10 text-center text-text-muted">No open positions.</div>
       )}
