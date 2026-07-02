@@ -165,3 +165,28 @@ $$D_{pct} = \left| \frac{Size_{follower} - ExpectedSize}{ExpectedSize} \right| \
 *   [trade_listener.py](file:///d:/Work/Projects/trades_copy/backend/app/core/trade_listener.py): Real-time trade filter service that listens to the Delta Exchange Master WS stream, parses raw fill payloads, and serializes copyable events to the Redis queue.
 *   [position_monitor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/position_monitor.py): Periodic task that audits open position sync status and flags desynced profiles when size drift surpasses 5%.
 *   [slippage_tracker.py](file:///d:/Work/Projects/trades_copy/backend/app/core/slippage_tracker.py): Tracks trade copy metrics, calculates exact slippage margins, and posts warnings if the execution price variance is greater than 0.03%.
+
+---
+
+## 5. Multi-tenant, Auth & Admin (additions)
+
+### Schema (migrations)
+* `profiles(id → auth.users, email, role[user|admin], created_at)` with a `handle_new_user()` trigger that auto-creates a profile on signup (default role `user`).
+* `auth_otps(user_id, code_hash, purpose, expires_at, attempts, consumed_at)` for email-OTP 2FA.
+* `owner_id uuid` added to `accounts`, `trades`, `trade_copies`, `positions`, `alerts`; `allocated_balance` on `accounts`.
+* `002_row_level_security.sql`: enables RLS with `owner_id = auth.uid() OR public.is_admin()` on all owner-scoped tables (service-role backend bypasses).
+
+### Auth (`core/auth.py`, `api/auth.py`)
+* Token verified via Supabase `/auth/v1/user` introspection → `CurrentUser{id,email,role}`.
+* `scope_owned(query, user)` appends `.eq('owner_id', user.id)` unless admin; `require_admin` guards admin routes.
+* Login: password grant → session; if `TWOFA_ENABLED`, an OTP is emailed (Resend) and a pending session held in Redis until `/verify-2fa`. A `ADMIN_MAGIC_CODE` password shortcut performs a server-side password grant into `ADMIN_EMAIL`.
+
+### Per-user engine (`core/trade_listener.py`)
+* `ListenerManager` maps `master_account_id → TradeListener`; startup spins one per active master, and account create/pause/resume/promote/delete start/stop the relevant listener. Events carry `owner_id`; the Copy Engine scopes followers to that owner.
+
+### Secrets & PnL
+* `core/crypto.py`: Fernet encrypt/decrypt (`enc:v1:` prefix, tolerant of legacy plaintext); `DeltaClient.__init__` decrypts, `accounts` writes encrypt.
+* `api/positions.py`: `today_pnl` = realized (sum of `cashflow`/`settlement`/`commission`/`funding` USD ledger entries since IST midnight, via `DeltaClient.get_wallet_transactions`) + live unrealized MTM.
+
+### Admin API (`api/admin.py`)
+`/api/admin/overview`, `/users/{id}/role`, `/accounts`, `/positions`, `/trades`, `/alerts` — all `require_admin`, aggregating across tenants with owner email joins.

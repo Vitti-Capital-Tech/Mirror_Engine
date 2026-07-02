@@ -95,4 +95,21 @@ Pending **limit** and **stop / SL / TP (bracket)** orders the master places, edi
 
 * **Execution Latency**: Target end-to-end copy latency is $<200\text{ms}$ from master fill detection to follower submission.
 * **Slippage Threshold**: Maximum acceptable price difference between Master and Follower is $0.03\%$ (3 basis points). Any slippage exceeding this limit raises a warning alert.
+
+---
+
+## 5. Multi-tenancy, Authentication & Admin
+
+Mirror Engine is multi-tenant: every user manages their own master + followers in isolation.
+
+* **Identity** — Supabase Auth (GoTrue). Tokens are verified via the `/auth/v1/user` introspection endpoint. Roles (`user` / `admin`) live in a `profiles` table. Auth methods: email+password, optional email-OTP 2FA (Resend, gated by `TWOFA_ENABLED`), Google OAuth, and a server-side "quick-admin" passphrase that logs into a shared admin account.
+* **Data isolation** — every domain row carries `owner_id`. API queries are owner-scoped (`scope_owned`), admins bypass scoping (`require_admin`). Postgres **Row-Level Security** (`owner_id = auth.uid() OR is_admin()`) enforces the same at the DB layer; the service-role backend bypasses RLS.
+* **Per-user engine** — a **`ListenerManager`** runs one master WebSocket `TradeListener` per user, so all tenants' masters trade concurrently. Fill/order events are tagged with the master's `owner_id` and the Copy Engine only mirrors to that owner's followers.
+* **Secrets at rest** — Delta API keys/secrets are Fernet-encrypted (`crypto.py`) and decrypted transparently inside `DeltaClient`.
+* **Today's PnL** — computed per account as realized PnL for the IST day (summed from Delta's wallet ledger) plus current unrealized MTM PnL.
+* **Admin console** — a dedicated cross-tenant UI (users, all accounts, all positions, trades, alerts) served under `/admin` and guarded by role.
+
+## 6. Deployment Topology
+
+Frontend is hosted on **Vercel** (Next.js); backend + Redis run in **Docker** on the server. `NEXT_PUBLIC_*` values are baked into the client build on Vercel; all real secrets (Supabase service key, Resend, admin credentials, encryption key, Delta keys) stay in the backend `.env`.
 * **Circuit Breakers**: If a follower account encounters 5 consecutive execution failures, the account status is automatically set to `blocked` and copy activities are suspended.
