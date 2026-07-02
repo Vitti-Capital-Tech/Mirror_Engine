@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
-import { AdminHeader, RoleBadge, pnlClass } from '@/components/admin/AdminUI';
+import { AdminHeader, pnlClass } from '@/components/admin/AdminUI';
 import { Crown, Search } from 'lucide-react';
 
 export default function AdminUsers() {
@@ -19,7 +19,10 @@ export default function AdminUsers() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const filtered = users.filter(u => !q || (u.email || '').toLowerCase().includes(q.toLowerCase()));
+  // Only show regular users (hide admin accounts).
+  const filtered = users
+    .filter(u => u.role !== 'admin')
+    .filter(u => !q || (u.email || '').toLowerCase().includes(q.toLowerCase()));
 
   return (
     <div>
@@ -39,7 +42,6 @@ export default function AdminUsers() {
             <thead>
               <tr className="text-left text-[10px] uppercase tracking-wider text-text-muted border-b border-bg-border">
                 <th className="px-4 py-3 font-bold">User</th>
-                <th className="px-4 py-3 font-bold">Role</th>
                 <th className="px-4 py-3 font-bold">Master</th>
                 <th className="px-4 py-3 font-bold text-right">Followers</th>
                 <th className="px-4 py-3 font-bold text-right">Active</th>
@@ -52,9 +54,7 @@ export default function AdminUsers() {
                 <tr key={u.id} className="hover:bg-bg-panel/40 transition-colors">
                   <td className="px-4 py-3">
                     <div className="font-medium text-text-primary">{u.email || '—'}</div>
-                    <div className="text-[11px] text-text-muted font-mono">{u.id.slice(0, 8)}…</div>
                   </td>
-                  <td className="px-4 py-3"><RoleBadge role={u.role} /></td>
                   <td className="px-4 py-3">
                     {u.master_name ? (
                       <span className="flex items-center gap-1.5">
@@ -72,7 +72,7 @@ export default function AdminUsers() {
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
-                <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
+                <tr><td colSpan={6} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
               )}
             </tbody>
           </table>

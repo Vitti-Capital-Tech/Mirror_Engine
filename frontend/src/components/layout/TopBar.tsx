@@ -93,9 +93,8 @@ export function TopBar() {
     '/trades': { title: 'Trade Log', subtitle: 'Full audit trail of every copied trade and its fills' },
     '/alerts': { title: 'Alerts', subtitle: 'Slippage, sync and connection events that need your attention' },
     // Admin console
-    '/admin': { title: 'Admin Overview', subtitle: 'Platform-wide activity across all tenants' },
-    '/admin/users': { title: 'Users', subtitle: 'Manage every account holder on the platform' },
-    '/admin/positions': { title: 'Live Positions', subtitle: 'Open positions per user — master & followers' },
+    '/admin': { title: 'Live Positions', subtitle: 'Open positions per user — master & followers' },
+    '/admin/users': { title: 'Users', subtitle: 'Everyone on the platform' },
     '/admin/accounts': { title: 'All Accounts', subtitle: 'Every master and follower across all tenants' },
     '/admin/trades': { title: 'Trade Log', subtitle: 'Copied trades across all tenants' },
     '/admin/alerts': { title: 'Alert Feed', subtitle: 'Slippage, sync and connection events across all tenants' },
