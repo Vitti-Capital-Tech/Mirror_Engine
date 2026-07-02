@@ -59,7 +59,6 @@ export default function AdminAccounts() {
                     {a.is_master ? (
                       <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-300">
                         <Crown className="w-3.5 h-3.5" /> Master
-                        <span className={`w-2 h-2 rounded-full ${a.live ? 'bg-emerald-400' : 'bg-text-muted'}`} title={a.live ? 'Listener live' : 'Not live'} />
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-text-secondary">

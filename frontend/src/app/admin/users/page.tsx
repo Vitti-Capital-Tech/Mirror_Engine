@@ -50,7 +50,6 @@ export default function AdminUsers() {
                 <th className="px-4 py-3 font-bold">Master</th>
                 <th className="px-4 py-3 font-bold text-right">Followers</th>
                 <th className="px-4 py-3 font-bold text-right">Active</th>
-                <th className="px-4 py-3 font-bold text-right">Total Balance</th>
                 <th className="px-4 py-3 font-bold text-right">Copies (Filled)</th>
                 <th className="px-4 py-3 font-bold text-right">Joined</th>
               </tr>
@@ -66,20 +65,17 @@ export default function AdminUsers() {
                       <span className="flex items-center gap-1.5">
                         <Crown className="w-3.5 h-3.5 text-amber-400" />
                         <span className="text-text-primary">{u.master_name}</span>
-                        <span className={`w-2 h-2 rounded-full ${u.master_live ? 'bg-emerald-400' : 'bg-text-muted'}`}
-                          title={u.master_live ? 'Listener live' : 'Not live'} />
                       </span>
                     ) : <span className="text-text-muted">—</span>}
                   </td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.follower_count}</td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.active_accounts}/{u.total_accounts}</td>
-                  <td className="px-4 py-3 text-right font-mono text-text-primary">{u.total_balance != null ? Number(u.total_balance).toFixed(2) : '—'}</td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.copies_filled_today}/{u.copies_today}</td>
                   <td className="px-4 py-3 text-right text-text-muted whitespace-nowrap">{fmtDate(u.created_at)}</td>
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
-                <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
+                <tr><td colSpan={6} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
               )}
             </tbody>
           </table>

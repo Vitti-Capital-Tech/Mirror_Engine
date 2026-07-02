@@ -78,10 +78,9 @@ function AccountCard({ acc }: { acc: any }) {
             )}
           </span>
           <h3 className="font-bold text-text-primary text-sm tracking-tight truncate">{acc.name}</h3>
-          {acc.is_master && <span className={`w-2 h-2 rounded-full ${acc.live ? 'bg-emerald-400' : 'bg-text-muted'}`} title={acc.live ? 'Listener live' : 'Not live'} />}
         </div>
         <div className="flex items-center gap-5 font-mono text-xs font-bold">
-          <Stat label="Today" value={acc.today_pnl} pnl />
+          <Stat label="Today P&L" value={acc.today_pnl} pnl />
           <Stat label="Active P&L" value={activePnL} pnl />
           <div className="flex items-center gap-1.5">
             <span className="text-text-muted text-[10px] uppercase font-semibold">Balance:</span>
