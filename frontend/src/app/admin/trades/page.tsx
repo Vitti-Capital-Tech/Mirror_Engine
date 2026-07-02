@@ -3,19 +3,23 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { AdminHeader } from '@/components/admin/AdminUI';
 import { TradeLogTable } from '@/components/trades/TradeLogTable';
-import { Search } from 'lucide-react';
+import { Search, ChevronDown } from 'lucide-react';
 
 export default function AdminTrades() {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [q, setQ] = useState('');
+  const [open, setOpen] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     try { setLoading(true); const res = await api.admin.trades(); setUsers(res.users || []); setError(''); }
     catch (e: any) { setError(e.message || 'Failed to load'); } finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  const toggle = (id: string) => setOpen(o => ({ ...o, [id]: !(o[id] ?? true) }));
+  const isOpen = (id: string) => open[id] ?? true;
 
   const filtered = users.filter(u => !q || (u.email || '').toLowerCase().includes(q.toLowerCase()));
 
@@ -35,14 +39,23 @@ export default function AdminTrades() {
         <div className="card-premium p-10 text-center text-text-muted">No trades found.</div>
       )}
 
-      <div className="space-y-8">
+      <div className="space-y-4">
         {filtered.map((u) => (
-          <div key={u.id} className="space-y-3">
-            <div className="flex items-center gap-2">
-              <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">{u.email}</h3>
-              <span className="text-[11px] text-text-muted">· {u.count} trade{u.count === 1 ? '' : 's'}</span>
-            </div>
-            <TradeLogTable trades={u.trades} isLoading={false} page={1} setPage={() => {}} hasMore={false} />
+          <div key={u.id} className="card-premium overflow-hidden">
+            <button onClick={() => toggle(u.id)}
+              className="w-full flex items-center justify-between px-4 py-3 border-b border-bg-border hover:bg-bg-panel/40 transition-colors">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <ChevronDown className={`w-4 h-4 text-text-muted transition-transform ${isOpen(u.id) ? '' : '-rotate-90'}`} />
+                <span className="font-semibold text-text-primary truncate">{u.email}</span>
+              </div>
+              <span className="text-[11px] text-text-muted">{u.count} trade{u.count === 1 ? '' : 's'}</span>
+            </button>
+
+            {isOpen(u.id) && (
+              <div className="p-4">
+                <TradeLogTable trades={u.trades} isLoading={false} page={1} setPage={() => {}} hasMore={false} />
+              </div>
+            )}
           </div>
         ))}
       </div>
