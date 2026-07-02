@@ -1,5 +1,5 @@
 'use client';
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Radio, Scale, ShieldCheck, TrendingUp, Eye, EyeOff, Lock, AlertCircle } from 'lucide-react';
 
 const FEATURES = [
@@ -8,42 +8,24 @@ const FEATURES = [
   { icon: ShieldCheck, title: 'Encrypted & isolated', desc: 'Keys encrypted at rest, per-user data isolation.' },
 ];
 
-/** Auto-rotating feature highlight that "rolls" to the next every few seconds. */
-function RotatingFeatures() {
-  const [i, setI] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setI((p) => (p + 1) % FEATURES.length), 3800);
-    return () => clearInterval(id);
-  }, []);
-  const f = FEATURES[i];
-  const Icon = f.icon;
+/** Static list of all feature highlights. */
+function FeatureList() {
   return (
-    <div className="mt-9">
-      {/* Fixed-height stage so the layout doesn't jump as text rolls */}
-      <div className="relative h-[76px] overflow-hidden">
-        <div key={i} className="absolute inset-0 flex items-start gap-3.5 animate-slide-in">
-          <div className="mt-0.5 flex items-center justify-center w-11 h-11 rounded-2xl bg-gradient-to-br from-blue-500/20 to-blue-500/5 ring-1 ring-blue-500/25 shrink-0 shadow-lg shadow-blue-500/10">
-            <Icon className="w-5 h-5 text-blue-300" strokeWidth={2} />
+    <div className="mt-9 space-y-4">
+      {FEATURES.map((f) => {
+        const Icon = f.icon;
+        return (
+          <div key={f.title} className="flex items-start gap-3.5">
+            <div className="mt-0.5 flex items-center justify-center w-11 h-11 rounded-2xl bg-gradient-to-br from-blue-500/20 to-blue-500/5 ring-1 ring-blue-500/25 shrink-0 shadow-lg shadow-blue-500/10">
+              <Icon className="w-5 h-5 text-blue-300" strokeWidth={2} />
+            </div>
+            <div>
+              <div className="text-[15px] font-semibold text-text-primary">{f.title}</div>
+              <div className="text-xs text-text-muted mt-1 leading-relaxed max-w-xs">{f.desc}</div>
+            </div>
           </div>
-          <div>
-            <div className="text-[15px] font-semibold text-text-primary">{f.title}</div>
-            <div className="text-xs text-text-muted mt-1 leading-relaxed max-w-xs">{f.desc}</div>
-          </div>
-        </div>
-      </div>
-      {/* Progress dots */}
-      <div className="flex items-center gap-1.5 mt-4">
-        {FEATURES.map((_, idx) => (
-          <button
-            key={idx}
-            onClick={() => setI(idx)}
-            aria-label={`Feature ${idx + 1}`}
-            className={`h-1.5 rounded-full transition-all duration-500 ${
-              idx === i ? 'w-7 bg-blue-400' : 'w-1.5 bg-text-muted/40 hover:bg-text-muted/70'
-            }`}
-          />
-        ))}
-      </div>
+        );
+      })}
     </div>
   );
 }
@@ -92,7 +74,7 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
             sized to the last contract — automatically.
           </p>
 
-          <RotatingFeatures />
+          <FeatureList />
         </div>
 
         <div className="relative z-10 text-[11px] text-text-muted">
@@ -146,15 +128,17 @@ export function PasswordField({
         onChange={(e) => onChange(e.target.value)}
         className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted"
       />
-      <button
-        type="button"
-        onClick={() => setShow((s) => !s)}
-        tabIndex={-1}
-        aria-label={show ? 'Hide password' : 'Show password'}
-        className="text-text-muted hover:text-text-secondary shrink-0 transition-colors"
-      >
-        {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-      </button>
+      {value.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setShow((s) => !s)}
+          tabIndex={-1}
+          aria-label={show ? 'Hide password' : 'Show password'}
+          className="text-text-muted hover:text-text-secondary shrink-0 transition-colors"
+        >
+          {show ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+        </button>
+      )}
     </Field>
   );
 }
