@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 from fastapi import APIRouter, HTTPException, Depends
 from app.database import db
@@ -10,6 +11,48 @@ from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_acco
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
+
+# India market operates in IST; "today" is an IST calendar day.
+IST = timezone(timedelta(hours=5, minutes=30))
+# Ledger entry types that make up realized trading PnL for the day on Delta India.
+# 'cashflow' = realized PnL booked when a trade closes, 'settlement' = options
+# expiry settlement, 'commission' = trading fees (negative), 'funding' = perp funding.
+# Deposits/withdrawals use their own types and are intentionally excluded.
+_REALIZED_PNL_TYPES = {"cashflow", "settlement", "commission", "funding", "pnl"}
+
+
+async def _realized_pnl_today(client: DeltaClient) -> float:
+    """Sum realized PnL (and fees) booked since IST midnight from the wallet ledger."""
+    now_ist = datetime.now(IST)
+    start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+    start_us = int(start_utc.timestamp() * 1_000_000)
+    total = 0.0
+    try:
+        txns = await client.get_wallet_transactions(start_time_us=start_us)
+        for tx in txns:
+            ttype = (tx.get("transaction_type") or "").lower()
+            if ttype not in _REALIZED_PNL_TYPES:
+                continue
+            # Only count the USD/USDT settlement asset (Delta India labels it "USD").
+            asset = tx.get("asset_symbol")
+            if asset and asset not in ("USD", "USDT"):
+                continue
+            # Safety filter on created_at in case start_time isn't honored.
+            ca = tx.get("created_at")
+            if ca:
+                try:
+                    when = datetime.fromisoformat(str(ca).replace("Z", "+00:00"))
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    if when < start_utc:
+                        continue
+                except Exception:
+                    pass
+            total += float(tx.get("amount") or 0)
+    except Exception as e:
+        logger.warning(f"Could not fetch realized PnL: {e}")
+    return total
 
 
 def _format_live_position(account_id: str, account_name: str, pos: dict) -> dict | None:
@@ -238,6 +281,11 @@ async def _sync_accounts(accounts: list) -> list:
                         account_name=acc["name"],
                         position_data=pos
                     )
+
+                # Add realized PnL booked today (closed trades) so the figure
+                # survives closing positions — "today's PnL" = realized + unrealized.
+                realized_today = await _realized_pnl_today(client)
+                today_pnl += realized_today
 
                 db.table("accounts").update({"today_pnl": round(today_pnl, 2)}).eq("id", acc["id"]).execute()
 

@@ -111,6 +111,18 @@ class DeltaClient:
 
         return all_positions
 
+    async def get_wallet_transactions(self, start_time_us: Optional[int] = None, page_size: int = 200) -> list:
+        """Fetch wallet ledger transactions (used to sum realized PnL for the day)."""
+        q = f"?page_size={page_size}"
+        if start_time_us:
+            q += f"&start_time={start_time_us}"
+        path = f"/v2/wallet/transactions{q}"
+        headers = self._get_headers("GET", path)
+        resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result", []) if isinstance(data, dict) else (data or [])
+
     async def place_order(
         self,
         symbol: str,
