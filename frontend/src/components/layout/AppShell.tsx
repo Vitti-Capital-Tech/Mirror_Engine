@@ -12,7 +12,7 @@ const PUBLIC_ROUTES = ['/', '/login', '/signup', '/auth/callback'];
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { isAuthenticated, loading, user } = useAuth();
+  const { isAuthenticated, loading, user, signingOut } = useAuth();
   const isPublic = PUBLIC_ROUTES.includes(pathname);
 
   useEffect(() => {
@@ -28,7 +28,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (loading || !isAuthenticated) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-bg-primary">
-        <div className="w-6 h-6 rounded-full border-2 border-blue-500/30 border-t-blue-500 animate-spin" />
+        <div className="flex flex-col items-center gap-3">
+          <div className="relative w-12 h-12 rounded-2xl overflow-hidden ring-1 ring-bg-border shadow-lg shadow-blue-500/20">
+            <img src="/logo.jpg" alt="Mirror Engine" className="w-full h-full object-cover" />
+            <span className="pointer-events-none absolute top-0 left-0 h-full w-2/3 bg-gradient-to-r from-transparent via-white/55 to-transparent animate-shimmer" />
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 rounded-full border-2 border-blue-500/30 border-t-blue-500 animate-spin" />
+            <span className="text-xs text-text-muted">{signingOut ? 'Signing out…' : 'Loading…'}</span>
+          </div>
+        </div>
       </div>
     );
   }

@@ -6,6 +6,7 @@ interface User { id: string; email?: string; role?: string; }
 interface AuthState {
   user: User | null;
   loading: boolean;
+  signingOut: boolean;
   isAuthenticated: boolean;
   setSession: (accessToken: string, user?: User) => void;
   logout: () => void;
@@ -34,6 +35,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // paint after a refresh — avoids briefly showing the wrong panel.
   const [user, setUserState] = useState<User | null>(() => (getToken() ? readCachedUser() : null));
   const [loading, setLoading] = useState(true);
+  const [signingOut, setSigningOut] = useState(false);
 
   const setUser = (u: User | null) => { setUserState(u); writeCachedUser(u); };
 
@@ -59,13 +61,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = () => {
+    setSigningOut(true);
     setToken(null);
     setUser(null);
     if (typeof window !== 'undefined') window.location.href = '/login';
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, isAuthenticated: !!user, setSession, logout, refresh }}>
+    <AuthContext.Provider value={{ user, loading, signingOut, isAuthenticated: !!user, setSession, logout, refresh }}>
       {children}
     </AuthContext.Provider>
   );
