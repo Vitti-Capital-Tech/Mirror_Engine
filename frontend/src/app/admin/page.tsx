@@ -50,11 +50,26 @@ export default function AdminPositions() {
               </span>
             </button>
 
-            {isOpen(u.id) && (
-              <div className="p-4 space-y-4">
-                {u.accounts.map((a: any) => <AccountCard key={a.id} acc={a} />)}
-              </div>
-            )}
+            {isOpen(u.id) && (() => {
+              const masters = u.accounts.filter((a: any) => a.is_master);
+              const followers = u.accounts.filter((a: any) => !a.is_master);
+              return (
+                <div className="p-4 space-y-6">
+                  {masters.length > 0 && (
+                    <div className="space-y-3">
+                      <h4 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h4>
+                      <div className="space-y-4">{masters.map((a: any) => <AccountCard key={a.id} acc={a} />)}</div>
+                    </div>
+                  )}
+                  {followers.length > 0 && (
+                    <div className="space-y-3">
+                      <h4 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Follower Accounts ({followers.length})</h4>
+                      <div className="space-y-4">{followers.map((a: any) => <AccountCard key={a.id} acc={a} />)}</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         ))}
       </div>
