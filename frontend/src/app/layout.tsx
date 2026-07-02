@@ -34,7 +34,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           })();
         `}} />
       </head>
-      <body className={`${inter.className} overflow-hidden`}>
+      <body className={inter.className}>
         <Providers>
           <AuthProvider>
             <AppShell>{children}</AppShell>
