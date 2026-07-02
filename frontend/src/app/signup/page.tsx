@@ -1,70 +1,12 @@
 'use client';
-import React, { useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { api } from '@/lib/api';
-import { GoogleButton } from '@/components/auth/GoogleButton';
-import { AuthShell, Field, PasswordField, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
-import { Mail, RefreshCw, ArrowRight, CheckCircle } from 'lucide-react';
+import React from 'react';
+import { AuthShell } from '@/components/auth/AuthShell';
+import { AuthCard } from '@/components/auth/AuthCard';
 
 export default function SignupPage() {
-  const router = useRouter();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirm, setConfirm] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState(false);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    if (password.length < 6) { setError('Password must be at least 6 characters.'); return; }
-    if (password !== confirm) { setError('Passwords do not match.'); return; }
-    setBusy(true);
-    try {
-      await api.auth.signup(email, password);
-      setDone(true);
-      setTimeout(() => router.replace('/login'), 1500);
-    } catch (err: any) {
-      setError(err.message || 'Signup failed');
-    } finally { setBusy(false); }
-  };
-
   return (
     <AuthShell>
-      <div className="card-premium p-8 animate-slide-in">
-        {done ? (
-          <div className="text-center py-8">
-            <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-emerald-500/10 ring-1 ring-emerald-500/20 mb-4 mx-auto glow-green">
-              <CheckCircle className="w-7 h-7 text-emerald-400" />
-            </div>
-            <h1 className="text-lg font-bold text-text-primary tracking-tight">Account created</h1>
-            <p className="text-xs text-text-muted mt-1.5">Redirecting to sign in…</p>
-          </div>
-        ) : (
-          <>
-            <h1 className="text-xl font-bold text-text-primary tracking-tight">Create your account</h1>
-            <p className="text-xs text-text-muted mt-1.5 mb-6">Start mirroring trades in minutes.</p>
-            <GoogleButton />
-            <form onSubmit={submit} className="space-y-3">
-              <Field icon={<Mail className="w-4 h-4" />}>
-                <input type="email" required placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
-                  className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
-              </Field>
-              <PasswordField value={password} onChange={setPassword} />
-              <PasswordField value={confirm} onChange={setConfirm} placeholder="Confirm password" />
-              <ErrorBanner message={error} />
-              <SubmitButton busy={busy}>
-                {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Create account <ArrowRight className="w-4 h-4" /></>}
-              </SubmitButton>
-            </form>
-            <p className="text-xs text-text-muted mt-6 text-center">
-              Already have an account? <Link href="/login" className="text-blue-400 font-semibold hover:text-blue-300 transition-colors">Sign in</Link>
-            </p>
-          </>
-        )}
-      </div>
+      <AuthCard initialMode="signup" />
     </AuthShell>
   );
 }
