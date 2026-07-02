@@ -24,12 +24,23 @@ export default function AuthCallback() {
       if (done || !token) return;
       done = true;
       setToken(token);
+      clearInterval(creep);
+      setProgress(100);
+
+      // If opened as a popup (e.g. from an iframe-embedded app), hand the token
+      // back to the opener and close, instead of navigating this window.
+      if (typeof window !== 'undefined' && window.opener && window.opener !== window) {
+        try {
+          window.opener.postMessage({ type: 'mirror-auth', token }, window.location.origin);
+          setTimeout(() => window.close(), 300);
+          return;
+        } catch { /* fall through to normal redirect */ }
+      }
+
       let me: any = null;
       try { me = await api.auth.me(); } catch { /* ignore */ }
       if (me) setSession(token, { id: me.id, email: me.email, role: me.role });
       else setSession(token);
-      clearInterval(creep);
-      setProgress(100);
       setTimeout(() => router.replace(me?.role === 'admin' ? '/admin' : '/positions'), 450);
     };
 
