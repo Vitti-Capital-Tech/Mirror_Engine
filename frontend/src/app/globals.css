@@ -123,6 +123,63 @@ body {
   }
 }
 
+/* ----- Auth hero motion ----- */
+/* Staggered entrance — replays on every page mount (login <-> signup) */
+@keyframes heroRise {
+  0%   { opacity: 0; transform: translateY(14px); filter: blur(4px); }
+  100% { opacity: 1; transform: translateY(0);    filter: blur(0); }
+}
+.hero-rise { animation: heroRise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.hero-d1 { animation-delay: 0.05s; }
+.hero-d2 { animation-delay: 0.15s; }
+.hero-d3 { animation-delay: 0.25s; }
+.hero-d4 { animation-delay: 0.35s; }
+.hero-d5 { animation-delay: 0.45s; }
+
+/* Drifting ambient orbs */
+@keyframes orbDrift {
+  0%   { transform: translate(0, 0) scale(1); }
+  50%  { transform: translate(28px, -22px) scale(1.12); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+.orb-a { animation: orbDrift 14s ease-in-out infinite; }
+.orb-b { animation: orbDrift 18s ease-in-out infinite reverse; }
+
+/* Pulsing rings around the master node */
+@keyframes pulseRing {
+  0%   { transform: scale(0.6); opacity: 0.7; }
+  80%  { transform: scale(1.9); opacity: 0; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+.pulse-ring { transform-box: fill-box; transform-origin: center; animation: pulseRing 2.6s ease-out infinite; }
+.pulse-ring-2 { animation-delay: 1.3s; }
+
+/* Node soft breathing */
+@keyframes nodeBreathe {
+  0%, 100% { opacity: 0.85; }
+  50%      { opacity: 1; }
+}
+.node-breathe { animation: nodeBreathe 2.4s ease-in-out infinite; }
+
+/* Flowing "trade" dots traveling master -> follower */
+@keyframes flowDot {
+  0%   { offset-distance: 0%;   opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { offset-distance: 100%; opacity: 0; }
+}
+
+/* Animated connector flow (dashed line motion) */
+@keyframes dashFlow { to { stroke-dashoffset: -16; } }
+.dash-flow { stroke-dasharray: 3 5; animation: dashFlow 0.9s linear infinite; }
+
+/* Shimmer sweep for the badge */
+@keyframes badgeSweep {
+  0%   { transform: translateX(-120%) skewX(-20deg); }
+  60%, 100% { transform: translateX(320%) skewX(-20deg); }
+}
+.badge-sweep { animation: badgeSweep 3.6s ease-in-out infinite; }
+
 /* Neon glow accents (kept, slightly refined) */
 .glow-blue { box-shadow: 0 0 24px rgba(59, 130, 246, 0.18); }
 .glow-green { box-shadow: 0 0 24px rgba(16, 185, 129, 0.18); }
