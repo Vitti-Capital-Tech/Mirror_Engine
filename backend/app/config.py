@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_JWT_SECRET: str = ""   # for verifying user JWTs (Settings → API → JWT Secret)
 
+    # Quick-admin passphrase login: typing ADMIN_MAGIC_CODE as the password logs
+    # straight into the shared admin account (no password/OTP). Server-side only.
+    ADMIN_MAGIC_CODE: str = ""   # e.g. "trade"; empty disables the shortcut
+    ADMIN_EMAIL: str = ""        # the admin account this shortcut signs into
+    ADMIN_PASSWORD: str = ""     # its real Supabase password (used server-side)
+
     # Auth / 2FA (Resend email OTP)
     TWOFA_ENABLED: bool = False   # when False, email+password logs in directly (no OTP)
     RESEND_API_KEY: str = ""

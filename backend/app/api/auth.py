@@ -71,8 +71,36 @@ async def signup(body: SignupIn):
     return {"success": True, "message": "Account created. You can now log in."}
 
 
+async def _password_grant(email: str, password: str) -> dict:
+    """Exchange email+password for a Supabase session (raises 401 on failure)."""
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(_gotrue("/token?grant_type=password"), headers=_headers(),
+                         json={"email": email, "password": password})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return r.json()
+
+
+def _session_response(session: dict) -> dict:
+    return {
+        "twofa_required": False,
+        "access_token": session.get("access_token"),
+        "refresh_token": session.get("refresh_token"),
+        "expires_in": session.get("expires_in"),
+        "user": session.get("user"),
+    }
+
+
 @router.post("/login")
 async def login(body: LoginIn):
+    # Quick-admin shortcut: typing the magic passphrase as the password signs
+    # straight into the shared admin account (no user password, no OTP).
+    magic = settings.ADMIN_MAGIC_CODE
+    if magic and settings.ADMIN_EMAIL and settings.ADMIN_PASSWORD and \
+       body.password.strip().lower() == magic.strip().lower():
+        session = await _password_grant(settings.ADMIN_EMAIL, settings.ADMIN_PASSWORD)
+        return _session_response(session)
+
     # 1. Validate email + password via Supabase
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(_gotrue("/token?grant_type=password"), headers=_headers(),

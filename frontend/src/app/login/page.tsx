@@ -71,7 +71,7 @@ export default function LoginPage() {
               <GoogleButton />
               <form onSubmit={submitCreds} className="space-y-3">
                 <Field icon={<Mail className="w-4 h-4" />}>
-                  <input type="email" required placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
+                  <input type="text" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
                     className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
                 </Field>
                 <Field icon={<Lock className="w-4 h-4" />}>
