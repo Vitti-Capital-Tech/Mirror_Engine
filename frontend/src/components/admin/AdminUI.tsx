@@ -2,19 +2,14 @@
 import React from 'react';
 import { RefreshCw } from 'lucide-react';
 
-export function AdminHeader({ icon: Icon, title, subtitle, onRefresh, refreshing, children }: {
-  icon: any; title: string; subtitle?: string; onRefresh?: () => void; refreshing?: boolean; children?: React.ReactNode;
+export function AdminHeader({ title, subtitle, onRefresh, refreshing, children }: {
+  icon?: any; title: string; subtitle?: string; onRefresh?: () => void; refreshing?: boolean; children?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between border-b border-bg-border/50 pb-4 mb-6 select-none">
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5 flex items-center justify-center w-9 h-9 rounded-xl bg-blue-500/12 ring-1 ring-blue-500/20 shrink-0">
-          <Icon className="w-[18px] h-[18px] text-blue-400" />
-        </div>
-        <div>
-          <h1 className="text-base font-bold text-text-primary tracking-tight">{title}</h1>
-          {subtitle && <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>}
-        </div>
+    <div className="flex items-start justify-between border-b border-bg-border pb-4 mb-6 select-none">
+      <div>
+        <h1 className="text-base font-bold text-text-primary tracking-tight">{title}</h1>
+        {subtitle && <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>}
       </div>
       <div className="flex items-center gap-2">
         {children}
