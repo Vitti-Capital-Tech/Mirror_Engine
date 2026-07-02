@@ -173,6 +173,14 @@ body {
 @keyframes dashFlow { to { stroke-dashoffset: -16; } }
 .dash-flow { stroke-dasharray: 3 5; animation: dashFlow 0.9s linear infinite; }
 
+/* Feature icon motions */
+@keyframes iconPulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.18); } }
+@keyframes iconWobble { 0%, 100% { transform: rotate(-8deg); } 50% { transform: rotate(8deg); } }
+@keyframes iconFloat { 0%, 100% { transform: translateY(1.5px); } 50% { transform: translateY(-2.5px); } }
+.icon-pulse { transform-origin: center; animation: iconPulse 2s ease-in-out infinite; }
+.icon-wobble { transform-origin: center; animation: iconWobble 2.6s ease-in-out infinite; }
+.icon-float { animation: iconFloat 2.8s ease-in-out infinite; }
+
 /* Shimmer sweep for the badge */
 @keyframes badgeSweep {
   0%   { transform: translateX(-120%) skewX(-20deg); }

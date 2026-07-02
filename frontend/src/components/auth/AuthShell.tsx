@@ -3,9 +3,9 @@ import React, { useState } from 'react';
 import { Radio, Scale, ShieldCheck, TrendingUp, Eye, EyeOff, Lock, AlertCircle } from 'lucide-react';
 
 const FEATURES = [
-  { icon: Radio, title: 'Real-time mirroring', desc: 'Master fills copy to every follower in milliseconds.' },
-  { icon: Scale, title: 'Balance-ratio sizing', desc: 'Each account sized precisely to its own capital.' },
-  { icon: ShieldCheck, title: 'Encrypted & isolated', desc: 'Keys encrypted at rest, per-user data isolation.' },
+  { icon: Radio, anim: 'icon-pulse', title: 'Real-time mirroring', desc: 'Master fills copy to every follower in milliseconds.' },
+  { icon: Scale, anim: 'icon-wobble', title: 'Balance-ratio sizing', desc: 'Each account sized precisely to its own capital.' },
+  { icon: ShieldCheck, anim: 'icon-float', title: 'Encrypted & isolated', desc: 'Keys encrypted at rest, per-user data isolation.' },
 ];
 
 /** Static list of all feature highlights. */
@@ -17,7 +17,7 @@ function FeatureList() {
         return (
           <div key={f.title} className="flex items-start gap-3.5">
             <div className="mt-0.5 flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500/20 to-blue-500/5 ring-1 ring-blue-500/25 shrink-0 shadow-lg shadow-blue-500/10">
-              <Icon className="w-[18px] h-[18px] text-blue-300" strokeWidth={2} />
+              <Icon className={`w-[18px] h-[18px] text-blue-300 ${f.anim}`} strokeWidth={2} />
             </div>
             <div>
               <div className="text-sm font-semibold text-text-primary">{f.title}</div>
@@ -121,9 +121,8 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
 
         <div className="relative z-10 max-w-md">
           {/* Shimmering badge */}
-          <div className="relative inline-flex items-center gap-1.5 rounded-full border border-bg-border bg-bg-panel/50 px-3 py-1 text-[11px] font-semibold text-text-secondary mb-6 overflow-hidden hero-rise hero-d2">
+          <div className="inline-flex items-center gap-1.5 rounded-full border border-bg-border bg-bg-panel/50 px-3 py-1 text-[11px] font-semibold text-text-secondary mb-6 hero-rise hero-d2">
             <TrendingUp className="w-3.5 h-3.5 text-emerald-400" /> Copy-trading for Delta Exchange
-            <span className="pointer-events-none absolute top-0 left-0 h-full w-1/3 bg-gradient-to-r from-transparent via-white/25 to-transparent badge-sweep" />
           </div>
           <h1 className="text-3xl xl:text-4xl font-extrabold text-text-primary leading-tight tracking-tight hero-rise hero-d3">
             One master.<br />
