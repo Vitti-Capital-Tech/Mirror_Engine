@@ -31,7 +31,7 @@ function FeatureList() {
 }
 
 /** Animated copy-trading graphic: master node broadcasting trades to followers. */
-function MirrorGraphic() {
+export function MirrorGraphic() {
   const lines = [
     'M160 46 L56 156',
     'M160 46 L160 156',
