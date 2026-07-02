@@ -85,6 +85,16 @@ async def login(body: LoginIn):
     if not uid:
         raise HTTPException(status_code=401, detail="Login failed")
 
+    # 2FA disabled → return the session immediately (email + password is enough)
+    if not settings.TWOFA_ENABLED:
+        return {
+            "twofa_required": False,
+            "access_token": session.get("access_token"),
+            "refresh_token": session.get("refresh_token"),
+            "expires_in": session.get("expires_in"),
+            "user": session.get("user"),
+        }
+
     # 2. Generate + email the 2FA code
     code = generate_and_store_otp(uid)
     if not await send_otp_email(email, code):

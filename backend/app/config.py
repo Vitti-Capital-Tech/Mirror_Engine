@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     SUPABASE_JWT_SECRET: str = ""   # for verifying user JWTs (Settings → API → JWT Secret)
 
     # Auth / 2FA (Resend email OTP)
+    TWOFA_ENABLED: bool = False   # when False, email+password logs in directly (no OTP)
     RESEND_API_KEY: str = ""
     RESEND_FROM: str = "Mirror Engine <noreply@example.com>"
     OTP_TTL_SECONDS: int = 300

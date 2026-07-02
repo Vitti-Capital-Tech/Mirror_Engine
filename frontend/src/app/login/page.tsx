@@ -27,6 +27,10 @@ export default function LoginPage() {
       if (res.twofa_required) {
         setPendingId(res.pending_id);
         setStep('otp');
+      } else {
+        // 2FA disabled — logged in directly
+        setSession(res.access_token, res.user ? { id: res.user.id, email: res.user.email } : undefined);
+        router.replace('/positions');
       }
     } catch (err: any) {
       setError(err.message || 'Login failed');
