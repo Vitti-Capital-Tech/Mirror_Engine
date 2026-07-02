@@ -158,6 +158,65 @@ async def admin_positions(user: CurrentUser = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/trades")
+async def admin_trades(limit: int = 100, user: CurrentUser = Depends(require_admin)):
+    """Recent trades across all tenants with owner email and copy roll-up."""
+    try:
+        profiles = (db.table("profiles").select("id, email").execute().data) or []
+        email_by_id = {p["id"]: p.get("email") for p in profiles}
+        trades = (db.table("trades")
+                  .select("*, copies:trade_copies(status)")
+                  .order("created_at", desc=True).limit(limit).execute().data) or []
+        out = []
+        for t in trades:
+            copies = t.get("copies") or []
+            out.append({
+                "id": t.get("id"),
+                "owner_email": email_by_id.get(t.get("owner_id")) or "—",
+                "symbol": t.get("symbol"),
+                "side": t.get("side"),
+                "quantity": t.get("quantity"),
+                "trade_type": t.get("trade_type"),
+                "entry_price": t.get("entry_price"),
+                "status": t.get("status"),
+                "copies_total": len(copies),
+                "copies_filled": sum(1 for c in copies if c.get("status") == "filled"),
+                "created_at": t.get("created_at"),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Error listing admin trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/alerts")
+async def admin_alerts(limit: int = 150, user: CurrentUser = Depends(require_admin)):
+    """Recent alerts across all tenants with owner email and account name."""
+    try:
+        profiles = (db.table("profiles").select("id, email").execute().data) or []
+        email_by_id = {p["id"]: p.get("email") for p in profiles}
+        alerts = (db.table("alerts")
+                  .select("*, accounts(name)")
+                  .order("created_at", desc=True).limit(limit).execute().data) or []
+        out = []
+        for a in alerts:
+            acc = a.get("accounts") or {}
+            out.append({
+                "id": a.get("id"),
+                "owner_email": email_by_id.get(a.get("owner_id")) or "—",
+                "account_name": acc.get("name") or "System",
+                "level": a.get("level"),
+                "type": a.get("type"),
+                "message": a.get("message"),
+                "is_resolved": a.get("is_resolved", False),
+                "created_at": a.get("created_at"),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Error listing admin alerts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/users/{user_id}/role")
 async def set_user_role(user_id: str, role: str, user: CurrentUser = Depends(require_admin)):
     """Promote/demote a user between 'user' and 'admin'."""

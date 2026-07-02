@@ -2,7 +2,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { AdminHeader, pnlClass } from '@/components/admin/AdminUI';
-import { Activity, Crown, User, ChevronDown } from 'lucide-react';
+import { Crown, User, ChevronDown } from 'lucide-react';
 
 export default function AdminPositions() {
   const [users, setUsers] = useState<any[]>([]);
@@ -14,7 +14,11 @@ export default function AdminPositions() {
     try {
       setLoading(true);
       const res = await api.admin.positions();
-      setUsers(res.users || []); setError('');
+      // Hide paused accounts; drop users left with no accounts.
+      const cleaned = (res.users || [])
+        .map((u: any) => ({ ...u, accounts: (u.accounts || []).filter((a: any) => a.status !== 'paused') }))
+        .filter((u: any) => u.accounts.length > 0);
+      setUsers(cleaned); setError('');
     } catch (e: any) { setError(e.message || 'Failed to load'); } finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); const id = setInterval(load, 12000); return () => clearInterval(id); }, [load]);
@@ -24,7 +28,7 @@ export default function AdminPositions() {
 
   return (
     <div>
-      <AdminHeader icon={Activity} title="Live Positions" subtitle="Open positions per user — master & followers, straight from Delta" onRefresh={load} refreshing={loading} />
+      <AdminHeader onRefresh={load} refreshing={loading} />
 
       {error && <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-sm rounded-lg px-4 py-3 mb-5">{error}</div>}
 

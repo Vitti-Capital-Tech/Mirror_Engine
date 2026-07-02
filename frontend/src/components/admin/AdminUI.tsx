@@ -2,24 +2,20 @@
 import React from 'react';
 import { RefreshCw } from 'lucide-react';
 
-export function AdminHeader({ title, subtitle, onRefresh, refreshing, children }: {
-  icon?: any; title: string; subtitle?: string; onRefresh?: () => void; refreshing?: boolean; children?: React.ReactNode;
+export function AdminHeader({ onRefresh, refreshing, children }: {
+  icon?: any; title?: string; subtitle?: string; onRefresh?: () => void; refreshing?: boolean; children?: React.ReactNode;
 }) {
+  // The page title/subtitle live in the TopBar; this is just the actions row.
+  if (!onRefresh && !children) return null;
   return (
-    <div className="flex items-start justify-between border-b border-bg-border pb-4 mb-6 select-none">
-      <div>
-        <h1 className="text-base font-bold text-text-primary tracking-tight">{title}</h1>
-        {subtitle && <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>}
-      </div>
-      <div className="flex items-center gap-2">
-        {children}
-        {onRefresh && (
-          <button onClick={onRefresh}
-            className="flex items-center gap-2 text-xs font-semibold bg-bg-panel border border-bg-border hover:border-blue-500/50 text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg transition-colors">
-            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} /> Refresh
-          </button>
-        )}
-      </div>
+    <div className="flex items-center justify-end gap-2 mb-5 select-none">
+      {children}
+      {onRefresh && (
+        <button onClick={onRefresh}
+          className="flex items-center gap-2 text-xs font-semibold bg-bg-panel border border-bg-border hover:border-blue-500/50 text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg transition-colors">
+          <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} /> Refresh
+        </button>
+      )}
     </div>
   );
 }

@@ -24,6 +24,8 @@ export function Sidebar() {
     { href: '/admin/users', label: 'Users', icon: Users },
     { href: '/admin/positions', label: 'Positions', icon: Activity },
     { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
+    { href: '/admin/trades', label: 'Trades Log', icon: FileText },
+    { href: '/admin/alerts', label: 'Alert Feed', icon: Bell },
   ];
 
   const links = isAdmin ? adminLinks : traderLinks;

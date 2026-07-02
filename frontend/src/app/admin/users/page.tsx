@@ -2,13 +2,12 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { AdminHeader, RoleBadge, pnlClass } from '@/components/admin/AdminUI';
-import { Users, Crown, Search } from 'lucide-react';
+import { Crown, Search } from 'lucide-react';
 
 export default function AdminUsers() {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState<string | null>(null);
   const [q, setQ] = useState('');
 
   const load = useCallback(async () => {
@@ -20,18 +19,11 @@ export default function AdminUsers() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const toggleRole = async (u: any) => {
-    const next = u.role === 'admin' ? 'user' : 'admin';
-    if (!confirm(`Change ${u.email || u.id} to "${next}"?`)) return;
-    try { setBusy(u.id); await api.admin.setRole(u.id, next); await load(); }
-    catch (e: any) { alert(e.message || 'Failed'); } finally { setBusy(null); }
-  };
-
   const filtered = users.filter(u => !q || (u.email || '').toLowerCase().includes(q.toLowerCase()));
 
   return (
     <div>
-      <AdminHeader icon={Users} title="Users" subtitle="Manage every account holder on the platform" onRefresh={load} refreshing={loading}>
+      <AdminHeader onRefresh={load} refreshing={loading}>
         <div className="flex items-center gap-2 bg-bg-panel border border-bg-border rounded-lg px-3 py-1.5">
           <Search className="w-3.5 h-3.5 text-text-muted" />
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search email"
@@ -45,20 +37,19 @@ export default function AdminUsers() {
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-[11px] uppercase tracking-wider text-text-muted border-b border-bg-border">
-                <th className="px-4 py-3 font-semibold">User</th>
-                <th className="px-4 py-3 font-semibold">Role</th>
-                <th className="px-4 py-3 font-semibold">Master</th>
-                <th className="px-4 py-3 font-semibold text-right">Followers</th>
-                <th className="px-4 py-3 font-semibold text-right">Active</th>
-                <th className="px-4 py-3 font-semibold text-right">Today PnL</th>
-                <th className="px-4 py-3 font-semibold text-right">Copies (Filled)</th>
-                <th className="px-4 py-3 font-semibold text-right">Actions</th>
+              <tr className="text-left text-[10px] uppercase tracking-wider text-text-muted border-b border-bg-border">
+                <th className="px-4 py-3 font-bold">User</th>
+                <th className="px-4 py-3 font-bold">Role</th>
+                <th className="px-4 py-3 font-bold">Master</th>
+                <th className="px-4 py-3 font-bold text-right">Followers</th>
+                <th className="px-4 py-3 font-bold text-right">Active</th>
+                <th className="px-4 py-3 font-bold text-right">Today PnL</th>
+                <th className="px-4 py-3 font-bold text-right">Copies (Filled)</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="divide-y divide-white/[0.04]">
               {filtered.map((u) => (
-                <tr key={u.id} className="border-b border-bg-border/50 hover:bg-bg-panel/40 transition-colors">
+                <tr key={u.id} className="hover:bg-bg-panel/40 transition-colors">
                   <td className="px-4 py-3">
                     <div className="font-medium text-text-primary">{u.email || '—'}</div>
                     <div className="text-[11px] text-text-muted font-mono">{u.id.slice(0, 8)}…</div>
@@ -78,16 +69,10 @@ export default function AdminUsers() {
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.active_accounts}/{u.total_accounts}</td>
                   <td className={`px-4 py-3 text-right font-mono font-semibold ${pnlClass(u.today_pnl)}`}>{Number(u.today_pnl).toFixed(2)}</td>
                   <td className="px-4 py-3 text-right font-mono text-text-secondary">{u.copies_filled_today}/{u.copies_today}</td>
-                  <td className="px-4 py-3 text-right">
-                    <button onClick={() => toggleRole(u)} disabled={busy === u.id}
-                      className="text-[11px] font-semibold px-2.5 py-1 rounded-lg border border-bg-border hover:border-blue-500/50 text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50">
-                      {u.role === 'admin' ? 'Demote' : 'Make admin'}
-                    </button>
-                  </td>
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
+                <tr><td colSpan={7} className="px-4 py-10 text-center text-text-muted">No users found.</td></tr>
               )}
             </tbody>
           </table>
