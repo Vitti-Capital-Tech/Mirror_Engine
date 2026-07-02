@@ -164,31 +164,42 @@ async def admin_positions(user: CurrentUser = Depends(require_admin)):
 
 
 @router.get("/trades")
-async def admin_trades(limit: int = 100, user: CurrentUser = Depends(require_admin)):
-    """Recent trades across all tenants with owner email and copy roll-up."""
+async def admin_trades(limit: int = 300, user: CurrentUser = Depends(require_admin)):
+    """Recent trades across all tenants, grouped by user, each trade carrying its
+    full copy details (same shape as the trader trade log)."""
     try:
         profiles = (db.table("profiles").select("id, email").execute().data) or []
         email_by_id = {p["id"]: p.get("email") for p in profiles}
         trades = (db.table("trades")
-                  .select("*, copies:trade_copies(status)")
+                  .select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)")
                   .order("created_at", desc=True).limit(limit).execute().data) or []
-        out = []
+
+        by_owner: dict = {}
         for t in trades:
-            copies = t.get("copies") or []
-            out.append({
-                "id": t.get("id"),
-                "owner_email": email_by_id.get(t.get("owner_id")) or "—",
-                "symbol": t.get("symbol"),
-                "side": t.get("side"),
-                "quantity": t.get("quantity"),
-                "trade_type": t.get("trade_type"),
-                "entry_price": t.get("entry_price"),
-                "status": t.get("status"),
-                "copies_total": len(copies),
-                "copies_filled": sum(1 for c in copies if c.get("status") == "filled"),
-                "created_at": t.get("created_at"),
+            formatted = []
+            for copy in (t.get("copies") or []):
+                acc = copy.get("accounts") or {}
+                formatted.append({
+                    "account_id": copy.get("account_id"),
+                    "account_name": acc.get("name") or "Unknown",
+                    "status": copy.get("status"),
+                    "execution_price": copy.get("execution_price"),
+                    "slippage_pct": copy.get("slippage_pct"),
+                    "execution_time_ms": copy.get("execution_time_ms"),
+                    "failure_reason": copy.get("failure_reason"),
+                })
+            t["copies"] = formatted
+            owner = t.get("owner_id")
+            entry = by_owner.setdefault(owner, {
+                "id": owner, "email": email_by_id.get(owner) or "—", "trades": [],
             })
-        return out
+            entry["trades"].append(t)
+
+        users = list(by_owner.values())
+        for e in users:
+            e["count"] = len(e["trades"])
+        users.sort(key=lambda u: (u["email"] or "").lower())
+        return {"users": users}
     except Exception as e:
         logger.error(f"Error listing admin trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
