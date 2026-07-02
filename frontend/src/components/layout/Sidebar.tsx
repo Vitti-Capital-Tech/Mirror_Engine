@@ -2,20 +2,30 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Server, Wallet } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
   const pathname = usePathname();
   const { user } = useAuth();
   const [isCollapsed, setIsCollapsed] = React.useState(false);
 
-  const links = [
+  const isAdmin = user?.role === 'admin';
+
+  const traderLinks = [
     { href: '/positions', label: 'Positions', icon: Activity },
     { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/trades', label: 'Trades Log', icon: FileText },
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
-    ...(user?.role === 'admin' ? [{ href: '/admin', label: 'Admin', icon: Shield }] : []),
   ];
+
+  const adminLinks = [
+    { href: '/admin', label: 'Overview', icon: LayoutGrid },
+    { href: '/admin/users', label: 'Users', icon: Users },
+    { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
+    { href: '/admin/system', label: 'System', icon: Server },
+  ];
+
+  const links = isAdmin ? adminLinks : traderLinks;
 
   return (
     <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border flex flex-col h-full select-none transition-all duration-300 ${
@@ -90,10 +100,10 @@ export function Sidebar() {
         <div className="p-4 border-t border-bg-border">
           <div className="flex items-center gap-2 px-2 py-2 rounded-lg bg-bg-panel/50">
             <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+              <span className={`absolute inline-flex h-full w-full rounded-full opacity-60 animate-ping ${isAdmin ? 'bg-purple-400' : 'bg-emerald-400'}`} />
+              <span className={`relative inline-flex h-2 w-2 rounded-full ${isAdmin ? 'bg-purple-400' : 'bg-emerald-400'}`} />
             </span>
-            <span className="text-[11px] font-medium text-text-secondary">Engine Online</span>
+            <span className="text-[11px] font-medium text-text-secondary">{isAdmin ? 'Admin Console' : 'Engine Online'}</span>
           </div>
         </div>
       )}

@@ -11,14 +11,14 @@ const PUBLIC_ROUTES = ['/login', '/signup', '/auth/callback'];
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { isAuthenticated, loading } = useAuth();
+  const { isAuthenticated, loading, user } = useAuth();
   const isPublic = PUBLIC_ROUTES.includes(pathname);
 
   useEffect(() => {
     if (loading) return;
     if (!isAuthenticated && !isPublic) router.replace('/login');
-    if (isAuthenticated && isPublic) router.replace('/positions');
-  }, [loading, isAuthenticated, isPublic, pathname, router]);
+    if (isAuthenticated && isPublic) router.replace(user?.role === 'admin' ? '/admin' : '/positions');
+  }, [loading, isAuthenticated, isPublic, pathname, router, user]);
 
   // Public pages (login/signup) render without the app chrome.
   if (isPublic) return <>{children}</>;

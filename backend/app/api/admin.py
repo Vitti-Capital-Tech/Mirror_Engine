@@ -73,6 +73,38 @@ async def admin_overview(user: CurrentUser = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/accounts")
+async def admin_accounts(user: CurrentUser = Depends(require_admin)):
+    """Every account across all tenants, with owner email and live status."""
+    try:
+        profiles = (db.table("profiles").select("id, email").execute().data) or []
+        email_by_id = {p["id"]: p.get("email") for p in profiles}
+        from app.core.crypto import decrypt
+        accounts = (db.table("accounts").select("*").order("created_at").execute().data) or []
+        out = []
+        for a in accounts:
+            key = decrypt(a.get("api_key") or "")
+            out.append({
+                "id": a["id"],
+                "name": a.get("name"),
+                "owner_id": a.get("owner_id"),
+                "owner_email": email_by_id.get(a.get("owner_id")) or "—",
+                "is_master": bool(a.get("is_master")),
+                "status": a.get("status"),
+                "environment": a.get("environment"),
+                "balance": a.get("balance"),
+                "allocated_balance": a.get("allocated_balance"),
+                "today_pnl": a.get("today_pnl"),
+                "api_key_hint": f"...{key[-4:]}" if len(key) >= 4 else "…",
+                "live": bool(a.get("is_master")) and listener_manager.is_running(a["id"]),
+                "created_at": a.get("created_at"),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Error listing admin accounts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/users/{user_id}/role")
 async def set_user_role(user_id: str, role: str, user: CurrentUser = Depends(require_admin)):
     """Promote/demote a user between 'user' and 'admin'."""
