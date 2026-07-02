@@ -49,7 +49,7 @@ async def admin_overview(user: CurrentUser = Depends(require_admin)):
                 "master_name": master["name"] if master else None,
                 "master_live": bool(master) and listener_manager.is_running(master["id"]),
                 "follower_count": len(followers),
-                "today_pnl": round(sum(float(f.get("today_pnl") or 0) for f in followers), 2),
+                "today_pnl": round(sum(float(a.get("today_pnl") or 0) for a in accs), 2),
                 "copies_today": len(ucopies),
                 "copies_filled_today": sum(1 for c in ucopies if c.get("status") == "filled"),
             })

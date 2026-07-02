@@ -221,10 +221,16 @@ async def _sync_accounts(accounts: list) -> list:
 
                 live_positions = await client.get_positions()
 
+                # Accumulate live unrealized PnL as "today's PnL" (intraday MTM).
+                today_pnl = 0.0
                 for pos in live_positions:
                     symbol = pos.get("product_symbol") or pos.get("symbol")
                     if not symbol:
                         continue
+
+                    fmt = _format_live_position(acc["id"], acc["name"], pos)
+                    if fmt:
+                        today_pnl += float(fmt.get("unrealized_pnl") or 0.0)
 
                     from app.core.position_monitor import position_monitor
                     await position_monitor.on_position_update(
@@ -232,6 +238,8 @@ async def _sync_accounts(accounts: list) -> list:
                         account_name=acc["name"],
                         position_data=pos
                     )
+
+                db.table("accounts").update({"today_pnl": round(today_pnl, 2)}).eq("id", acc["id"]).execute()
 
                 # Deletion is intentionally omitted here.
                 # WebSocket handles position closes (size=0 messages) in real time.
