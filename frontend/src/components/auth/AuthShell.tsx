@@ -130,12 +130,7 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
             <span className="bg-gradient-to-r from-sky-300 to-blue-500 bg-clip-text text-transparent">Infinite mirrors.</span>
           </h1>
 
-          {/* Live animated graphic */}
-          <div className="hero-rise hero-d4 mt-6">
-            <MirrorGraphic />
-          </div>
-
-          <div className="hero-rise hero-d5">
+          <div className="hero-rise hero-d4">
             <FeatureList />
           </div>
         </div>
