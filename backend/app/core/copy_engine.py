@@ -1,6 +1,6 @@
 import logging
 import asyncio
-import random
+import hashlib
 from typing import List, Dict, Any
 from app.database import db
 from app.websocket.socket_manager import socket_manager
@@ -189,13 +189,23 @@ class CopyEngine:
         logger.info(f"Completed trade copy chain. Status: {final_status}. Fills: {filled_count}/{len(followers)}")
 
     @staticmethod
-    def _jitter_trigger(price):
-        """Offset an SL/TP trigger price by a random +/- (10..50) so multiple
-        followers don't all trigger at the exact same price/instant. The lower
-        bound is 10 so the offset is never negligibly small."""
+    def _jitter_trigger(price, seed: str = ""):
+        """Offset an SL/TP trigger by a DETERMINISTIC +/- (10..50).
+
+        The offset is derived from the follower (``seed``) and the trigger price,
+        NOT random. This means:
+          * two legs of a pair that share the same master trigger price get the
+            SAME follower price (so a pair stays aligned), and
+          * different followers still get different offsets, so they don't all
+            trigger at the exact same price/instant.
+        """
         if price is None:
             return None
-        return round(float(price) + random.choice([-1, 1]) * random.randint(10, 50), 1)
+        base = round(float(price), 1)
+        h = int(hashlib.sha256(f"{seed}:{base}".encode()).hexdigest(), 16)
+        magnitude = 10 + (h % 41)          # 10..50 inclusive
+        sign = 1 if (h >> 7) & 1 else -1
+        return round(base + sign * magnitude, 1)
 
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
@@ -295,7 +305,7 @@ class CopyEngine:
                     except Exception as e:
                         logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
                 try:
-                    jittered_stop = self._jitter_trigger(stop_price)
+                    jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
                     if is_update and existing_foid:
                         # Master EDITED the SL/TP price -> edit the follower's existing
                         # bracket order rather than creating a new one (which 400s).
