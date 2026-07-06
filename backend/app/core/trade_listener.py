@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Optional
 from app.services.delta_client import DeltaClient
 from app.models.trade import TradeEvent, TradeSide, TradeType
@@ -118,6 +119,7 @@ class TradeListener:
         logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
         payload = trade_event.dict()
         payload["owner_id"] = (self.master_account or {}).get("owner_id")
+        payload["ts"] = time.time()  # detection time, for latency measurement
         await self.redis.lpush("trade_events", json.dumps(payload))
 
     async def _push_order_event(self, order: dict, action: str) -> None:
@@ -141,6 +143,7 @@ class TradeListener:
             # stop_update / action 'update' => the master EDITED an existing SL/TP.
             "is_update": order.get("reason") == "stop_update" or order.get("action") == "update",
             "owner_id": (self.master_account or {}).get("owner_id"),
+            "ts": time.time(),  # detection time, for latency measurement
         }
         logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")
         await self.redis.lpush("order_events", json.dumps(payload))

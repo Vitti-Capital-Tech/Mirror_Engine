@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import hashlib
+import time
 from typing import List, Dict, Any
 from app.database import db
 from app.websocket.socket_manager import socket_manager
@@ -35,6 +36,10 @@ class CopyEngine:
         trade_type = event_dict.get("trade_type", "entry")
         raw_payload = event_dict.get("raw_payload")
         owner_id = event_dict.get("owner_id")
+        ts_detected = event_dict.get("ts")
+        _t0 = time.time()
+        if ts_detected:
+            logger.info(f"[LATENCY] {symbol}: {(_t0 - ts_detected):.2f}s from master-fill detection to dispatch start")
 
         logger.info(f"Processing master fill: {side.upper()} {quantity} {symbol} @ {entry_price} (ID: {master_trade_id})")
 
@@ -181,6 +186,8 @@ class CopyEngine:
         results = []
         if tasks:
             results = await asyncio.gather(*tasks)
+        if ts_detected:
+            logger.info(f"[LATENCY] {symbol}: {(time.time() - ts_detected):.2f}s end-to-end (detection → followers executed)")
 
         # 5. Determine final master trade status
         filled_count = sum(1 for r in results if r.get("status") == "filled")
@@ -294,6 +301,9 @@ class CopyEngine:
         owner_id = event.get("owner_id")
         if not symbol or not side or master_qty <= 0:
             return
+        ts = event.get("ts")
+        if ts:
+            logger.info(f"[LATENCY] {symbol} order-mirror: {(time.time() - ts):.2f}s from master order detection to mirror start")
 
         # Active followers (scoped to the master's owner)
         try:

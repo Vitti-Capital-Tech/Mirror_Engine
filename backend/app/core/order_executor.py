@@ -144,6 +144,7 @@ class OrderExecutor:
                     logger.warning(f"FOK attempt {attempt + 1} for {account_name} on {symbol}: {last_error}")
 
         execution_time_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"[LATENCY] {account_name} {symbol}: follower order {'filled' if filled_qty > 0 else 'not filled'} in {execution_time_ms}ms")
 
         if filled_qty > 0:
             db.table("accounts").update({"consecutive_failures": 0, "status": "active"}).eq("id", account_id).execute()
