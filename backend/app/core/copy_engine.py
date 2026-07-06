@@ -476,17 +476,34 @@ class CopyEngine:
 
         product_id = (event or {}).get("product_id")
         symbol = (event or {}).get("symbol")
-        # A protective order = a stop / SL / TP / bracket leg. Cancelling one of
-        # these while the follower's position is still open would strip its
-        # protection — and that's exactly what happens when the master's SL/TP
-        # hits and Delta auto-cancels the paired leg (OCO). We must NOT propagate
-        # that: let each follower's own bracket close its position independently
-        # (they're jittered, so they trigger at slightly different prices).
+
+        # A protective order = stop / SL / TP / bracket leg. Decide ONCE, from the
+        # MASTER's position, whether this cancel is genuine or an SL/TP-hit:
+        #   • master still HOLDS the position  -> the user cancelled/edited the stop
+        #       intentionally  -> propagate the cancel to followers.
+        #   • master is FLAT                    -> the leg vanished because the SL/TP
+        #       HIT (OCO) -> keep each follower's own (jittered) bracket so it closes
+        #       its own position; don't strip its protection.
         is_protective = bool(
             (event or {}).get("stop_order_type")
             or (event or {}).get("stop_price")
             or (event or {}).get("is_bracket")
         )
+        if is_protective and symbol and event:
+            owner_id = event.get("owner_id")
+            try:
+                mq = self.db.table("accounts").select("*").eq("is_master", True)
+                if owner_id:
+                    mq = mq.eq("owner_id", owner_id)
+                mrow = mq.execute()
+                master_row = mrow.data[0] if mrow.data else None
+            except Exception:
+                master_row = None
+            master_sz = await self._master_position_size(master_row, symbol)
+            if master_sz is not None and master_sz == 0:
+                logger.info(f"Master flat on {symbol}; keeping follower SL/TP (leg cancelled by an SL/TP hit, not a manual cancel).")
+                return
+            # else: master still holds it (or size unknown) -> genuine cancel, propagate.
 
         # Determine the set of followers to act on: mapped ones, plus (for
         # self-heal) all active followers if we have no mapping.
@@ -505,22 +522,6 @@ class CopyEngine:
             client = await self._get_follower_client(acc_res.data[0])
             if not client:
                 continue
-
-            # Guard: keep the follower's SL/TP if its position is still open.
-            if is_protective and symbol:
-                try:
-                    positions = await client.get_positions()
-                    has_open = any(
-                        (p.get("product_symbol") == symbol or p.get("symbol") == symbol)
-                        and float(p.get("size") or 0) != 0
-                        for p in positions
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not verify {symbol} position for {follower_id}: {e}")
-                    has_open = True  # fail safe: don't strip protection on error
-                if has_open:
-                    logger.info(f"Kept SL/TP for follower {follower_id} on {symbol} — position still open (master leg cancelled, letting follower's own bracket run)")
-                    continue
 
             try:
                 if follower_order_id:
