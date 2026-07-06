@@ -53,7 +53,11 @@ class TradeListener:
         fill on their own (avoids double fills).
         """
         try:
-            logger.info(f"Master order update received: {order}")
+            logger.info(
+                "Master order update: %s %s state=%s reason=%s",
+                order.get("side"), order.get("product_symbol"),
+                order.get("state"), order.get("reason"),
+            )
 
             state = (order.get("state") or "").lower()
             reason = order.get("reason")

@@ -382,6 +382,17 @@ class DeltaClient:
 
         if msg_type == "orders":
             order = data.get("order", data)
+            # Measure how stale this event is by the time we process it: compares
+            # Delta's own event timestamp (µs) to now. A high value means the WS
+            # read loop is backed up (heavy order flood) or Delta delivered late.
+            ts = data.get("timestamp") or order.get("timestamp")
+            if ts:
+                try:
+                    lag = time.time() - float(ts) / 1_000_000.0
+                    if lag > 1.0:
+                        logger.warning(f"[WSLAG] orders event {lag:.2f}s stale at processing ({order.get('product_symbol')} {order.get('state')}/{order.get('reason')})")
+                except Exception:
+                    pass
             # Forward every order lifecycle event (create/fill/cancel); the
             # listener decides how to handle each.
             if self._on_fill:
