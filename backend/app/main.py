@@ -129,17 +129,41 @@ async def lifespan(app: FastAPI):
     await redis_client.close()
     logger.info("Shutdown completed.")
 
+# Per-symbol locks so events for the SAME symbol stay ordered (place→cancel→fill),
+# while different symbols process concurrently. This lets a burst of master
+# orders drain immediately instead of queuing one-at-a-time behind REST calls.
+_symbol_locks: dict = {}
+
+def _symbol_lock(key: str) -> asyncio.Lock:
+    lk = _symbol_locks.get(key)
+    if lk is None:
+        lk = asyncio.Lock()
+        _symbol_locks[key] = lk
+    return lk
+
+async def _run_fill(event_dict: dict):
+    async with _symbol_lock(event_dict.get("symbol") or "_"):
+        try:
+            await copy_engine.process_fill(event_dict)
+        except Exception as e:
+            logger.error(f"process_fill error: {e}", exc_info=True)
+
+async def _run_order(event: dict):
+    async with _symbol_lock(event.get("symbol") or "_"):
+        try:
+            await copy_engine.process_order_event(event)
+        except Exception as e:
+            logger.error(f"process_order_event error: {e}", exc_info=True)
+
 async def redis_consumer():
-    """Background loop consuming master fill events from Redis and executing them via the CopyEngine."""
+    """Consume master fill events and dispatch them concurrently (ordered per symbol)."""
     logger.info("Redis consumer loop started.")
     while True:
         try:
-            # Block for up to 1 second waiting for list elements
             data = await redis_client.brpop("trade_events", timeout=1)
             if data:
                 _, raw_payload = data
-                event_dict = json.loads(raw_payload)
-                await copy_engine.process_fill(event_dict)
+                asyncio.create_task(_run_fill(json.loads(raw_payload)))
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -147,16 +171,15 @@ async def redis_consumer():
             await asyncio.sleep(0.1)
 
 async def order_consumer():
-    """Background loop consuming master resting-order place/cancel events and
-    mirroring them onto followers via the CopyEngine."""
+    """Consume master resting-order place/cancel events and dispatch them
+    concurrently (ordered per symbol) so bursts don't queue up."""
     logger.info("Order mirror consumer loop started.")
     while True:
         try:
             data = await redis_client.brpop("order_events", timeout=1)
             if data:
                 _, raw_payload = data
-                event = json.loads(raw_payload)
-                await copy_engine.process_order_event(event)
+                asyncio.create_task(_run_order(json.loads(raw_payload)))
         except asyncio.CancelledError:
             break
         except Exception as e:
