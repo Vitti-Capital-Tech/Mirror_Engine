@@ -238,27 +238,37 @@ class PositionMonitor:
                 status = "out_of_sync"
                 msg = f"Position mismatch for {account_name} on {symbol}: actual size={follower_qty}, expected size={expected_qty} (diff={diff})"
 
-                # Only alert/log ONCE per open mismatch (per account+symbol) —
-                # avoid re-firing the same alert every sync cycle.
-                existing_alert = self.db.table("alerts").select("id, metadata").eq("account_id", account_id).eq("type", "position_mismatch").eq("is_resolved", False).execute()
-                already = any((a.get("metadata") or {}).get("symbol") == symbol for a in (existing_alert.data or []))
-                if not already:
+                # Notify BOTH the follower and the master account. Only alert
+                # ONCE per open mismatch (per account+symbol) — avoid re-firing
+                # the same alert every sync cycle.
+                owner_id = follower_account.get("owner_id")
+                targets = [account_id, master_id]
+                existing_alert = (
+                    self.db.table("alerts")
+                    .select("account_id, metadata")
+                    .eq("type", "position_mismatch").eq("is_resolved", False)
+                    .in_("account_id", targets).execute()
+                )
+                have = {
+                    (a.get("account_id"), (a.get("metadata") or {}).get("symbol"))
+                    for a in (existing_alert.data or [])
+                }
+                meta = {
+                    "symbol": symbol,
+                    "follower_qty": follower_qty,
+                    "expected_qty": expected_qty,
+                    "master_qty": master_qty,
+                }
+                to_insert = [
+                    {"level": "error", "type": "position_mismatch", "account_id": aid,
+                     "message": msg, "metadata": meta, "owner_id": owner_id}
+                    for aid in targets if (aid, symbol) not in have
+                ]
+                if to_insert:
                     logger.warning(msg)
-                    alert_data = {
-                        "level": "error",
-                        "type": "position_mismatch",
-                        "account_id": account_id,
-                        "message": msg,
-                        "metadata": {
-                            "symbol": symbol,
-                            "follower_qty": follower_qty,
-                            "expected_qty": expected_qty,
-                            "master_qty": master_qty,
-                        },
-                    }
-                    alert_res = self.db.table("alerts").insert(alert_data).execute()
-                    if alert_res.data:
-                        await self.socket_manager.emit_alert(alert_res.data[0])
+                    alert_res = self.db.table("alerts").insert(to_insert).execute()
+                    for row in (alert_res.data or []):
+                        await self.socket_manager.emit_alert(row)
                 
                 # Update position sync_status in DB
                 self.db.table("positions").update({"sync_status": "out_of_sync"}).eq("account_id", account_id).eq("symbol", symbol).execute()
@@ -273,18 +283,29 @@ class PositionMonitor:
             return "unknown"
 
     async def _resolve_mismatch_alert(self, account_id: str, symbol: str) -> None:
-        """Resolve any open position mismatch alerts for the given account/symbol."""
+        """Resolve open position mismatch alerts for this symbol on BOTH the
+        follower and the master (mismatch alerts are raised on both)."""
         try:
-            alerts_res = self.db.table("alerts").select("*").eq("account_id", account_id).eq("type", "position_mismatch").eq("is_resolved", False).execute()
-            alerts = alerts_res.data or []
-            
-            for alert in alerts:
+            account_ids = [account_id]
+            try:
+                mr = self.db.table("accounts").select("id").eq("is_master", True).execute()
+                if mr.data:
+                    account_ids.append(mr.data[0]["id"])
+            except Exception:
+                pass
+
+            alerts_res = (
+                self.db.table("alerts").select("*")
+                .eq("type", "position_mismatch").eq("is_resolved", False)
+                .in_("account_id", account_ids).execute()
+            )
+            for alert in (alerts_res.data or []):
                 meta = alert.get("metadata") or {}
                 if meta.get("symbol") == symbol:
                     self.db.table("alerts").update({"is_resolved": True}).eq("id", alert["id"]).execute()
                     alert["is_resolved"] = True
                     await self.socket_manager.emit_alert(alert)
-                    logger.info(f"Resolved position mismatch alert {alert['id']} for {account_id} on {symbol}")
+                    logger.info(f"Resolved position mismatch alert {alert['id']} for {alert.get('account_id')} on {symbol}")
         except Exception as e:
             logger.error(f"Error resolving mismatch alerts: {e}")
 
