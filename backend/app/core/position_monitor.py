@@ -197,11 +197,16 @@ class PositionMonitor:
             if account_id == master_id:
                 return "synced"
 
-            # 2. Fetch master's position for this symbol
+            # 2. Fetch master's position for this symbol.
+            # If we have NO record of the master's position for this symbol, we
+            # cannot compute an expected size (e.g. options positions can't be
+            # fetched over REST — Delta's options endpoint 400s — and the WS
+            # snapshot may be empty). Return 'unknown' instead of raising a false
+            # "expected size = 0" mismatch for a follower that is actually synced.
             master_pos_res = self.db.table("positions").select("*").eq("account_id", master_id).eq("symbol", symbol).execute()
-            master_qty = 0.0
-            if master_pos_res.data:
-                master_qty = float(master_pos_res.data[0]["quantity"])
+            if not master_pos_res.data:
+                return "unknown"
+            master_qty = float(master_pos_res.data[0]["quantity"])
 
             # 3. Fetch follower account settings
             follower_acc_res = self.db.table("accounts").select("*").eq("id", account_id).execute()
@@ -232,25 +237,25 @@ class PositionMonitor:
             if diff > mismatch_limit:
                 status = "out_of_sync"
                 msg = f"Position mismatch for {account_name} on {symbol}: actual size={follower_qty}, expected size={expected_qty} (diff={diff})"
-                logger.warning(msg)
 
-                # Upsert / insert alert
-                alert_data = {
-                    "level": "error",
-                    "type": "position_mismatch",
-                    "account_id": account_id,
-                    "message": msg,
-                    "metadata": {
-                        "symbol": symbol,
-                        "follower_qty": follower_qty,
-                        "expected_qty": expected_qty,
-                        "master_qty": master_qty
+                # Only alert/log ONCE per open mismatch (per account+symbol) —
+                # avoid re-firing the same alert every sync cycle.
+                existing_alert = self.db.table("alerts").select("id, metadata").eq("account_id", account_id).eq("type", "position_mismatch").eq("is_resolved", False).execute()
+                already = any((a.get("metadata") or {}).get("symbol") == symbol for a in (existing_alert.data or []))
+                if not already:
+                    logger.warning(msg)
+                    alert_data = {
+                        "level": "error",
+                        "type": "position_mismatch",
+                        "account_id": account_id,
+                        "message": msg,
+                        "metadata": {
+                            "symbol": symbol,
+                            "follower_qty": follower_qty,
+                            "expected_qty": expected_qty,
+                            "master_qty": master_qty,
+                        },
                     }
-                }
-                
-                # Check if there is an unresolved alert
-                existing_alert = self.db.table("alerts").select("id").eq("account_id", account_id).eq("type", "position_mismatch").eq("is_resolved", False).execute()
-                if not existing_alert.data:
                     alert_res = self.db.table("alerts").insert(alert_data).execute()
                     if alert_res.data:
                         await self.socket_manager.emit_alert(alert_res.data[0])

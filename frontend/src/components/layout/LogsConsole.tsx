@@ -22,6 +22,9 @@ export function LogsConsole() {
     },
   ]);
   const consoleBottomRef = useRef<HTMLDivElement>(null);
+  // Track which account+symbol are already flagged out-of-sync so we log each
+  // mismatch only once (until it recovers) instead of every sync cycle.
+  const outOfSyncRef = useRef<Set<string>>(new Set());
 
   const addLog = (message: string, level: 'info' | 'warning' | 'error' = 'info') => {
     const newLog: LogItem = {
@@ -52,16 +55,23 @@ export function LogsConsole() {
     }
   }, [latestTrade]);
 
-  // Listen to position updates — only surface mismatches, not routine syncs
+  // Listen to position updates — surface each mismatch ONCE (log on the
+  // transition into out-of-sync, and again only after it has recovered).
   useEffect(() => {
-    if (latestPosition) {
-      const status = latestPosition.sync_status?.toLowerCase();
-      if (status === 'out_of_sync' || status === 'desynced') {
+    if (!latestPosition) return;
+    const status = latestPosition.sync_status?.toLowerCase();
+    const key = `${latestPosition.account_id}:${latestPosition.symbol}`;
+    const seen = outOfSyncRef.current;
+    if (status === 'out_of_sync' || status === 'desynced') {
+      if (!seen.has(key)) {
+        seen.add(key);
         addLog(
           `Position OUT OF SYNC: ${latestPosition.account_name} on ${latestPosition.symbol} (size=${latestPosition.quantity})`,
           'warning'
         );
       }
+    } else {
+      seen.delete(key); // recovered — allow a future mismatch to log again
     }
   }, [latestPosition]);
 
