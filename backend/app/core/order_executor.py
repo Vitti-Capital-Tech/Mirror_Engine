@@ -10,10 +10,11 @@ from app.websocket.socket_manager import socket_manager
 
 logger = logging.getLogger(__name__)
 
-# Liquidity-shortfall handling: fill what's available, then retry the unfilled
-# remainder every FILL_RETRY_DELAY seconds up to MAX_FILL_RETRIES times.
-MAX_FILL_RETRIES = 3
-FILL_RETRY_DELAY = 5  # seconds
+# Liquidity-shortfall handling (all-or-nothing FOK entries): if the full size
+# can't fill instantly, retry a few times, quickly, to catch the next liquidity
+# window. Kept short so follower entries land fast (worst case ≈ RETRIES*DELAY).
+MAX_FILL_RETRIES = 4
+FILL_RETRY_DELAY = 1.0  # seconds  (was 5s → caused 10-15s copy latency)
 
 class OrderExecutor:
     def __init__(self) -> None:
