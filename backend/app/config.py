@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # If unset, a stable key is derived from SUPABASE_SERVICE_KEY (see crypto.py).
     ENCRYPTION_KEY: str = ""
 
+    # Telegram alert notifications (optional). Set both to enable.
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 

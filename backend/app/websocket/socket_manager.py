@@ -96,6 +96,14 @@ class SocketManager:
             await sio.emit("alert", data)
         except Exception as exc:
             logger.error("emit_alert failed: %s", exc)
+        # Also push to Telegram (fire-and-forget). Skip resolution updates.
+        if not data.get("is_resolved"):
+            try:
+                import asyncio
+                from app.services.telegram_client import send_alert
+                asyncio.create_task(send_alert(data))
+            except Exception as exc:
+                logger.warning("telegram dispatch failed: %s", exc)
 
     async def emit_account_update(self, data: dict) -> None:
         """Broadcast an account status / balance update."""
