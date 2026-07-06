@@ -6,6 +6,7 @@ from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
+from app.services.delta_client import DeltaClient
 
 logger = logging.getLogger(__name__)
 
@@ -110,16 +111,25 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
 
-        # Closes (exit/sl) round up so reduce-only orders never leave a residual;
-        # opens floor so we never over-expose.
+        # Opens: floor (never over-expose).
+        # Closes: rebalance each follower to floor(master_remaining × ratio) —
+        # i.e. close only the difference between what the follower holds and what
+        # it *should* hold given the master's REMAINING position. This prevents a
+        # small master trim of a large position from wiping a small follower
+        # (the old ceil(master_close × ratio) rounded every tiny trim up to a
+        # full follower lot).
         is_exit = trade_type in ("exit", "sl")
+
+        master_remaining = None
+        if is_exit:
+            master_row = master_acc.data[0] if master_acc.data else None
+            master_remaining = await self._master_position_size(master_row, symbol)
 
         tasks = []
         for follower in followers:
             # Inject master balance context
             follower["master_balance"] = master_balance
-            follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=is_exit)
-            
+
             client = self.connection_manager.get_client(follower["id"])
             if not client:
                 try:
@@ -130,23 +140,42 @@ class CopyEngine:
                         "trade_id": trade_uuid,
                         "account_id": follower["id"],
                         "status": "failed",
-                        "quantity": follower_qty,
+                        "quantity": 0,
                         "failure_reason": f"Connection error: {e}",
                         "owner_id": follower.get("owner_id"),
                     }).execute()
                     continue
+            if not client:
+                continue
 
-            if client:
-                tasks.append(order_executor.execute(
-                    client=client,
-                    account=follower,
-                    trade_id=trade_uuid,
-                    symbol=symbol,
-                    side=side,
-                    quantity=follower_qty,
-                    master_price=entry_price,
-                    trade_type=trade_type
-                ))
+            if is_exit:
+                if master_remaining is None:
+                    # Couldn't read the master's remaining size — fall back to a
+                    # proportional close rather than skipping the exit entirely.
+                    follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                else:
+                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=False)
+                    current = await self._position_size(client, symbol)
+                    follower_qty = int(current) - int(target)
+                    if follower_qty < 1:
+                        logger.info(
+                            f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
+                            f"target {int(target)} (master left {master_remaining:.0f})"
+                        )
+                        continue
+            else:
+                follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=False)
+
+            tasks.append(order_executor.execute(
+                client=client,
+                account=follower,
+                trade_id=trade_uuid,
+                symbol=symbol,
+                side=side,
+                quantity=follower_qty,
+                master_price=entry_price,
+                trade_type=trade_type
+            ))
 
         # 4. Gather results in parallel
         results = []
@@ -206,6 +235,33 @@ class CopyEngine:
         magnitude = 10 + (h % 41)          # 10..50 inclusive
         sign = 1 if (h >> 7) & 1 else -1
         return round(base + sign * magnitude, 1)
+
+    @staticmethod
+    async def _position_size(client, symbol: str) -> float:
+        """Live absolute position size for a symbol on the given client (0 if none)."""
+        try:
+            for p in await client.get_positions():
+                s = p.get("product_symbol") or p.get("symbol")
+                if s == symbol:
+                    return abs(float(p.get("size") or 0))
+        except Exception as e:
+            logger.warning(f"Position size fetch failed for {symbol}: {e}")
+        return 0.0
+
+    async def _master_position_size(self, master_row: dict, symbol: str):
+        """Live absolute master position size for a symbol. Returns None if it
+        can't be determined (so the caller can fall back)."""
+        if not master_row:
+            return None
+        try:
+            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
+            try:
+                return await self._position_size(mc, symbol)
+            finally:
+                await mc.close()
+        except Exception as e:
+            logger.error(f"Master position size fetch failed for {symbol}: {e}")
+            return None
 
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
