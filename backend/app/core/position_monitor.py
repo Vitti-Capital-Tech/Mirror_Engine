@@ -1,11 +1,15 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 
 logger = logging.getLogger(__name__)
+
+# Don't re-raise the same (account, symbol) position-mismatch alert more than once
+# within this window — even if it resolves and re-triggers as the master trades.
+MISMATCH_COOLDOWN_MIN = 30
 
 class PositionMonitor:
     def __init__(self, db_client, socket_mgr) -> None:
@@ -238,20 +242,24 @@ class PositionMonitor:
                 status = "out_of_sync"
                 msg = f"Position mismatch for {account_name} on {symbol}: actual size={follower_qty}, expected size={expected_qty} (diff={diff})"
 
-                # Notify BOTH the follower and the master account. Only alert
-                # ONCE per open mismatch (per account+symbol) — avoid re-firing
-                # the same alert every sync cycle.
+                # Notify BOTH the follower and the master account, but at most
+                # ONCE per (account, symbol) within MISMATCH_COOLDOWN_MIN — even
+                # if the mismatch resolves and re-triggers repeatedly while the
+                # master trades. Time-window based so resolve/re-create churn
+                # can't defeat it.
                 owner_id = follower_account.get("owner_id")
                 targets = [account_id, master_id]
-                existing_alert = (
+                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=MISMATCH_COOLDOWN_MIN)).isoformat()
+                recent = (
                     self.db.table("alerts")
-                    .select("account_id, metadata")
-                    .eq("type", "position_mismatch").eq("is_resolved", False)
-                    .in_("account_id", targets).execute()
+                    .select("account_id, metadata, created_at")
+                    .eq("type", "position_mismatch")
+                    .in_("account_id", targets)
+                    .gte("created_at", cutoff).execute()
                 )
                 have = {
                     (a.get("account_id"), (a.get("metadata") or {}).get("symbol"))
-                    for a in (existing_alert.data or [])
+                    for a in (recent.data or [])
                 }
                 meta = {
                     "symbol": symbol,
