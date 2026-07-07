@@ -168,7 +168,7 @@ class CopyEngine:
                     # proportional close rather than skipping the exit entirely.
                     follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
                 else:
-                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=False)
+                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=False, min_one=False)
                     current = await self._position_size(client, symbol)
                     follower_qty = int(current) - int(target)
                     if follower_qty < 1:
@@ -263,6 +263,21 @@ class CopyEngine:
         except Exception as e:
             logger.warning(f"Position size fetch failed for {symbol}: {e}")
         return 0.0
+
+    async def _follower_close_qty(self, client, follower: dict, symbol: str, master_row: dict, ref_price: float = 0.0):
+        """How many lots the follower should CLOSE to rebalance to the master's
+        REMAINING position: follower_current - floor(master_remaining × ratio).
+        A small master trim therefore closes ~nothing on a small follower.
+        Returns (close_qty, follower_current); close_qty is None if the master
+        size can't be read (caller falls back)."""
+        master_remaining = await self._master_position_size(master_row, symbol)
+        current = await self._position_size(client, symbol)
+        if master_remaining is None:
+            return None, current
+        target = self.risk_engine.calculate_follower_quantity(
+            master_remaining, ref_price, follower, round_up=False, min_one=False
+        )
+        return max(0, int(current) - int(target)), current
 
     async def _master_position_size(self, master_row: dict, symbol: str):
         """Live absolute master position size for a symbol (cached ~3s so a burst
@@ -417,6 +432,20 @@ class CopyEngine:
                     logger.error(f"Failed to mirror bracket to {follower['name']}: {e} {body}")
                 continue
 
+            # CLOSE via limit (reduce-only): size it by rebalancing to the master's
+            # REMAINING position, not by the master's close-chunk size. Otherwise a
+            # 1-lot master trim would close a whole follower lot (min-1) and wipe a
+            # small follower after a few trims.
+            if reduce_only and not is_update:
+                cq, cur = await self._follower_close_qty(client, follower, symbol, master_row, ref_price)
+                if cq is None:
+                    pass  # master size unknown → fall through with the mirrored qty
+                elif cq < 1:
+                    logger.info(f"No close needed for {follower['name']} on {symbol}: holds {cur:.0f} (rebalance says 0)")
+                    continue
+                else:
+                    qty = cq
+
             # Plain limit order: if the master EDITED it, edit the follower's
             # existing order instead of placing a duplicate.
             existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
@@ -465,46 +494,87 @@ class CopyEngine:
                 body = getattr(getattr(e, "response", None), "text", "")
                 logger.error(f"Failed to mirror order to {follower['name']}: {e} {body}")
 
+    @staticmethod
+    def _order_done(od: dict) -> bool:
+        """True if the order is fully filled/closed (nothing left to force)."""
+        state = (od.get("state") or "").lower()
+        unfilled = od.get("unfilled_size")
+        unfilled = float(unfilled if unfilled is not None else (od.get("size") or 1))
+        return state in ("closed", "filled") or unfilled <= 0
+
+    @staticmethod
+    def _filled_size(od: dict) -> int:
+        fs = od.get("filled_size")
+        if fs is not None:
+            return int(float(fs))
+        return int(float(od.get("size") or 0) - float(od.get("unfilled_size") or 0))
+
+    async def _safe_get_order(self, client, order_id) -> dict:
+        try:
+            return (await client.get_order(str(order_id))).get("result", {}) or {}
+        except Exception:
+            return {}
+
+    async def _safe_cancel(self, client, order_id, product_id) -> bool:
+        """Cancel; return True only if it actually cancelled (order was open)."""
+        try:
+            await client.cancel_order(str(order_id), product_id=product_id)
+            return True
+        except Exception as e:
+            logger.warning(f"Escalation cancel failed for {order_id}: {e}")
+            return False
+
     async def _escalate_unfilled_limit(self, follower, client, order_id, product_id,
                                        symbol, side, qty, reduce_only, master_row) -> None:
         """If a mirrored limit order hasn't executed after wait+retry, force the
-        follower in with a full-or-nothing market order (only if the master
-        actually holds the position, so we don't enter when the master didn't)."""
+        follower in/out with a full-or-nothing market order — but only when it's
+        still warranted, and without ever double-filling."""
         try:
-            # Window 1 (wait), then window 2 (the "retry" wait).
+            # Wait, then retry-wait; bail the moment it fills.
             for _ in range(2):
                 await asyncio.sleep(ESCALATE_WAIT_SEC)
-                try:
-                    od = (await client.get_order(str(order_id))).get("result", {}) or {}
-                except Exception:
-                    od = {}
-                state = (od.get("state") or "").lower()
-                unfilled = od.get("unfilled_size")
-                unfilled = float(unfilled if unfilled is not None else (od.get("size") or 0))
-                if state in ("closed", "filled") or unfilled <= 0:
-                    return  # it filled — nothing to do
-
-            # Still unfilled. For entries, only force market if the master really
-            # holds the position (its own limit filled); otherwise the master
-            # didn't get in either, so neither should the follower.
-            if not reduce_only:
-                msz = await self._master_position_size(master_row, symbol)
-                if msz is not None and msz == 0:
-                    logger.info(f"Escalation skipped for {follower['name']} {symbol}: master has no position (limit unfilled on master too).")
+                if self._order_done(await self._safe_get_order(client, order_id)):
                     return
 
-            # Cancel the resting limit, then market it (full size or nothing).
-            try:
-                await client.cancel_order(str(order_id), product_id=product_id)
-            except Exception as e:
-                logger.warning(f"Escalation cancel failed for {follower['name']} {symbol}: {e}")
+            # Is forcing still warranted?
+            if reduce_only:
+                # Only force-close if the follower is STILL over its rebalance
+                # target (guards against the master cancelling/re-quoting the close).
+                cq, cur = await self._follower_close_qty(client, follower, symbol, master_row)
+                if cq is not None and cq < 1:
+                    logger.info(f"Escalation: no close needed for {follower['name']} {symbol}; cancelling stale limit.")
+                    await self._safe_cancel(client, order_id, product_id)
+                    return
+            else:
+                # Only force-enter if the master actually holds the position.
+                msz = await self._master_position_size(master_row, symbol)
+                if msz is not None and msz == 0:
+                    logger.info(f"Escalation skipped for {follower['name']} {symbol}: master has no position.")
+                    await self._safe_cancel(client, order_id, product_id)
+                    return
+
+            # Cancel, then CONFIRM it didn't fill during the race before marketing.
+            cancelled = await self._safe_cancel(client, order_id, product_id)
+            od = await self._safe_get_order(client, order_id)
+            if not cancelled and self._order_done(od):
+                logger.info(f"Escalation aborted for {follower['name']} {symbol}: limit filled during cancel (no double-order).")
+                return
+
+            # Market only the UNFILLED remainder, never more than intended.
+            market_qty = int(qty) - self._filled_size(od)
+            if reduce_only:
+                cq, _cur = await self._follower_close_qty(client, follower, symbol, master_row)
+                if cq is not None:
+                    market_qty = min(market_qty, cq)
+            if market_qty < 1:
+                return
             try:
                 resp = await client.place_order(
-                    symbol=symbol, side=(side or "").lower(), size=int(qty),
+                    symbol=symbol, side=(side or "").lower(), size=int(market_qty),
                     order_type="market_order", time_in_force="fok", reduce_only=reduce_only,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
-                logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {qty} (order {oid})")
+                logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {market_qty} (order {oid})")
             except Exception as e:
                 logger.error(f"Escalation market order failed for {follower['name']} {symbol}: {e}")
         except Exception as e:

@@ -83,6 +83,7 @@ class RiskEngine:
         master_price: float,
         account: dict,
         round_up: bool = False,
+        min_one: bool = True,
     ) -> int:
         """
         Compute the order size for a follower account based on its allocation_mode.
@@ -139,7 +140,10 @@ class RiskEngine:
         # Opens floor (never over-expose); closes ceil (never leave a residual,
         # reduce_only caps it so it can't over-close).
         rounded = math.ceil(qty) if round_up else math.floor(qty)
-        result = max(1, rounded)
+        # min_one=True (default) never returns 0 — good for OPENS (a copy is at
+        # least 1 lot). For a rebalance TARGET (how much the follower should
+        # still hold) we need a true 0, so callers pass min_one=False.
+        result = max(1, rounded) if min_one else max(0, rounded)
         max_pos: float | None = account.get("max_position_size")
         if max_pos is not None:
             result = min(result, int(max_pos))
