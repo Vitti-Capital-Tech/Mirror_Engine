@@ -4,6 +4,13 @@ import { api } from '@/lib/api';
 import { AdminHeader, pnlClass, Loader } from '@/components/admin/AdminUI';
 import { Crown, ChevronDown, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 
+function fmtOpenedAt(iso?: string) {
+  if (!iso) return '-';
+  return new Date(iso).toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+  });
+}
+
 export default function AdminPositions() {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -128,7 +135,8 @@ function AccountCard({ acc }: { acc: any }) {
                   <th className="text-right">Current Price</th>
                   <th className="text-right">Unrealized PNL</th>
                   <th className="text-right">Stop Loss</th>
-                  <th className="text-right pr-2">Take Profit</th>
+                  <th className="text-right">Take Profit</th>
+                  <th className="text-right pr-2">Opened At</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.04] font-medium">
@@ -149,7 +157,8 @@ function AccountCard({ acc }: { acc: any }) {
                       <td className="text-right font-mono text-text-primary">{Number(pos.current_price || pos.entry_price).toFixed(2)}</td>
                       <td className={`text-right font-mono ${pnlClass(pnl)}`}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</td>
                       <td className="text-right font-mono text-text-muted">{pos.sl_price != null ? Number(pos.sl_price).toFixed(2) : '—'}</td>
-                      <td className="text-right font-mono text-text-muted pr-2">{pos.tp_price != null ? Number(pos.tp_price).toFixed(2) : '—'}</td>
+                      <td className="text-right font-mono text-text-muted">{pos.tp_price != null ? Number(pos.tp_price).toFixed(2) : '—'}</td>
+                      <td className="text-right font-mono text-text-secondary pr-2 whitespace-nowrap">{fmtOpenedAt(pos.created_at)}</td>
                     </tr>
                   );
                 })}
