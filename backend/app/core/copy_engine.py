@@ -11,6 +11,11 @@ from app.services.delta_client import DeltaClient
 
 logger = logging.getLogger(__name__)
 
+# If a mirrored LIMIT order hasn't filled after this window (checked twice:
+# wait, then retry-wait), escalate it to a full-or-nothing market order.
+ESCALATE_WAIT_SEC = 5
+
+
 class CopyEngine:
     def __init__(self, db_client, redis_client, socket_mgr, connection_mgr) -> None:
         self.db = db_client
@@ -328,13 +333,15 @@ class CopyEngine:
 
         # Master balance for the ratio
         master_balance = 0.0
+        master_row = None
         try:
             mq = self.db.table("accounts").select("*").eq("is_master", True)
             if owner_id:
                 mq = mq.eq("owner_id", owner_id)
             m = mq.execute()
             if m.data:
-                master_balance = float(m.data[0].get("allocated_balance") or m.data[0].get("available_margin") or m.data[0].get("balance") or 0.0)
+                master_row = m.data[0]
+                master_balance = float(master_row.get("allocated_balance") or master_row.get("available_margin") or master_row.get("balance") or 0.0)
         except Exception:
             pass
 
@@ -445,9 +452,63 @@ class CopyEngine:
                     await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
+
+                    # Plain LIMIT order (not a stop/bracket): if it hasn't filled
+                    # after the wait+retry window, escalate to a full-or-nothing
+                    # market order so the follower actually gets in.
+                    if order_type == "limit_order" and stop_price is None and not is_bracket:
+                        asyncio.create_task(self._escalate_unfilled_limit(
+                            follower, client, follower_order_id, product_id, symbol,
+                            side, int(qty), reduce_only, master_row,
+                        ))
             except Exception as e:
                 body = getattr(getattr(e, "response", None), "text", "")
                 logger.error(f"Failed to mirror order to {follower['name']}: {e} {body}")
+
+    async def _escalate_unfilled_limit(self, follower, client, order_id, product_id,
+                                       symbol, side, qty, reduce_only, master_row) -> None:
+        """If a mirrored limit order hasn't executed after wait+retry, force the
+        follower in with a full-or-nothing market order (only if the master
+        actually holds the position, so we don't enter when the master didn't)."""
+        try:
+            # Window 1 (wait), then window 2 (the "retry" wait).
+            for _ in range(2):
+                await asyncio.sleep(ESCALATE_WAIT_SEC)
+                try:
+                    od = (await client.get_order(str(order_id))).get("result", {}) or {}
+                except Exception:
+                    od = {}
+                state = (od.get("state") or "").lower()
+                unfilled = od.get("unfilled_size")
+                unfilled = float(unfilled if unfilled is not None else (od.get("size") or 0))
+                if state in ("closed", "filled") or unfilled <= 0:
+                    return  # it filled — nothing to do
+
+            # Still unfilled. For entries, only force market if the master really
+            # holds the position (its own limit filled); otherwise the master
+            # didn't get in either, so neither should the follower.
+            if not reduce_only:
+                msz = await self._master_position_size(master_row, symbol)
+                if msz is not None and msz == 0:
+                    logger.info(f"Escalation skipped for {follower['name']} {symbol}: master has no position (limit unfilled on master too).")
+                    return
+
+            # Cancel the resting limit, then market it (full size or nothing).
+            try:
+                await client.cancel_order(str(order_id), product_id=product_id)
+            except Exception as e:
+                logger.warning(f"Escalation cancel failed for {follower['name']} {symbol}: {e}")
+            try:
+                resp = await client.place_order(
+                    symbol=symbol, side=(side or "").lower(), size=int(qty),
+                    order_type="market_order", time_in_force="fok", reduce_only=reduce_only,
+                )
+                oid = resp.get("id") or resp.get("result", {}).get("id")
+                logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {qty} (order {oid})")
+            except Exception as e:
+                logger.error(f"Escalation market order failed for {follower['name']} {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Escalation error for {symbol}: {e}")
 
     async def _find_follower_order(self, client, event: dict):
         """Locate the follower's order matching a master order, for self-healing
