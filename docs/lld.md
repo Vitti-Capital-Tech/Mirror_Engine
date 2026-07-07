@@ -190,3 +190,25 @@ $$D_{pct} = \left| \frac{Size_{follower} - ExpectedSize}{ExpectedSize} \right| \
 
 ### Admin API (`api/admin.py`)
 `/api/admin/overview`, `/users/{id}/role`, `/accounts`, `/positions`, `/trades`, `/alerts` — all `require_admin`, aggregating across tenants with owner email joins.
+
+---
+
+## 6. Execution, latency & reliability (updates)
+
+### Low-latency copy pipeline
+* `delta_client._ws_loop` drains the socket **non-blocking** into two `asyncio.Queue`s; a worker (`_ws_worker`) processes **fills before order-churn** so a real trade never waits behind the master's SL/TP re-quote flood. The order-churn queue is capped (drop-oldest) to bound memory.
+* `main.redis_consumer` / `order_consumer` dispatch each event as a task with a **per-symbol lock** — same-symbol events stay ordered (place→cancel→fill), different symbols run concurrently.
+* `[WSLAG]` / `[LATENCY]` log lines instrument WS staleness and end-to-end copy time.
+
+### Fill logic (`order_executor.execute`)
+* Entries **and** exits are **Fill-Or-Kill** (full size or nothing). On shortfall: wait `FILL_RETRY_DELAY` (5s) and retry up to `MAX_FILL_RETRIES` (2), then skip. No partial fills.
+
+### Unfilled-limit escalation (`copy_engine._escalate_unfilled_limit`)
+* After mirroring a plain limit order, a background task waits `ESCALATE_WAIT_SEC` (5s) ×2; if still unfilled it cancels the limit and places a full-or-nothing market order. Entries only escalate if the master still holds the position; SL/TP brackets are excluded.
+
+### Proportional close (`copy_engine.process_fill`, exit branch)
+* On a close, the follower is rebalanced to `floor(master_remaining × ratio)` and only the excess is closed (reduce-only) — a small master trim can't wipe a small follower. `_master_position_size` is cached ~3s.
+
+### Alerts
+* `position_monitor.check_sync_and_alert` raises mismatch on **both** follower and master, `owner_id`-stamped, with a `MISMATCH_COOLDOWN_MIN` (30m) time-window suppression to stop resolve/re-create spam.
+* `socket_manager.emit_alert` also forwards non-resolved alerts to Telegram via `services/telegram_client.py` (deduped; inert unless `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` set).

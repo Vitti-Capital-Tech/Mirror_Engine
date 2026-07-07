@@ -24,14 +24,18 @@ Each user may have **one master** at a time; any follower can be promoted to mas
 
 | Master action | Follower behaviour |
 |---------------|--------------------|
-| **Opens a position** (market fill) | Opens the same position, size scaled by ratio (floored, min 1 lot) |
-| **Closes a position** (full or partial) | Proportional **reduce-only** close — never flips, ceils so no residual is left |
+| **Opens a position** (market fill) | Opens the same position, size scaled by ratio (floored). **All-or-nothing (FOK)** — full size or skip |
+| **Closes a position** (full or partial) | **Rebalances** the follower to `floor(master_remaining × ratio)` and closes only the excess (reduce-only). A small master trim never wipes a small follower |
 | **Places a limit order** | Mirrors a ratio-sized limit order |
 | **Places a stop / SL / TP (bracket) order** | Mirrors via Delta's bracket endpoint with the correct trigger reference (Mark/Index) |
 | **Edits an order or SL/TP price/trigger** | Edits the follower's existing order in place |
 | **Cancels an order** | Cancels the follower's mirrored order (with self-heal lookup if the id map is stale) |
 
-**SL/TP jitter:** each follower's stop/target trigger price is offset by a random **±(10–50)** so multiple followers don't all trigger at the exact same price/instant.
+**SL/TP jitter:** each follower's stop/target trigger price is offset by **±(10–50)**, computed **deterministically** from the follower + price — so two legs of a pair that share the same master SL/TP price land on the *same* follower price, while different followers still get different offsets (they don't all trigger at once).
+
+**Unfilled-limit escalation:** the master trades with limit orders, so a mirrored follower limit that doesn't fill would leave the follower missing the position. If a plain limit order hasn't executed within a wait+retry window (5s × 2), the engine **cancels it and places a full-or-nothing market order** so the follower gets in — for entries and exits. Entries only escalate if the master actually holds the position (its own limit filled). SL/TP brackets are excluded (they're meant to rest until triggered).
+
+**Protective-cancel safety:** when a stop/SL/TP cancel arrives, the engine checks the **master's** position: if the master still holds it, the cancel is genuine (user removed/edited the stop) and is propagated; if the master is flat, the leg was cancelled by an SL/TP *hit* (OCO) and the follower's own bracket is kept so it closes independently.
 
 ---
 
@@ -71,6 +75,19 @@ Each account can carry an optional **Allocated Balance** that overrides its real
 ```
 
 ---
+
+## Execution & reliability
+
+* **Low-latency pipeline** — the master WebSocket reader drains the socket instantly into a queue and a worker processes **fills first** (ahead of the master's resting-order churn), and copy events are handled **concurrently, ordered per symbol**. Under a high-frequency master this keeps copy latency ~1s instead of stacking up to ~8s.
+* **All-or-nothing fills** — follower entries and exits use **Fill-Or-Kill** (full size or nothing, no partials). If the book can't supply the full size, it waits **5s** and retries (×2), then skips.
+* **Cached master state** — master position lookups are cached briefly so a burst of cancels doesn't hammer the REST API.
+
+## Alerts & notifications
+
+Alert types raised: **position mismatch** (follower size ≠ master × ratio — raised on *both* master and follower, with a 30-min cooldown to prevent re-alert spam), **high slippage** (> 0.03%), and **liquidity unavailable** (a follower order couldn't fill the full size).
+
+* **Dashboard** — Alert Feed with level filters + a notification bell.
+* **Telegram** — every alert is also pushed to a Telegram group via the Bot API (configure `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; resolutions are skipped and duplicates deduped). Leave unset to disable.
 
 ## Accounts, Auth & Multi-tenancy
 
@@ -165,6 +182,8 @@ TWOFA_ENABLED=false         # true → email-OTP 2FA on login
 RESEND_API_KEY=...          RESEND_FROM="Mirror Engine <noreply@yourdomain>"
 # Quick-admin passphrase login
 ADMIN_MAGIC_CODE=...        ADMIN_EMAIL=admin@yourdomain   ADMIN_PASSWORD=...
+# Telegram alert notifications (optional; leave blank to disable)
+TELEGRAM_BOT_TOKEN=...      TELEGRAM_CHAT_ID=...
 ```
 
 ### Database migrations (run once in Supabase SQL editor)
