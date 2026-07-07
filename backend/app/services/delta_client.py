@@ -47,6 +47,13 @@ class DeltaClient:
         self._on_fill: Optional[OnFillCallback] = None
         self._on_position: Optional[OnPositionCallback] = None
         self._running = False
+        # Decouple socket reading from processing: the read loop drains the
+        # socket instantly into these queues; a worker processes them, taking
+        # FILLS first so a real trade never waits behind the order-churn flood.
+        self._fill_q: asyncio.Queue = asyncio.Queue()
+        self._other_q: asyncio.Queue = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+        self._OTHER_Q_MAX = 1000  # cap order-churn backlog to bound memory
 
     # ------------------------------------------------------------------
     # Auth helpers
@@ -288,6 +295,32 @@ class DeltaClient:
         self._on_position = on_position_callback
         self._running = True
         self._ws_task = asyncio.create_task(self._ws_loop(), name=f"ws-{self.api_key[:8]}")
+        self._worker_task = asyncio.create_task(self._ws_worker(), name=f"wsw-{self.api_key[:8]}")
+
+    @staticmethod
+    def _is_fill_event(data: dict) -> bool:
+        if data.get("type") != "orders":
+            return False
+        o = data.get("order", data)
+        return o.get("reason") == "fill" or (o.get("state") or "").lower() == "filled"
+
+    async def _ws_worker(self) -> None:
+        """Process queued WS messages, FILLS first (so trades copy without waiting
+        behind the master's resting-order churn)."""
+        while self._running:
+            try:
+                try:
+                    data = self._fill_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    try:
+                        data = await asyncio.wait_for(self._other_q.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                await self._handle_ws_message(data)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("WS worker error: %s", exc, exc_info=True)
 
     async def _ws_loop(self) -> None:
         """Main WebSocket reconnection loop."""
@@ -326,13 +359,23 @@ class DeltaClient:
                     logger.info("WS subscribed to orders + positions for key %s", self.api_key[:8])
 
                     async for raw_message in ws:
+                        # Drain the socket INSTANTLY — never block the reader on
+                        # downstream work. Fills go to the priority queue; the
+                        # order-churn queue is capped (drop oldest) to bound memory.
                         try:
                             data = json.loads(raw_message)
-                            await self._handle_ws_message(data)
                         except json.JSONDecodeError:
                             logger.warning("WS received non-JSON message: %s", raw_message[:200])
-                        except Exception as exc:
-                            logger.error("WS message handler error: %s", exc, exc_info=True)
+                            continue
+                        if self._is_fill_event(data):
+                            self._fill_q.put_nowait(data)
+                        else:
+                            if self._other_q.qsize() >= self._OTHER_Q_MAX:
+                                try:
+                                    self._other_q.get_nowait()  # drop oldest churn
+                                except asyncio.QueueEmpty:
+                                    pass
+                            self._other_q.put_nowait(data)
 
             except (ConnectionClosedOK, ConnectionClosedError) as exc:
                 if not self._running:
@@ -412,12 +455,13 @@ class DeltaClient:
     async def disconnect_websocket(self) -> None:
         """Cancel the WS loop task and close the socket."""
         self._running = False
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-            try:
-                await self._ws_task
-            except asyncio.CancelledError:
-                pass
+        for _task in (self._ws_task, self._worker_task):
+            if _task and not _task.done():
+                _task.cancel()
+                try:
+                    await _task
+                except asyncio.CancelledError:
+                    pass
         if self._ws:
             try:
                 await self._ws.close()

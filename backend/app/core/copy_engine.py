@@ -18,6 +18,10 @@ class CopyEngine:
         self.socket_manager = socket_mgr
         self.connection_manager = connection_mgr
         self.risk_engine = RiskEngine()
+        # Short-lived cache of master position sizes {symbol: (size, ts)} so a
+        # burst of protective cancels doesn't fire a get_positions REST call each.
+        self._master_pos_cache: dict = {}
+        self._MASTER_POS_TTL = 3.0  # seconds
 
     async def process_fill(self, event_dict: dict) -> None:
         """
@@ -256,16 +260,21 @@ class CopyEngine:
         return 0.0
 
     async def _master_position_size(self, master_row: dict, symbol: str):
-        """Live absolute master position size for a symbol. Returns None if it
-        can't be determined (so the caller can fall back)."""
+        """Live absolute master position size for a symbol (cached ~3s so a burst
+        of cancels doesn't hammer REST). Returns None if it can't be determined."""
         if not master_row:
             return None
+        cached = self._master_pos_cache.get(symbol)
+        if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
+            return cached[0]
         try:
             mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
             try:
-                return await self._position_size(mc, symbol)
+                size = await self._position_size(mc, symbol)
             finally:
                 await mc.close()
+            self._master_pos_cache[symbol] = (size, time.time())
+            return size
         except Exception as e:
             logger.error(f"Master position size fetch failed for {symbol}: {e}")
             return None
