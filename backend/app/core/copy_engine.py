@@ -401,17 +401,26 @@ class CopyEngine:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], existing_foid)
                     except Exception as e:
                         logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
-                try:
-                    jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
-                    if is_update and existing_foid:
-                        # Master EDITED the SL/TP price -> edit the follower's existing
-                        # bracket order rather than creating a new one (which 400s).
+                jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
+                edited = False
+                if is_update and existing_foid:
+                    # Master EDITED the SL/TP price -> edit the follower's existing
+                    # bracket order rather than creating a new one (which 400s).
+                    try:
                         resp = await client.edit_order(existing_foid, product_id=product_id, stop_price=jittered_stop, stop_trigger_method=trigger_method)
                         new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
                         if new_id and str(new_id) != str(existing_foid):
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
                         logger.info(f"Updated bracket {master_order_id} ({stop_order_type}) -> {follower['name']} order {new_id or existing_foid} @ {jittered_stop} (master {stop_price})")
-                    else:
+                        edited = True
+                    except Exception as e:
+                        body = getattr(getattr(e, "response", None), "text", "")
+                        logger.warning(f"Bracket edit failed for {follower['name']} ({e} {body}); re-placing SL/TP so the update still reflects.")
+                if not edited:
+                    # Either a fresh bracket, or the edit failed because the
+                    # follower's order was gone (deleted / replaced) — (re)place it
+                    # so a master update always reflects on the FIRST try.
+                    try:
                         leg = {"order_type": order_type, "stop_price": str(jittered_stop)}
                         if order_type == "limit_order" and limit_price is not None:
                             leg["limit_price"] = str(limit_price)
@@ -427,9 +436,9 @@ class CopyEngine:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(foid))
                             await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                         logger.info(f"Mirrored bracket {master_order_id} ({stop_order_type}, trigger={trigger_method}) -> {follower['name']}")
-                except Exception as e:
-                    body = getattr(getattr(e, "response", None), "text", "")
-                    logger.error(f"Failed to mirror bracket to {follower['name']}: {e} {body}")
+                    except Exception as e:
+                        body = getattr(getattr(e, "response", None), "text", "")
+                        logger.error(f"Failed to (re)place bracket to {follower['name']}: {e} {body}")
                 continue
 
             # CLOSE via limit (reduce-only): size it by rebalancing to the master's
@@ -457,10 +466,11 @@ class CopyEngine:
                     if new_id and str(new_id) != str(existing_foid):
                         await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
                     logger.info(f"Updated order {master_order_id} -> {follower['name']} order {new_id or existing_foid} @ {limit_price}")
+                    continue
                 except Exception as e:
                     body = getattr(getattr(e, "response", None), "text", "")
-                    logger.error(f"Failed to update order for {follower['name']}: {e} {body}")
-                continue
+                    logger.warning(f"Order edit failed for {follower['name']} ({e} {body}); re-placing so the update reflects on the first try.")
+                    # fall through to place a fresh order (the mapped one was gone)
 
             try:
                 resp = await client.place_order(
