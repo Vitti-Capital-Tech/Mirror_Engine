@@ -90,41 +90,74 @@ class OrderExecutor:
                 "failure_reason": f"Quantity rounded to 0: {quantity}"
             }
 
-        # Both entries and exits are all-or-nothing (Fill-Or-Kill): fill the FULL
-        # size or nothing. If the book can't supply it, wait FILL_RETRY_DELAY and
-        # retry up to MAX_FILL_RETRIES, then give up (no partial). Exits are
-        # reduce-only so the follower can only close, never flip.
+        # Try a clean full fill first (Fill-Or-Kill), retrying a couple of times;
+        # if that still can't fill, fall back to a plain market order that takes
+        # whatever the book offers so the follower isn't left out. Exits are
+        # reduce-only (can only close, never flip).
         is_exit = trade_type in ("exit", "sl")
 
         filled_qty = 0
         exec_price = master_price
 
-        for attempt in range(MAX_FILL_RETRIES + 1):  # 1 initial + N retries
+        async def _confirm(order_id):
+            """Return (filled_lots, avg_price). Delta orders expose unfilled_size,
+            NOT filled_size — so filled = size - unfilled_size."""
+            try:
+                await asyncio.sleep(0.15)
+                od = (await client.get_order(order_id)).get("result", {}) or {}
+            except Exception:
+                od = {}
+            unfilled = od.get("unfilled_size")
+            unfilled = float(unfilled if unfilled is not None else order_size)
+            filled = max(0, int(order_size - unfilled))
+            avg = od.get("average_fill_price")
+            return filled, (float(avg) if avg else None)
+
+        # Phase 1 — all-or-nothing FOK with retries.
+        for attempt in range(MAX_FILL_RETRIES + 1):
             if attempt > 0:
                 await asyncio.sleep(FILL_RETRY_DELAY)
-                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol} ({'exit' if is_exit else 'entry'}): need full {order_size} lots (insufficient book liquidity)")
+                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol} ({'exit' if is_exit else 'entry'})")
             try:
                 resp = await client.place_order(
                     symbol=symbol, side=side.lower(), size=order_size,
-                    order_type='market_order', time_in_force='fok',
-                    reduce_only=is_exit,
+                    order_type='market_order', time_in_force='fok', reduce_only=is_exit,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 if not oid:
                     last_error = f"Invalid API response: {resp}"
                     continue
-                await asyncio.sleep(0.1)
-                rd = (await client.get_order(oid)).get("result", {})
-                f = int(float(rd.get("filled_size") or 0))
-                if f >= order_size:  # FOK => either full or zero
+                f, avg = await _confirm(oid)
+                if f >= order_size:
                     filled_qty = f
-                    if rd.get("average_fill_price"):
-                        exec_price = float(rd["average_fill_price"])
+                    if avg:
+                        exec_price = avg
                     break
-                last_error = f"Insufficient liquidity for full {order_size} lots (FOK killed)"
+                last_error = f"FOK killed (filled {f}/{order_size})"
             except Exception as e:
                 last_error = str(e)
                 logger.warning(f"FOK attempt {attempt + 1} for {account_name} on {symbol}: {last_error}")
+
+        # Phase 2 — still nothing → plain market order (fill whatever's available).
+        if filled_qty <= 0:
+            try:
+                resp = await client.place_order(
+                    symbol=symbol, side=side.lower(), size=order_size,
+                    order_type='market_order', reduce_only=is_exit,
+                )
+                oid = resp.get("id") or resp.get("result", {}).get("id")
+                if oid:
+                    f, avg = await _confirm(oid)
+                    if f > 0:
+                        filled_qty = f
+                        if avg:
+                            exec_price = avg
+                        logger.info(f"Market fallback filled {f}/{order_size} for {account_name} on {symbol}")
+                    else:
+                        last_error = f"Market order filled nothing for {symbol} (no liquidity)"
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Market fallback failed for {account_name} on {symbol}: {last_error}")
 
         execution_time_ms = int((time.time() - start_time) * 1000)
         logger.info(f"[LATENCY] {account_name} {symbol}: follower order {'filled' if filled_qty > 0 else 'not filled'} in {execution_time_ms}ms")
@@ -146,9 +179,10 @@ class OrderExecutor:
                 "filled_quantity": filled_qty, "execution_time_ms": execution_time_ms,
             }
 
-        # Could not fill the full size (all-or-nothing) after all retries — skipped.
-        reason = (f"Not filled: order book lacked the full {order_size} lots after "
-                  f"{MAX_FILL_RETRIES} retries — {'close' if is_exit else 'entry'} not placed")
+        # Neither FOK nor the plain market order filled anything — genuinely no
+        # liquidity on the book for this symbol right now.
+        reason = (f"Not filled: no liquidity for {order_size} lots on {symbol} "
+                  f"(FOK + market both empty) — {'close' if is_exit else 'entry'} skipped")
         logger.error(f"Copy {'close' if is_exit else 'entry'} not filled for {account_name} on {symbol}: {reason}")
         db.table("trade_copies").update({
             "status": "failed", "failure_reason": reason, "retry_count": MAX_FILL_RETRIES,

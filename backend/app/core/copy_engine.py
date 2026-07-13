@@ -235,7 +235,7 @@ class CopyEngine:
 
     @staticmethod
     def _jitter_trigger(price, seed: str = ""):
-        """Offset an SL/TP trigger by a DETERMINISTIC +/- (10..50).
+        """Offset an SL/TP trigger by a DETERMINISTIC +/- (0..20).
 
         The offset is derived from the follower (``seed``) and the trigger price,
         NOT random. This means:
@@ -248,7 +248,7 @@ class CopyEngine:
             return None
         base = round(float(price), 1)
         h = int(hashlib.sha256(f"{seed}:{base}".encode()).hexdigest(), 16)
-        magnitude = 10 + (h % 41)          # 10..50 inclusive
+        magnitude = h % 21                 # 0..20 inclusive
         sign = 1 if (h >> 7) & 1 else -1
         return round(base + sign * magnitude, 1)
 
@@ -279,14 +279,17 @@ class CopyEngine:
         )
         return max(0, int(current) - int(target)), current
 
-    async def _master_position_size(self, master_row: dict, symbol: str):
+    async def _master_position_size(self, master_row: dict, symbol: str, fresh: bool = False):
         """Live absolute master position size for a symbol (cached ~3s so a burst
-        of cancels doesn't hammer REST). Returns None if it can't be determined."""
+        of cancels doesn't hammer REST). Pass fresh=True to bypass the cache when
+        the answer must be current (e.g. deciding if an SL/TP cancel is a hit).
+        Returns None if it can't be determined."""
         if not master_row:
             return None
-        cached = self._master_pos_cache.get(symbol)
-        if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
-            return cached[0]
+        if not fresh:
+            cached = self._master_pos_cache.get(symbol)
+            if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
+                return cached[0]
         try:
             mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
             try:
@@ -649,7 +652,7 @@ class CopyEngine:
                 master_row = mrow.data[0] if mrow.data else None
             except Exception:
                 master_row = None
-            master_sz = await self._master_position_size(master_row, symbol)
+            master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
                 logger.info(f"Master flat on {symbol}; keeping follower SL/TP (leg cancelled by an SL/TP hit, not a manual cancel).")
                 return
