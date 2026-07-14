@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { Crown, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useAccountLiveView } from '@/hooks/usePositions';
+import { PageSizeSelect, DateFilter } from './controls';
 
 // ── Formatting helpers (mirror the live Delta tables) ─────────────────────
 const num = (v: any): number | null =>
@@ -59,14 +60,7 @@ function Paginator({ page, setPage, pageSize, setPageSize, total, start, end, ma
   const btn = 'w-6 h-6 flex items-center justify-center rounded-md border border-bg-border text-text-secondary disabled:opacity-30 disabled:cursor-not-allowed enabled:hover:bg-bg-panel/60 transition-colors';
   return (
     <div className="flex items-center justify-between gap-3 pt-3 mt-2 border-t border-bg-border text-[11px]">
-      <select
-        value={pageSize}
-        onChange={(e) => setPageSize(Number(e.target.value))}
-        className="bg-bg-panel border border-bg-border text-text-secondary rounded-md pl-2 pr-1 py-1 font-semibold outline-none cursor-pointer [color-scheme:dark]"
-        title="Rows per page"
-      >
-        {PAGE_SIZES.map((n) => <option key={n} value={n}>{n} / Page</option>)}
-      </select>
+      <PageSizeSelect value={pageSize} onChange={setPageSize} options={PAGE_SIZES} />
       <div className="flex items-center gap-2">
         <span className="text-text-muted font-mono whitespace-nowrap">{start + 1}–{end} of {total}</span>
         <button className={btn} onClick={() => setPage(Math.max(0, page - 1))} disabled={page <= 0} title="Previous page">
@@ -491,16 +485,8 @@ function HistoryTab({ history }: { history: any[] }) {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-end gap-2">
-        <input
-          type="date"
-          value={filterDate}
-          onChange={(e) => setFilterDate(e.target.value)}
-          className="bg-bg-panel border border-bg-border text-text-secondary rounded-md px-2 py-1 text-[11px] font-semibold outline-none [color-scheme:dark]"
-        />
-        {filterDate && (
-          <button onClick={() => setFilterDate('')} className="px-2 py-1 text-[10px] font-bold text-text-muted border border-bg-border rounded-md hover:text-text-secondary">All</button>
-        )}
+      <div className="flex items-center justify-end">
+        <DateFilter value={filterDate} onChange={setFilterDate} />
       </div>
       {rows.length === 0 ? <Empty text="No orders match the selected date." /> : (
         <div className="overflow-x-auto">
