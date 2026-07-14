@@ -482,6 +482,12 @@ class CopyEngine:
             # Plain limit order: if the master EDITED it, edit the follower's
             # existing order instead of placing a duplicate.
             existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+            # Idempotency: this resting order is already mirrored to this follower
+            # (repeated open/pending WS updates for the same master order) — don't
+            # place a duplicate. Edits and reduce-only closes fall through.
+            if existing_foid and not is_update and not reduce_only:
+                logger.debug(f"Order {master_order_id} already mirrored to {follower['name']} ({existing_foid}); skipping duplicate")
+                continue
             if is_update and existing_foid:
                 try:
                     resp = await client.edit_order(existing_foid, product_id=product_id, limit_price=limit_price)

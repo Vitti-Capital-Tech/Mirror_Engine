@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -7,11 +8,19 @@ from app.models.trade import TradeEvent, TradeSide, TradeType
 
 logger = logging.getLogger(__name__)
 
+# How often to reconcile the master's resting limit orders onto followers, as a
+# safety net for any order the WS create event missed (or that was resting while
+# the backend was down). Idempotent, so it only ever places what's missing.
+RECONCILE_INTERVAL_SEC = 30
+
+
 class TradeListener:
     def __init__(self, redis_client=None) -> None:
         self.redis = redis_client
         self.client: Optional[DeltaClient] = None
         self.master_account: Optional[dict] = None
+        self._running = False
+        self._reconcile_task: Optional[asyncio.Task] = None
 
     async def start(self, master_account: dict) -> None:
         """
@@ -19,29 +28,88 @@ class TradeListener:
         Instantiates DeltaClient and connects to its WebSocket feed.
         """
         self.master_account = master_account
+        self._running = True
         logger.info(f"Starting TradeListener for master account: {master_account['name']}")
-        
+
         self.client = DeltaClient(
             api_key=master_account["api_key"],
             api_secret=master_account["api_secret"],
             environment=master_account.get("environment", "demo")
         )
-        
+
         # Connect websocket with on_fill and on_position callbacks
         await self.client.connect_websocket(
             on_fill_callback=self.on_order_fill,
             on_position_callback=self.on_position_update
         )
 
+        # Safety net: periodically re-mirror the master's resting limit orders.
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+
     async def stop(self) -> None:
         """
         Stop the listener and close connections.
         """
+        self._running = False
+        if self._reconcile_task and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_task = None
         if self.client:
             logger.info("Stopping TradeListener and DeltaClient websocket connection...")
             await self.client.close()
             self.client = None
         self.master_account = None
+
+    async def _reconcile_loop(self) -> None:
+        """Every RECONCILE_INTERVAL_SEC, ensure each of the master's resting plain
+        limit ENTRY orders is mirrored. The copy engine is idempotent per
+        (master_order_id, follower), so this only fills gaps — it never dupes.
+        Deliberately scoped to plain limits: bracket SL/TP are placed via the
+        position-open path and aren't tracked by master_order_id, so reconciling
+        them could double-place."""
+        # small initial delay so the WS snapshot/auth settles first
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            return
+        while self._running:
+            try:
+                await self._reconcile_orders()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Order reconcile pass failed: %s", e)
+            try:
+                await asyncio.sleep(RECONCILE_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                break
+
+    async def _reconcile_orders(self) -> None:
+        if not self.client or not self.master_account:
+            return
+        try:
+            orders = await self.client.get_open_orders(state="open")
+        except Exception as e:
+            logger.warning("Reconcile: could not fetch master open orders: %s", e)
+            return
+        pushed = 0
+        for o in orders or []:
+            order_type = o.get("order_type") or ""
+            is_stop = bool(o.get("stop_order_type") or o.get("stop_price"))
+            is_bracket = bool(o.get("bracket_order")) or str((o.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL")
+            # plain resting limit entries only
+            if order_type != "limit_order" or is_stop or is_bracket or o.get("reduce_only"):
+                continue
+            if (o.get("state") or "").lower() != "open":
+                continue
+            await self._push_order_event(o, "place")
+            pushed += 1
+        if pushed:
+            logger.info("Reconcile: re-mirrored %d resting limit order(s) for master %s", pushed, self.master_account.get("name"))
 
     async def on_order_fill(self, order: dict) -> None:
         """
@@ -53,17 +121,17 @@ class TradeListener:
         fill on their own (avoids double fills).
         """
         try:
-            logger.info(
-                "Master order update: %s %s state=%s reason=%s",
-                order.get("side"), order.get("product_symbol"),
-                order.get("state"), order.get("reason"),
-            )
-
             state = (order.get("state") or "").lower()
             reason = order.get("reason")
             action = (order.get("action") or "").lower()
             order_type = order.get("order_type", "") or ""
             is_stop = bool(order.get("stop_order_type") or order.get("stop_price"))
+
+            logger.info(
+                "Master order update: %s %s type=%s state=%s reason=%s action=%s",
+                order.get("side"), order.get("product_symbol"),
+                order_type, state, reason or "-", action or "-",
+            )
 
             # ---- 1. Fills ----
             if reason == "fill" or state == "filled":
@@ -76,15 +144,21 @@ class TradeListener:
                     logger.info("Skipping fill copy for resting %s (mirrored separately)", order_type)
                 return
 
-            # ---- 2. New resting order placed (limit / stop) ----
-            if action in ("create", "update") and state in ("open", "pending"):
-                if order_type == "limit_order" or is_stop:
-                    await self._push_order_event(order, "place")
-                return
-
-            # ---- 3. Cancellation ----
+            # ---- 2. Cancellation ----
             if state in ("cancelled", "canceled") or (action == "delete" and reason != "fill"):
                 await self._push_order_event(order, "cancel")
+                return
+
+            # ---- 3. Resting order present (limit / stop) in open/pending ----
+            # Mirror it. Deliberately NOT gated on `action`: Delta's orders
+            # channel doesn't reliably send create/update, which was silently
+            # dropping plain limit ENTRY orders (only bracket SL/TP, placed via
+            # the position-open path, were reaching followers). The copy engine
+            # is idempotent per (master_order_id, follower), so repeated open/
+            # pending updates for the same order don't place duplicates.
+            if state in ("open", "pending"):
+                if order_type == "limit_order" or is_stop:
+                    await self._push_order_event(order, "place")
                 return
 
         except Exception as e:
