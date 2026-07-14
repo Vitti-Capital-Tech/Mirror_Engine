@@ -11,17 +11,24 @@ function fmtTime(iso?: string) {
 
 const pnlCls = (v: number) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-red-400' : 'text-text-secondary');
 
-export function AccountPositionCard({ acc, positions = [], orders = [], history = [] }: {
-  acc: any; positions?: any[]; orders?: any[]; history?: any[];
+export function AccountPositionCard({ acc, positions = [], orders = [], history = [], fills = [], risk = [] }: {
+  acc: any; positions?: any[]; orders?: any[]; history?: any[]; fills?: any[]; risk?: any[];
 }) {
   const activePnL = positions.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
+
+  // Split resting orders into plain limit (Open Orders) vs stop/SL/TP (Stop Orders).
+  const openOrders = orders.filter((o: any) => !o.stop_price);
+  const stopOrders = orders.filter((o: any) => o.stop_price);
 
   // Delta-style tabs. Followers only get Positions (no order feeds fetched).
   const tabs = acc.is_master
     ? [
         { key: 'positions', label: `Positions (${positions.length})` },
-        { key: 'orders', label: `Open Orders (${orders.length})` },
+        { key: 'open', label: `Open Orders (${openOrders.length})` },
+        { key: 'stop', label: `Stop Orders (${stopOrders.length})` },
+        { key: 'fills', label: `Fills (${fills.length})` },
         { key: 'history', label: `Order History (${history.length})` },
+        { key: 'risk', label: `Risk & Margin (${risk.length})` },
       ]
     : [{ key: 'positions', label: `Positions (${positions.length})` }];
   const [tab, setTab] = useState('positions');
@@ -84,8 +91,11 @@ export function AccountPositionCard({ acc, positions = [], orders = [], history 
       {/* Tab content */}
       <div className="p-4 sm:p-6">
         {tab === 'positions' && <PositionsTab positions={positions} />}
-        {tab === 'orders' && <OpenOrdersTab orders={orders} />}
+        {tab === 'open' && <OpenOrdersTab orders={openOrders} />}
+        {tab === 'stop' && <OpenOrdersTab orders={stopOrders} emptyText="No active stop orders." />}
+        {tab === 'fills' && <FillsTab fills={fills} />}
         {tab === 'history' && <HistoryTab history={history} />}
+        {tab === 'risk' && <RiskTab risk={risk} />}
       </div>
     </div>
   );
@@ -134,8 +144,8 @@ function PositionsTab({ positions }: { positions: any[] }) {
   );
 }
 
-function OpenOrdersTab({ orders }: { orders: any[] }) {
-  if (orders.length === 0) return <Empty text="No active open orders." />;
+function OpenOrdersTab({ orders, emptyText = 'No active open orders.' }: { orders: any[]; emptyText?: string }) {
+  if (orders.length === 0) return <Empty text={emptyText} />;
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-left text-xs border-collapse">
@@ -166,6 +176,76 @@ function OpenOrdersTab({ orders }: { orders: any[] }) {
                 <td className="text-right font-mono text-text-primary">{ord.limit_price ? Number(ord.limit_price).toFixed(2) : '-'}</td>
                 <td className="text-right font-mono text-text-secondary">{ord.stop_price ? Number(ord.stop_price).toFixed(2) : '-'}</td>
                 <td className="text-right text-text-secondary pr-4 capitalize">{triggerIndex}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function FillsTab({ fills }: { fills: any[] }) {
+  if (fills.length === 0) return <Empty text="No recent fills." />;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-xs border-collapse">
+        <thead>
+          <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none">
+            <th className="py-2">Time</th><th>Symbol</th><th>Side</th>
+            <th className="text-right">Size</th><th className="text-right">Price</th>
+            <th>Role</th><th className="text-right pr-4">Commission</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-white/[0.04] font-medium">
+          {fills.map((f: any, i: number) => {
+            const isBuy = f.side?.toLowerCase() === 'buy';
+            return (
+              <tr key={f.id ?? i} className="hover:bg-bg-secondary/10 transition-colors">
+                <td className="py-2.5 font-mono text-text-secondary whitespace-nowrap">{fmtTime(f.created_at)}</td>
+                <td className="font-bold text-text-primary">{f.symbol}</td>
+                <td><span className={`font-bold ${isBuy ? 'text-emerald-400' : 'text-rose-400'}`}>{f.side?.toUpperCase()}</span></td>
+                <td className="text-right font-mono text-text-primary">{Number(f.size).toFixed(0)}</td>
+                <td className="text-right font-mono text-text-primary">{f.price != null ? Number(f.price).toFixed(2) : '-'}</td>
+                <td className="capitalize text-text-secondary">{f.role || '-'}</td>
+                <td className="text-right font-mono text-text-muted pr-4">{f.commission != null ? Number(f.commission).toFixed(4) : '-'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RiskTab({ risk }: { risk: any[] }) {
+  if (risk.length === 0) return <Empty text="No open positions." />;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-xs border-collapse">
+        <thead>
+          <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none">
+            <th className="py-2">Symbol</th><th>Side</th>
+            <th className="text-right">Size</th><th className="text-right">Entry</th>
+            <th className="text-right">Mark</th><th className="text-right">Margin</th>
+            <th className="text-right">Liq. Price</th><th className="text-right">Bankruptcy</th>
+            <th className="text-right pr-4">ADL</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-white/[0.04] font-medium">
+          {risk.map((r: any, i: number) => {
+            const isLong = r.side === 'long';
+            return (
+              <tr key={r.symbol ?? i} className="hover:bg-bg-secondary/10 transition-colors">
+                <td className="py-2.5 font-bold text-text-primary">{r.symbol}</td>
+                <td><span className={`font-bold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>{(r.side || '').toUpperCase()}</span></td>
+                <td className="text-right font-mono text-text-primary">{Number(r.size).toFixed(0)}</td>
+                <td className="text-right font-mono text-text-secondary">{Number(r.entry_price).toFixed(2)}</td>
+                <td className="text-right font-mono text-text-secondary">{r.mark_price != null ? Number(r.mark_price).toFixed(2) : '-'}</td>
+                <td className="text-right font-mono text-text-primary">{r.margin != null ? Number(r.margin).toFixed(2) : '-'}</td>
+                <td className="text-right font-mono text-amber-400">{r.liquidation_price != null ? Number(r.liquidation_price).toFixed(2) : '-'}</td>
+                <td className="text-right font-mono text-text-muted">{r.bankruptcy_price != null ? Number(r.bankruptcy_price).toFixed(2) : '-'}</td>
+                <td className="text-right font-mono text-text-muted pr-4">{r.adl_level ?? '-'}</td>
               </tr>
             );
           })}

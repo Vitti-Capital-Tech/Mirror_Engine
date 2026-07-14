@@ -17,3 +17,11 @@ export function useMasterOpenOrders() {
 export function useMasterOrderHistory() {
   return useQuery({ queryKey: ['master-order-history'], queryFn: api.positions.masterOrderHistory, refetchInterval: 5000 });
 }
+
+export function useMasterFills() {
+  return useQuery({ queryKey: ['master-fills'], queryFn: api.positions.masterFills, refetchInterval: 5000 });
+}
+
+export function useMasterRisk() {
+  return useQuery({ queryKey: ['master-risk'], queryFn: api.positions.masterRisk, refetchInterval: 4000 });
+}

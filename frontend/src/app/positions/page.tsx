@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { usePositions, useMasterOpenOrders, useMasterOrderHistory } from '@/hooks/usePositions';
+import { usePositions, useMasterOpenOrders, useMasterOrderHistory, useMasterFills, useMasterRisk } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
@@ -15,6 +15,8 @@ export default function PositionsPage() {
   const { data: positions = [], isLoading: positionsLoading } = usePositions();
   const { data: masterOrders = [], isLoading: masterOrdersLoading } = useMasterOpenOrders();
   const { data: masterHistory = [] } = useMasterOrderHistory();
+  const { data: masterFills = [] } = useMasterFills();
+  const { data: masterRisk = [] } = useMasterRisk();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
 
@@ -70,6 +72,8 @@ export default function PositionsPage() {
           const accPositions = positions.filter((p: any) => p.account_id === acc.id);
           const accOrders = acc.is_master ? masterOrders : [];
           const accHistory = acc.is_master ? masterHistory : [];
+          const accFills = acc.is_master ? masterFills : [];
+          const accRisk = acc.is_master ? masterRisk : [];
           return (
             <AccountPositionCard
               key={acc.id}
@@ -77,6 +81,8 @@ export default function PositionsPage() {
               positions={accPositions}
               orders={accOrders}
               history={accHistory}
+              fills={accFills}
+              risk={accRisk}
             />
           );
         };

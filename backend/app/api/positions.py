@@ -437,3 +437,75 @@ async def get_master_order_history(user: CurrentUser = Depends(get_current_user)
     except Exception as e:
         logger.error(f"Error fetching master order history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _master_client_or_none(user):
+    master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
+    if not master_res.data:
+        return None
+    m = master_res.data[0]
+    return DeltaClient(api_key=m["api_key"], api_secret=m["api_secret"], environment=m.get("environment", "demo"))
+
+
+@router.get("/master/fills")
+async def get_master_fills(user: CurrentUser = Depends(get_current_user)):
+    """Recent trade fills (executions) for the caller's Master account."""
+    try:
+        client = _master_client_or_none(user)
+        if not client:
+            return []
+        try:
+            fills = await client.get_fills(page_size=50)
+            out = []
+            for f in fills:
+                out.append({
+                    "id": f.get("id") or f.get("fill_id"),
+                    "symbol": f.get("product_symbol"),
+                    "side": f.get("side"),
+                    "size": float(f.get("size") or 0),
+                    "price": float(f.get("price")) if f.get("price") else None,
+                    "role": f.get("role"),  # maker / taker
+                    "commission": float(f.get("commission")) if f.get("commission") else None,
+                    "created_at": f.get("created_at"),
+                })
+            out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+            return out
+        finally:
+            await client.close()
+    except Exception as e:
+        logger.error(f"Error fetching master fills: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/master/risk")
+async def get_master_risk(user: CurrentUser = Depends(get_current_user)):
+    """Per-position risk & margin for the caller's Master account."""
+    try:
+        client = _master_client_or_none(user)
+        if not client:
+            return []
+        try:
+            positions = await client.get_positions()
+            out = []
+            for p in positions:
+                sz = float(p.get("size") or 0)
+                if sz == 0:
+                    continue
+                out.append({
+                    "symbol": p.get("product_symbol") or p.get("symbol"),
+                    "size": abs(sz),
+                    "side": "long" if sz > 0 else "short",
+                    "entry_price": float(p.get("entry_price") or 0),
+                    "mark_price": float(p.get("mark_price") or 0) if p.get("mark_price") else None,
+                    "margin": float(p.get("margin")) if p.get("margin") else None,
+                    "liquidation_price": float(p.get("liquidation_price")) if p.get("liquidation_price") else None,
+                    "bankruptcy_price": float(p.get("bankruptcy_price")) if p.get("bankruptcy_price") else None,
+                    "adl_level": p.get("adl_level"),
+                })
+            out.sort(key=lambda x: x.get("symbol") or "")
+            return out
+        finally:
+            await client.close()
+    except Exception as e:
+        logger.error(f"Error fetching master risk: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
