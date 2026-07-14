@@ -55,7 +55,6 @@ export function AccountPositionCard({ acc }: { acc: any }) {
     { key: 'stop', label: `Stop Orders (${stopOrders.length})` },
     { key: 'fills', label: `Fills (${fills.length})` },
     { key: 'history', label: `Order History (${history.length})` },
-    { key: 'risk', label: `Risk & Margin (${risk.length})` },
   ];
   const [tab, setTab] = useState('positions');
   const loadingFirst = isLoading && !data;
@@ -129,7 +128,6 @@ export function AccountPositionCard({ acc }: { acc: any }) {
             {tab === 'stop' && <StopOrdersTab orders={stopOrders} />}
             {tab === 'fills' && <FillsTab fills={fills} />}
             {tab === 'history' && <HistoryTab history={history} />}
-            {tab === 'risk' && <RiskTab positions={risk} wallet={acc.balance} />}
           </>
         )}
       </div>
@@ -381,77 +379,6 @@ function FillsTab({ fills }: { fills: any[] }) {
           })}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-// ── Risk & Margin (live) — summary cards + per-leg margin/liquidation ──────
-function RiskTab({ positions, wallet }: { positions: any[]; wallet?: number }) {
-  const open = (positions || []).filter((p) => Number(p.size) !== 0);
-  const pnlOf = positionPnl;
-  const totalMargin = open.reduce((s, p) => s + (num(p.margin) || 0), 0);
-  const totalUnrl = open.reduce((s, p) => s + pnlOf(p), 0);
-  const w = num(wallet);
-  const usedPct = w ? Math.min(100, (totalMargin / w) * 100) : 0;
-
-  const cards = [
-    { label: 'Wallet Balance', big: w != null ? `$${fmtNum(w)}` : '—', sub: 'USDT on Delta', pct: 100, color: 'bg-blue-400', val: 'text-text-primary' },
-    { label: 'Margin Used', big: `$${fmtNum(totalMargin)}`, sub: w ? `${usedPct.toFixed(1)}% of wallet` : `${open.length} position${open.length !== 1 ? 's' : ''}`, pct: usedPct || 100, color: 'bg-blue-400', val: 'text-text-primary' },
-    { label: 'Unrealized P&L', big: `${totalUnrl >= 0 ? '+' : ''}${fmtNum(totalUnrl)}`, sub: 'Mark-to-market', pct: Math.min(100, (Math.abs(totalUnrl) / (totalMargin || 1)) * 100), color: totalUnrl >= 0 ? 'bg-emerald-400' : 'bg-rose-400', val: pnlCls(totalUnrl) },
-    { label: 'Open Legs', big: `${open.length}`, sub: 'Positions on exchange', pct: 100, color: 'bg-emerald-400', val: 'text-text-primary' },
-  ];
-
-  return (
-    <div className="space-y-5">
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        {cards.map((c, i) => (
-          <div key={i} className="rounded-xl border border-bg-border bg-bg-panel/40 p-3">
-            <h4 className="text-[9px] font-bold uppercase tracking-wider text-text-muted">{c.label}</h4>
-            <span className={`block mt-1 font-mono font-bold text-base ${c.val}`}>{c.big}</span>
-            <div className="mt-2 h-1 rounded-full bg-bg-border overflow-hidden">
-              <div className={`h-full rounded-full ${c.color}`} style={{ width: `${c.pct}%` }} />
-            </div>
-            <span className="block mt-1.5 text-[10px] text-text-muted">{c.sub}</span>
-          </div>
-        ))}
-      </div>
-
-      {open.length === 0 ? (
-        <Empty text="No open exposure." />
-      ) : (
-        <div className="overflow-x-auto border-t border-bg-border pt-4">
-          <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
-            <thead>
-              <tr className={TH_ROW}>
-                <th className="py-2">Instrument</th><th>Size</th><th className="text-right">Entry</th>
-                <th className="text-right">Mark</th><th className="text-right">Liq. Price</th>
-                <th className="text-right">Margin</th><th className="text-right pr-4">Unrealized P&L</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/[0.04] font-medium">
-              {open.map((p, i) => {
-                const size = num(p.size) || 0;
-                const long = size > 0;
-                const pnl = pnlOf(p);
-                return (
-                  <tr key={p.product_id ?? p.product_symbol ?? i} className={ROW}>
-                    <td className="py-2.5 font-bold text-text-primary">{p.product_symbol || '—'}</td>
-                    <td>
-                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ring-1 ${long ? 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/25' : 'bg-rose-500/10 text-rose-400 ring-rose-500/25'}`}>{long ? 'LONG' : 'SHORT'}</span>
-                      <span className="ml-2 font-mono font-semibold text-text-primary">{fmtNum(Math.abs(size), 0)}</span>
-                    </td>
-                    <td className="text-right font-mono text-text-secondary">{fmtNum(p.entry_price)}</td>
-                    <td className="text-right font-mono text-text-secondary">{fmtNum(p.mark_price)}</td>
-                    <td className="text-right font-mono text-amber-400">{fmtNum(p.liquidation_price)}</td>
-                    <td className="text-right font-mono text-text-primary">{p.margin != null ? `$${fmtNum(p.margin)}` : '—'}</td>
-                    <td className={`text-right font-mono pr-4 ${pnlCls(pnl)}`}>{pnl >= 0 ? '+' : ''}{fmtNum(pnl)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   );
 }
