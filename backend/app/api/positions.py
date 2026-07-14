@@ -55,6 +55,52 @@ async def _realized_pnl_today(client: DeltaClient) -> float:
     return total
 
 
+def _num(v):
+    """Coerce to float or None (mirrors the frontend's tolerant num())."""
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _prod(o: dict) -> dict:
+    """Minimal product spec the live tables read — contract_value + underlying."""
+    p = o.get("product") or {}
+    ua = p.get("underlying_asset") or {}
+    return {
+        "contract_value": _num(p.get("contract_value")),
+        "underlying_asset": {"symbol": ua.get("symbol")},
+    }
+
+
+async def _spot_map(client: DeltaClient) -> dict:
+    """Underlying index/spot per asset (BTC, ETH) for computing option notional.
+
+    Fetched from Delta's public perpetual tickers. Best-effort — on any failure
+    the map is empty and the frontend simply renders "—" for the Notional column.
+    """
+    out: dict = {}
+    for underlying, ticker in (("BTC", "BTCUSD"), ("ETH", "ETHUSD")):
+        try:
+            t = await client.get_ticker(ticker)
+            spot = _num(t.get("spot_price")) or _num(t.get("mark_price")) or _num(t.get("close"))
+            if spot is not None:
+                out[underlying] = spot
+        except Exception:
+            continue
+    return out
+
+
+def _spot_for(row: dict, spots: dict):
+    """Spot index for a row, keyed by its underlying asset (default BTC)."""
+    prod = row.get("product") or {}
+    ua = (prod.get("underlying_asset") or {}).get("symbol") or "BTC"
+    return spots.get(ua) or spots.get("BTC")
+
+
 def _format_live_position(account_id: str, account_name: str, pos: dict) -> dict | None:
     """Convert a raw Delta position payload into the API response shape.
 
@@ -348,31 +394,35 @@ async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
                         open_orders.append(o)
                 except Exception as e:
                     logger.warning(f"Failed to fetch {st} orders: {e}")
+            spots = await _spot_map(client)
             formatted = []
-            for order in open_orders:
-                base_type = order.get("order_type")  # 'market_order' / 'limit_order'
-                stop_type = order.get("stop_order_type")  # e.g. 'stop_loss_order'
-                # A stop/take-profit order is a triggered order — label it like Delta does.
-                if stop_type or order.get("stop_price"):
-                    if base_type == "limit_order":
-                        display_type = "stop_limit"
-                    else:
-                        display_type = "stop_market"
-                else:
-                    display_type = base_type
-
+            for o in open_orders:
+                # Pass through the exact raw Delta fields the Delta-style tables read,
+                # plus the underlying spot for the Notional column.
                 formatted.append({
-                    "id": order.get("id"),
-                    "symbol": order.get("product_symbol"),
-                    "side": order.get("side"),
-                    "quantity": float(order.get("size", 0)),
-                    "limit_price": float(order.get("limit_price")) if order.get("limit_price") else None,
-                    "stop_price": float(order.get("stop_price")) if order.get("stop_price") else None,
-                    "order_type": display_type,
-                    "trigger_method": order.get("stop_trigger_method"),  # mark_price / spot_price / etc.
-                    "created_at": order.get("created_at")
+                    "id": o.get("id"),
+                    "client_order_id": o.get("client_order_id"),
+                    "product_symbol": o.get("product_symbol"),
+                    "product_id": o.get("product_id"),
+                    "side": o.get("side"),
+                    "size": _num(o.get("size")),
+                    "unfilled_size": _num(o.get("unfilled_size")),
+                    "order_type": o.get("order_type"),
+                    "reduce_only": bool(o.get("reduce_only")),
+                    "limit_price": _num(o.get("limit_price")),
+                    "average_fill_price": _num(o.get("average_fill_price")),
+                    "stop_price": _num(o.get("stop_price")),
+                    "stop_order_type": o.get("stop_order_type"),
+                    "stop_trigger_method": o.get("stop_trigger_method"),
+                    "bracket_order": o.get("bracket_order"),
+                    "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
+                    "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
+                    "state": o.get("state"),
+                    "created_at": o.get("created_at"),
+                    "product": _prod(o),
+                    "spot_price": _spot_for(o, spots),
                 })
-            # Sort strictly: newest orders at the top, or sorted by ID for complete stability
+            # Newest first (stable).
             formatted.sort(key=lambda x: x.get("created_at") or "", reverse=True)
             return formatted
         except Exception as e:
@@ -403,32 +453,42 @@ async def get_master_order_history(user: CurrentUser = Depends(get_current_user)
         )
         try:
             history = await client.get_order_history(page_size=50)
+            spots = await _spot_map(client)
             formatted = []
             for o in history:
-                base_type = o.get("order_type")
-                stop_type = o.get("stop_order_type")
-                if stop_type or o.get("stop_price"):
-                    display_type = "stop_limit" if base_type == "limit_order" else "stop_market"
-                else:
-                    display_type = base_type
-                size = float(o.get("size") or 0)
-                unfilled = float(o.get("unfilled_size") or 0)
+                meta = o.get("meta_data") or {}
                 formatted.append({
                     "id": o.get("id"),
-                    "symbol": o.get("product_symbol"),
+                    "client_order_id": o.get("client_order_id"),
+                    "product_symbol": o.get("product_symbol"),
+                    "product_id": o.get("product_id"),
                     "side": o.get("side"),
-                    "quantity": size,
-                    "filled": max(0.0, size - unfilled),
-                    "limit_price": float(o.get("limit_price")) if o.get("limit_price") else None,
-                    "stop_price": float(o.get("stop_price")) if o.get("stop_price") else None,
-                    "avg_fill_price": float(o.get("average_fill_price")) if o.get("average_fill_price") else None,
-                    "order_type": display_type,
+                    "size": _num(o.get("size")),
+                    "unfilled_size": _num(o.get("unfilled_size")),
+                    "order_type": o.get("order_type"),
                     "reduce_only": bool(o.get("reduce_only")),
+                    "limit_price": _num(o.get("limit_price")),
+                    "average_fill_price": _num(o.get("average_fill_price")),
+                    "stop_price": _num(o.get("stop_price")),
+                    "stop_order_type": o.get("stop_order_type"),
+                    "bracket_order": o.get("bracket_order"),
+                    "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
+                    "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
                     "state": o.get("state"),
-                    "reason": o.get("cancellation_reason") or o.get("reason"),
+                    "cancellation_reason": o.get("cancellation_reason") or o.get("reason"),
+                    "realized_pnl": _num(o.get("realized_pnl") or o.get("realised_pnl")),
+                    "meta_data": {
+                        "pnl": _num(meta.get("pnl")),
+                        "order_size": _num(meta.get("order_size")),
+                        "order_type": meta.get("order_type"),
+                    },
                     "created_at": o.get("created_at"),
+                    "updated_at": o.get("updated_at"),
+                    "product": _prod(o),
+                    "spot_price": _spot_for(o, spots),
                 })
-            formatted.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+            # Delta sorts Order History by updated_at (fill/close time) descending.
+            formatted.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
             return formatted
         finally:
             await client.close()
@@ -458,15 +518,24 @@ async def get_master_fills(user: CurrentUser = Depends(get_current_user)):
             fills = await client.get_fills(page_size=50)
             out = []
             for f in fills:
+                meta = f.get("meta_data") or {}
                 out.append({
                     "id": f.get("id") or f.get("fill_id"),
-                    "symbol": f.get("product_symbol"),
+                    "order_id": f.get("order_id"),
+                    "product_symbol": f.get("product_symbol"),
                     "side": f.get("side"),
-                    "size": float(f.get("size") or 0),
-                    "price": float(f.get("price")) if f.get("price") else None,
+                    "size": _num(f.get("size")),
+                    "price": _num(f.get("price")),
+                    "notional": _num(f.get("notional")),
+                    "fill_type": f.get("fill_type"),
                     "role": f.get("role"),  # maker / taker
-                    "commission": float(f.get("commission")) if f.get("commission") else None,
+                    "commission": _num(f.get("commission")),
+                    "meta_data": {
+                        "order_size": _num(meta.get("order_size")),
+                        "order_type": meta.get("order_type"),
+                    },
                     "created_at": f.get("created_at"),
+                    "product": _prod(f),
                 })
             out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
             return out
@@ -486,23 +555,29 @@ async def get_master_risk(user: CurrentUser = Depends(get_current_user)):
             return []
         try:
             positions = await client.get_positions()
+            spots = await _spot_map(client)
             out = []
             for p in positions:
-                sz = float(p.get("size") or 0)
+                sz = _num(p.get("size")) or 0
                 if sz == 0:
                     continue
                 out.append({
-                    "symbol": p.get("product_symbol") or p.get("symbol"),
-                    "size": abs(sz),
+                    "product_symbol": p.get("product_symbol") or p.get("symbol"),
+                    "product_id": p.get("product_id"),
+                    "size": sz,  # signed (negative = short)
                     "side": "long" if sz > 0 else "short",
-                    "entry_price": float(p.get("entry_price") or 0),
-                    "mark_price": float(p.get("mark_price") or 0) if p.get("mark_price") else None,
-                    "margin": float(p.get("margin")) if p.get("margin") else None,
-                    "liquidation_price": float(p.get("liquidation_price")) if p.get("liquidation_price") else None,
-                    "bankruptcy_price": float(p.get("bankruptcy_price")) if p.get("bankruptcy_price") else None,
+                    "entry_price": _num(p.get("entry_price")),
+                    "mark_price": _num(p.get("mark_price")),
+                    "margin": _num(p.get("margin")),
+                    "liquidation_price": _num(p.get("liquidation_price")),
+                    "bankruptcy_price": _num(p.get("bankruptcy_price")),
+                    "unrealized_pnl": _num(p.get("unrealized_pnl") or p.get("unrealised_pnl")),
+                    "realized_cashflow": _num(p.get("realized_cashflow") or p.get("cashflow")),
                     "adl_level": p.get("adl_level"),
+                    "product": _prod(p),
+                    "spot_price": _spot_for(p, spots),
                 })
-            out.sort(key=lambda x: x.get("symbol") or "")
+            out.sort(key=lambda x: x.get("product_symbol") or "")
             return out
         finally:
             await client.close()

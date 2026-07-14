@@ -136,6 +136,18 @@ class DeltaClient:
         data = resp.json()
         return data.get("result", []) if isinstance(data, dict) else (data or [])
 
+    async def get_ticker(self, symbol: str) -> dict:
+        """Fetch the public ticker for a symbol (spot_price / mark_price / close).
+
+        Public endpoint (no signature required). Used to source the underlying
+        index/spot for computing option notional in the live views.
+        """
+        path = f"/v2/tickers/{symbol}"
+        resp = await self._client.get(f"{self.rest_url}{path}")
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result", data) if isinstance(data, dict) else {}
+
     async def get_wallet_transactions(self, start_time_us: Optional[int] = None, page_size: int = 200) -> list:
         """Fetch wallet ledger transactions (used to sum realized PnL for the day)."""
         q = f"?page_size={page_size}"
