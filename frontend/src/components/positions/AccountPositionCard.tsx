@@ -99,6 +99,9 @@ export function AccountPositionCard({ acc }: { acc: any }) {
     { key: 'history', label: `Order History (${history.length})` },
   ];
   const [tab, setTab] = useState('positions');
+  // Order-history date filter lives here so it can sit on the tab-bar row
+  // (right side) instead of eating an extra line inside the tab body.
+  const [historyDate, setHistoryDate] = useState('');
   const loadingFirst = isLoading && !data;
 
   return (
@@ -141,20 +144,28 @@ export function AccountPositionCard({ acc }: { acc: any }) {
         </div>
       </div>
 
-      {/* Tab bar (Delta-style, horizontal) */}
-      <div className="flex items-stretch gap-1 border-b border-bg-border px-2 sm:px-4 overflow-x-auto">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`relative px-3 py-2.5 text-[11px] font-semibold whitespace-nowrap transition-colors ${
-              tab === t.key ? 'text-text-primary' : 'text-text-muted hover:text-text-secondary'
-            }`}
-          >
-            {t.label}
-            {tab === t.key && <span className="absolute left-2 right-2 -bottom-px h-0.5 rounded-full bg-blue-400" />}
-          </button>
-        ))}
+      {/* Tab bar (Delta-style, horizontal). The Order History date filter rides
+          on the right of this same row so it never costs an extra line. */}
+      <div className="flex items-center gap-2 border-b border-bg-border px-2 sm:px-4">
+        <div className="flex items-stretch gap-1 overflow-x-auto flex-1 min-w-0">
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`relative px-3 py-2.5 text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                tab === t.key ? 'text-text-primary' : 'text-text-muted hover:text-text-secondary'
+              }`}
+            >
+              {t.label}
+              {tab === t.key && <span className="absolute left-2 right-2 -bottom-px h-0.5 rounded-full bg-blue-400" />}
+            </button>
+          ))}
+        </div>
+        {tab === 'history' && (
+          <div className="shrink-0 py-1.5">
+            <DateFilter value={historyDate} onChange={setHistoryDate} />
+          </div>
+        )}
       </div>
 
       {/* Tab content */}
@@ -169,7 +180,7 @@ export function AccountPositionCard({ acc }: { acc: any }) {
             {tab === 'open' && <OpenOrdersTab orders={openOrders} />}
             {tab === 'stop' && <StopOrdersTab orders={stopOrders} />}
             {tab === 'fills' && <FillsTab fills={fills} />}
-            {tab === 'history' && <HistoryTab history={history} />}
+            {tab === 'history' && <HistoryTab history={history} filterDate={historyDate} />}
           </>
         )}
       </div>
@@ -442,8 +453,7 @@ function FillsTab({ fills }: { fills: any[] }) {
 }
 
 // ── Order History (live) — Delta's real order-history feed ─────────────────
-function HistoryTab({ history }: { history: any[] }) {
-  const [filterDate, setFilterDate] = useState('');
+function HistoryTab({ history, filterDate }: { history: any[]; filterDate: string }) {
   const localYmd = (v: any) => {
     try {
       const d = new Date(v);
@@ -485,9 +495,6 @@ function HistoryTab({ history }: { history: any[] }) {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-end">
-        <DateFilter value={filterDate} onChange={setFilterDate} />
-      </div>
       {rows.length === 0 ? <Empty text="No orders match the selected date." /> : (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
