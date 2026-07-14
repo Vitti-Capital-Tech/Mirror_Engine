@@ -264,6 +264,27 @@ class CopyEngine:
             logger.warning(f"Position size fetch failed for {symbol}: {e}")
         return 0.0
 
+    async def _close_follower_position(self, client, symbol: str, name: str = "") -> None:
+        """Market-close (reduce-only) any remaining follower position on `symbol`.
+        No-op if the follower is already flat (e.g. its own bracket closed it)."""
+        try:
+            positions = await client.get_positions()
+            pos = next((p for p in positions
+                        if (p.get("product_symbol") == symbol or p.get("symbol") == symbol)
+                        and float(p.get("size") or 0) != 0), None)
+            if not pos:
+                return
+            sz = float(pos.get("size") or 0)
+            qty = int(abs(sz))
+            side = "buy" if sz < 0 else "sell"  # close a short with buy, a long with sell
+            resp = await client.place_order(
+                symbol=symbol, side=side, size=qty, order_type="market_order", reduce_only=True,
+            )
+            oid = resp.get("id") or resp.get("result", {}).get("id")
+            logger.info(f"Closed {name} position on {symbol}: {side} {qty} (reduce-only, matching master exit) order {oid}")
+        except Exception as e:
+            logger.error(f"Failed to close {name} position on {symbol}: {e}")
+
     async def _follower_close_qty(self, client, follower: dict, symbol: str, master_row: dict, ref_price: float = 0.0):
         """How many lots the follower should CLOSE to rebalance to the master's
         REMAINING position: follower_current - floor(master_remaining × ratio).
@@ -654,7 +675,24 @@ class CopyEngine:
                 master_row = None
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
-                logger.info(f"Master flat on {symbol}; keeping follower SL/TP (leg cancelled by an SL/TP hit, not a manual cancel).")
+                # Master EXITED this symbol (its SL/TP hit / it closed). Make sure
+                # every follower also exits — market-close any remaining follower
+                # position (reduce-only). If a follower's own jittered bracket
+                # already closed it, this is a no-op. Prevents followers being
+                # left holding a position the master has already closed.
+                logger.info(f"Master exited {symbol} — closing any remaining follower positions to match.")
+                owner_id = event.get("owner_id")
+                try:
+                    fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+                    if owner_id:
+                        fq = fq.eq("owner_id", owner_id)
+                    fols = fq.execute().data or []
+                except Exception:
+                    fols = []
+                for fol in fols:
+                    fclient = await self._get_follower_client(fol)
+                    if fclient:
+                        await self._close_follower_position(fclient, symbol, fol.get("name"))
                 return
             # else: master still holds it (or size unknown) -> genuine cancel, propagate.
 
