@@ -226,7 +226,7 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
   return (
     <>
     <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
+      <table className="w-full text-left text-xs border-collapse whitespace-nowrap [&_th]:pl-4 [&_td]:pl-4 [&_th:first-child]:pl-0 [&_td:first-child]:pl-0">
         <thead>
           <tr className={TH_ROW}>
             <th className="py-2">Symbol</th><th className="text-right">Size</th><th className="text-right">Notional</th>
@@ -289,7 +289,7 @@ function OpenOrdersTab({ orders }: { orders: any[] }) {
   return (
     <>
     <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
+      <table className="w-full text-left text-xs border-collapse whitespace-nowrap [&_th]:pl-4 [&_td]:pl-4 [&_th:first-child]:pl-0 [&_td:first-child]:pl-0">
         <thead>
           <tr className={TH_ROW}>
             <th className="py-2">Symbol</th><th className="text-right">Qty (Lot)</th><th className="text-right">Filled</th>
@@ -352,7 +352,7 @@ function StopOrdersTab({ orders }: { orders: any[] }) {
   return (
     <>
     <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
+      <table className="w-full text-left text-xs border-collapse whitespace-nowrap [&_th]:pl-4 [&_td]:pl-4 [&_th:first-child]:pl-0 [&_td:first-child]:pl-0">
         <thead>
           <tr className={TH_ROW}>
             <th className="py-2">Symbol</th><th className="text-right">Qty (Lot)</th><th className="text-right">Size</th>
@@ -408,7 +408,7 @@ function FillsTab({ fills }: { fills: any[] }) {
   return (
     <>
     <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
+      <table className="w-full text-left text-xs border-collapse whitespace-nowrap [&_th]:pl-4 [&_td]:pl-4 [&_th:first-child]:pl-0 [&_td:first-child]:pl-0">
         <thead>
           <tr className={TH_ROW}>
             <th className="py-2">Symbol</th><th className="text-right">Fill Qty (Lot)</th><th>Side</th>
@@ -497,7 +497,7 @@ function HistoryTab({ history, filterDate }: { history: any[]; filterDate: strin
     <div className="space-y-3">
       {rows.length === 0 ? <Empty text="No orders match the selected date." /> : (
         <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
+          <table className="w-full text-left text-xs border-collapse whitespace-nowrap [&_th]:pl-4 [&_td]:pl-4 [&_th:first-child]:pl-0 [&_td:first-child]:pl-0">
             <thead>
               <tr className={TH_ROW}>
                 <th className="py-2">Symbol</th><th>Side</th><th>Status</th><th className="text-right">Qty (Lot)</th>
