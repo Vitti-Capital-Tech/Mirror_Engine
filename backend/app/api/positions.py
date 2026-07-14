@@ -334,7 +334,20 @@ async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
             environment=master.get("environment", "demo")
         )
         try:
-            open_orders = await client.get_open_orders()
+            # Stop / SL / TP orders rest in the "pending" state; plain limit orders
+            # in "open". Fetch both so triggered/stop orders are shown too.
+            open_orders = []
+            seen_ids = set()
+            for st in ("open", "pending"):
+                try:
+                    for o in await client.get_open_orders(state=st):
+                        oid = o.get("id")
+                        if oid in seen_ids:
+                            continue
+                        seen_ids.add(oid)
+                        open_orders.append(o)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {st} orders: {e}")
             formatted = []
             for order in open_orders:
                 base_type = order.get("order_type")  # 'market_order' / 'limit_order'
@@ -371,4 +384,56 @@ async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
         raise
     except Exception as e:
         logger.error(f"Error fetching master open orders: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/master/order-history")
+async def get_master_order_history(user: CurrentUser = Depends(get_current_user)):
+    """Fetch recent closed/cancelled orders (order history) from Delta for the
+    caller's Master account."""
+    try:
+        master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
+        if not master_res.data:
+            return []
+        master = master_res.data[0]
+        client = DeltaClient(
+            api_key=master["api_key"],
+            api_secret=master["api_secret"],
+            environment=master.get("environment", "demo"),
+        )
+        try:
+            history = await client.get_order_history(page_size=50)
+            formatted = []
+            for o in history:
+                base_type = o.get("order_type")
+                stop_type = o.get("stop_order_type")
+                if stop_type or o.get("stop_price"):
+                    display_type = "stop_limit" if base_type == "limit_order" else "stop_market"
+                else:
+                    display_type = base_type
+                size = float(o.get("size") or 0)
+                unfilled = float(o.get("unfilled_size") or 0)
+                formatted.append({
+                    "id": o.get("id"),
+                    "symbol": o.get("product_symbol"),
+                    "side": o.get("side"),
+                    "quantity": size,
+                    "filled": max(0.0, size - unfilled),
+                    "limit_price": float(o.get("limit_price")) if o.get("limit_price") else None,
+                    "stop_price": float(o.get("stop_price")) if o.get("stop_price") else None,
+                    "avg_fill_price": float(o.get("average_fill_price")) if o.get("average_fill_price") else None,
+                    "order_type": display_type,
+                    "reduce_only": bool(o.get("reduce_only")),
+                    "state": o.get("state"),
+                    "reason": o.get("cancellation_reason") or o.get("reason"),
+                    "created_at": o.get("created_at"),
+                })
+            formatted.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+            return formatted
+        finally:
+            await client.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching master order history: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -13,3 +13,7 @@ export function useSyncStatus() {
 export function useMasterOpenOrders() {
   return useQuery({ queryKey: ['master-open-orders'], queryFn: api.positions.masterOpenOrders, refetchInterval: 3000 });
 }
+
+export function useMasterOrderHistory() {
+  return useQuery({ queryKey: ['master-order-history'], queryFn: api.positions.masterOrderHistory, refetchInterval: 5000 });
+}

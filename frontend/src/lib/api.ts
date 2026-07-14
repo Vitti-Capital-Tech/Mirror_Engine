@@ -81,6 +81,7 @@ export const api = {
     syncStatus: () => fetchAPI<any>('/api/positions/sync-status'),
     syncLive: () => fetchAPI<any>('/api/positions/sync-live', { method: 'POST' }),
     masterOpenOrders: () => fetchAPI<any[]>('/api/positions/master/open-orders'),
+    masterOrderHistory: () => fetchAPI<any[]>('/api/positions/master/order-history'),
   },
   alerts: {
     list: (params?: Record<string, any>) => {

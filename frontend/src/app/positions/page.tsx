@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { usePositions, useMasterOpenOrders } from '@/hooks/usePositions';
+import { usePositions, useMasterOpenOrders, useMasterOrderHistory } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
@@ -13,6 +13,7 @@ export default function PositionsPage() {
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
   const { data: positions = [], isLoading: positionsLoading } = usePositions();
   const { data: masterOrders = [], isLoading: masterOrdersLoading } = useMasterOpenOrders();
+  const { data: masterHistory = [] } = useMasterOrderHistory();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
 
@@ -67,6 +68,7 @@ export default function PositionsPage() {
         const renderCard = (acc: any) => {
           const accPositions = positions.filter((p: any) => p.account_id === acc.id);
           const accOrders = acc.is_master ? masterOrders : [];
+          const accHistory = acc.is_master ? masterHistory : [];
 
           // Calculate active PnL (sum of position unrealized pnl values)
           const activePnL = accPositions.reduce((sum: number, p: any) => sum + Number(p.unrealized_pnl || 0), 0);
@@ -243,6 +245,61 @@ export default function PositionsPage() {
                                     {ord.stop_price ? Number(ord.stop_price).toFixed(2) : '-'}
                                   </td>
                                   <td className="text-right text-text-secondary pr-4 capitalize">{triggerIndex}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Order History (Master only) — recent closed/cancelled orders from Delta */}
+                {acc.is_master && (
+                  <div>
+                    <h4 className="text-[10px] font-bold text-text-muted uppercase tracking-wider mb-2">Order History ({accHistory.length})</h4>
+                    {accHistory.length === 0 ? (
+                      <div className="py-4 text-center text-text-muted text-xs border border-dashed border-bg-border rounded-lg">
+                        No recent orders.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead>
+                            <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none">
+                              <th className="py-2">Time</th>
+                              <th>Symbol</th>
+                              <th>Side</th>
+                              <th>Type</th>
+                              <th className="text-right">Qty</th>
+                              <th className="text-right">Filled</th>
+                              <th className="text-right">Avg / Limit</th>
+                              <th>Status</th>
+                              <th className="pr-4">Reason</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/[0.04] font-medium">
+                            {accHistory.map((ord: any) => {
+                              const isBuy = ord.side?.toLowerCase() === 'buy';
+                              const price = ord.avg_fill_price ?? ord.limit_price;
+                              const st = (ord.state || '').toLowerCase();
+                              const stCls = st === 'closed' ? 'text-emerald-400' : st === 'cancelled' ? 'text-text-muted' : 'text-blue-400';
+                              return (
+                                <tr key={ord.id} className="hover:bg-bg-secondary/10 transition-colors">
+                                  <td className="py-2.5 font-mono text-text-secondary whitespace-nowrap">
+                                    {ord.created_at ? new Date(ord.created_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '-'}
+                                  </td>
+                                  <td className="font-bold text-text-primary">{ord.symbol}</td>
+                                  <td>
+                                    <span className={`font-bold ${isBuy ? 'text-emerald-400' : 'text-rose-400'}`}>{ord.side?.toUpperCase()}</span>
+                                  </td>
+                                  <td className="text-text-secondary uppercase">{ord.order_type || '-'}{ord.reduce_only ? ' · RO' : ''}</td>
+                                  <td className="text-right font-mono text-text-primary">{Number(ord.quantity).toFixed(0)}</td>
+                                  <td className="text-right font-mono text-text-secondary">{Number(ord.filled).toFixed(0)}</td>
+                                  <td className="text-right font-mono text-text-primary">{price ? Number(price).toFixed(2) : '-'}</td>
+                                  <td className={`capitalize font-semibold ${stCls}`}>{ord.state || '-'}</td>
+                                  <td className="text-text-muted pr-4 capitalize whitespace-nowrap">{(ord.reason || '').replace(/_/g, ' ') || '-'}</td>
                                 </tr>
                               );
                             })}

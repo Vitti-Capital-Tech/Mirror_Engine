@@ -118,6 +118,15 @@ class DeltaClient:
 
         return all_positions
 
+    async def get_order_history(self, page_size: int = 50) -> list:
+        """Fetch recent closed/cancelled orders (order history)."""
+        path = f"/v2/orders/history?page_size={page_size}"
+        headers = self._get_headers("GET", path)
+        resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result", []) if isinstance(data, dict) else (data or [])
+
     async def get_wallet_transactions(self, start_time_us: Optional[int] = None, page_size: int = 200) -> list:
         """Fetch wallet ledger transactions (used to sum realized PnL for the day)."""
         q = f"?page_size={page_size}"
