@@ -101,8 +101,12 @@ class TradeListener:
             order_type = o.get("order_type") or ""
             is_stop = bool(o.get("stop_order_type") or o.get("stop_price"))
             is_bracket = bool(o.get("bracket_order")) or str((o.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL")
-            # plain resting limit entries only
-            if order_type != "limit_order" or is_stop or is_bracket or o.get("reduce_only"):
+            # Resting limit orders (entries AND reduce-only closes). Brackets/stops
+            # are excluded: they're placed via the position-open path and aren't
+            # tracked by master_order_id, so reconciling them could double-place.
+            # Plain limits are safe — the copy engine's per-order idempotency
+            # guard means this only fills genuine gaps.
+            if order_type != "limit_order" or is_stop or is_bracket:
                 continue
             if (o.get("state") or "").lower() != "open":
                 continue

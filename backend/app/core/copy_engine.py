@@ -400,6 +400,17 @@ class CopyEngine:
             if not client:
                 continue
 
+            # Idempotency for resting orders: if this master order is already
+            # mirrored to this follower, only act again when the master EDITED it
+            # (is_update). We now mirror on order STATE (open/pending) rather than
+            # the create action, so the same resting order can surface on repeated
+            # WS updates and via the reconcile pass — this guard stops duplicates
+            # across every path (bracket / plain limit / reduce-only close).
+            if not is_update:
+                mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+                if mapped:
+                    continue
+
             # Bracket SL/TP attached to a position -> use the bracket endpoint.
             if is_bracket and product_id and stop_price is not None:
                 existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
@@ -482,12 +493,6 @@ class CopyEngine:
             # Plain limit order: if the master EDITED it, edit the follower's
             # existing order instead of placing a duplicate.
             existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
-            # Idempotency: this resting order is already mirrored to this follower
-            # (repeated open/pending WS updates for the same master order) — don't
-            # place a duplicate. Edits and reduce-only closes fall through.
-            if existing_foid and not is_update and not reduce_only:
-                logger.debug(f"Order {master_order_id} already mirrored to {follower['name']} ({existing_foid}); skipping duplicate")
-                continue
             if is_update and existing_foid:
                 try:
                     resp = await client.edit_order(existing_foid, product_id=product_id, limit_price=limit_price)
