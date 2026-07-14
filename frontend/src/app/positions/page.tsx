@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { usePositions, useMasterOpenOrders, useMasterOrderHistory, useMasterFills, useMasterRisk } from '@/hooks/usePositions';
+import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
@@ -12,11 +12,7 @@ import { AccountPositionCard } from '@/components/positions/AccountPositionCard'
 export default function PositionsPage() {
   const queryClient = useQueryClient();
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
-  const { data: positions = [], isLoading: positionsLoading } = usePositions();
-  const { data: masterOrders = [], isLoading: masterOrdersLoading } = useMasterOpenOrders();
-  const { data: masterHistory = [] } = useMasterOrderHistory();
-  const { data: masterFills = [] } = useMasterFills();
-  const { data: masterRisk = [] } = useMasterRisk();
+  const { isLoading: positionsLoading } = usePositions();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
 
@@ -39,7 +35,7 @@ export default function PositionsPage() {
       await api.positions.syncLive();
       queryClient.invalidateQueries({ queryKey: ['positions'] });
       queryClient.invalidateQueries({ queryKey: ['accounts'] });
-      queryClient.invalidateQueries({ queryKey: ['master-open-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['account-live-view'] });
     } catch (e) {
       console.error('Failed to sync live positions:', e);
     } finally {
@@ -68,24 +64,7 @@ export default function PositionsPage() {
         const masterAccts = visible.filter((a: any) => a.is_master);
         const followerAccts = visible.filter((a: any) => !a.is_master);
 
-        const renderCard = (acc: any) => {
-          const accPositions = positions.filter((p: any) => p.account_id === acc.id);
-          const accOrders = acc.is_master ? masterOrders : [];
-          const accHistory = acc.is_master ? masterHistory : [];
-          const accFills = acc.is_master ? masterFills : [];
-          const accRisk = acc.is_master ? masterRisk : [];
-          return (
-            <AccountPositionCard
-              key={acc.id}
-              acc={acc}
-              positions={accPositions}
-              orders={accOrders}
-              history={accHistory}
-              fills={accFills}
-              risk={accRisk}
-            />
-          );
-        };
+        const renderCard = (acc: any) => <AccountPositionCard key={acc.id} acc={acc} />;
 
         return (
           <div className="space-y-10">

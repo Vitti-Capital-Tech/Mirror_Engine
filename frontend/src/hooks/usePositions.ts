@@ -10,18 +10,13 @@ export function useSyncStatus() {
   return useQuery({ queryKey: ['positions-sync'], queryFn: api.positions.syncStatus, refetchInterval: 3000 });
 }
 
-export function useMasterOpenOrders() {
-  return useQuery({ queryKey: ['master-open-orders'], queryFn: api.positions.masterOpenOrders, refetchInterval: 3000 });
-}
-
-export function useMasterOrderHistory() {
-  return useQuery({ queryKey: ['master-order-history'], queryFn: api.positions.masterOrderHistory, refetchInterval: 5000 });
-}
-
-export function useMasterFills() {
-  return useQuery({ queryKey: ['master-fills'], queryFn: api.positions.masterFills, refetchInterval: 5000 });
-}
-
-export function useMasterRisk() {
-  return useQuery({ queryKey: ['master-risk'], queryFn: api.positions.masterRisk, refetchInterval: 4000 });
+// Full live Delta view (orders / stop orders / fills / history / risk) for one
+// account — powers the Delta-style tabs for master AND follower accounts.
+export function useAccountLiveView(accountId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['account-live-view', accountId],
+    queryFn: () => api.positions.liveView(accountId),
+    enabled: enabled && !!accountId,
+    refetchInterval: 4000,
+  });
 }

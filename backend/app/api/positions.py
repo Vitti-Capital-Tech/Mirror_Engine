@@ -365,25 +365,138 @@ async def sync_live_endpoint(user: CurrentUser = Depends(get_current_user)):
         logger.error(f"Error in sync-live: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/master/open-orders")
-async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
-    """Fetch live open orders directly from Delta for the caller's Master account."""
-    try:
-        master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
-        if not master_res.data:
-            return []
+# ---------------------------------------------------------------------------
+# Live Delta view (per account) — the exact raw fields the Delta-style tables
+# read, so every account (master + followers) renders identical columns.
+# ---------------------------------------------------------------------------
 
-        master = master_res.data[0]
-        client = DeltaClient(
-            api_key=master["api_key"],
-            api_secret=master["api_secret"],
-            environment=master.get("environment", "demo")
-        )
+def _enrich_order(o: dict, spots: dict) -> dict:
+    """Open / stop order → the fields the Open Orders + Stop Orders tables read."""
+    return {
+        "id": o.get("id"),
+        "client_order_id": o.get("client_order_id"),
+        "product_symbol": o.get("product_symbol"),
+        "product_id": o.get("product_id"),
+        "side": o.get("side"),
+        "size": _num(o.get("size")),
+        "unfilled_size": _num(o.get("unfilled_size")),
+        "order_type": o.get("order_type"),
+        "reduce_only": bool(o.get("reduce_only")),
+        "limit_price": _num(o.get("limit_price")),
+        "average_fill_price": _num(o.get("average_fill_price")),
+        "stop_price": _num(o.get("stop_price")),
+        "stop_order_type": o.get("stop_order_type"),
+        "stop_trigger_method": o.get("stop_trigger_method"),
+        "bracket_order": o.get("bracket_order"),
+        "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
+        "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
+        "state": o.get("state"),
+        "created_at": o.get("created_at"),
+        "product": _prod(o),
+        "spot_price": _spot_for(o, spots),
+    }
+
+
+def _enrich_history(o: dict, spots: dict) -> dict:
+    """Past order → the fields the Order History table reads."""
+    meta = o.get("meta_data") or {}
+    return {
+        "id": o.get("id"),
+        "client_order_id": o.get("client_order_id"),
+        "product_symbol": o.get("product_symbol"),
+        "product_id": o.get("product_id"),
+        "side": o.get("side"),
+        "size": _num(o.get("size")),
+        "unfilled_size": _num(o.get("unfilled_size")),
+        "order_type": o.get("order_type"),
+        "reduce_only": bool(o.get("reduce_only")),
+        "limit_price": _num(o.get("limit_price")),
+        "average_fill_price": _num(o.get("average_fill_price")),
+        "stop_price": _num(o.get("stop_price")),
+        "stop_order_type": o.get("stop_order_type"),
+        "bracket_order": o.get("bracket_order"),
+        "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
+        "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
+        "state": o.get("state"),
+        "cancellation_reason": o.get("cancellation_reason") or o.get("reason"),
+        "realized_pnl": _num(o.get("realized_pnl") or o.get("realised_pnl")),
+        "meta_data": {
+            "pnl": _num(meta.get("pnl")),
+            "order_size": _num(meta.get("order_size")),
+            "order_type": meta.get("order_type"),
+        },
+        "created_at": o.get("created_at"),
+        "updated_at": o.get("updated_at"),
+        "product": _prod(o),
+        "spot_price": _spot_for(o, spots),
+    }
+
+
+def _enrich_fill(f: dict) -> dict:
+    """Trade fill → the fields the Fills table reads."""
+    meta = f.get("meta_data") or {}
+    return {
+        "id": f.get("id") or f.get("fill_id"),
+        "order_id": f.get("order_id"),
+        "product_symbol": f.get("product_symbol"),
+        "side": f.get("side"),
+        "size": _num(f.get("size")),
+        "price": _num(f.get("price")),
+        "notional": _num(f.get("notional")),
+        "fill_type": f.get("fill_type"),
+        "role": f.get("role"),  # maker / taker
+        "commission": _num(f.get("commission")),
+        "meta_data": {
+            "order_size": _num(meta.get("order_size")),
+            "order_type": meta.get("order_type"),
+        },
+        "created_at": f.get("created_at"),
+        "product": _prod(f),
+    }
+
+
+def _enrich_position(p: dict, spots: dict) -> dict:
+    """Open position → the fields the Positions + Risk & Margin tables read."""
+    sz = _num(p.get("size")) or 0
+    return {
+        "product_symbol": p.get("product_symbol") or p.get("symbol"),
+        "product_id": p.get("product_id"),
+        "size": sz,  # signed (negative = short)
+        "side": "long" if sz > 0 else "short",
+        "entry_price": _num(p.get("entry_price")),
+        "mark_price": _num(p.get("mark_price")),
+        "margin": _num(p.get("margin")),
+        "liquidation_price": _num(p.get("liquidation_price")),
+        "bankruptcy_price": _num(p.get("bankruptcy_price")),
+        "unrealized_pnl": _num(p.get("unrealized_pnl") or p.get("unrealised_pnl")),
+        "realized_cashflow": _num(p.get("realized_cashflow") or p.get("cashflow")),
+        "adl_level": p.get("adl_level"),
+        "product": _prod(p),
+        "spot_price": _spot_for(p, spots),
+    }
+
+
+async def _fetch_account_live_view(acc: dict) -> dict:
+    """Full live Delta view for one account: orders, order history, fills and
+    per-position risk — enriched with the exact raw fields the Delta-style
+    tables render. Each section is best-effort so one failure doesn't blank the
+    rest. One Delta client + one spot lookup shared across all sections."""
+    client = DeltaClient(
+        api_key=acc["api_key"],
+        api_secret=acc["api_secret"],
+        environment=acc.get("environment", "demo"),
+    )
+    orders: list = []
+    history: list = []
+    fills: list = []
+    risk: list = []
+    try:
+        spots = await _spot_map(client)
+
+        # Resting orders — plain limits rest in "open", stop/SL/TP in "pending".
         try:
-            # Stop / SL / TP orders rest in the "pending" state; plain limit orders
-            # in "open". Fetch both so triggered/stop orders are shown too.
-            open_orders = []
             seen_ids = set()
+            raw_orders = []
             for st in ("open", "pending"):
                 try:
                     for o in await client.get_open_orders(state=st):
@@ -391,196 +504,46 @@ async def get_master_open_orders(user: CurrentUser = Depends(get_current_user)):
                         if oid in seen_ids:
                             continue
                         seen_ids.add(oid)
-                        open_orders.append(o)
+                        raw_orders.append(o)
                 except Exception as e:
-                    logger.warning(f"Failed to fetch {st} orders: {e}")
-            spots = await _spot_map(client)
-            formatted = []
-            for o in open_orders:
-                # Pass through the exact raw Delta fields the Delta-style tables read,
-                # plus the underlying spot for the Notional column.
-                formatted.append({
-                    "id": o.get("id"),
-                    "client_order_id": o.get("client_order_id"),
-                    "product_symbol": o.get("product_symbol"),
-                    "product_id": o.get("product_id"),
-                    "side": o.get("side"),
-                    "size": _num(o.get("size")),
-                    "unfilled_size": _num(o.get("unfilled_size")),
-                    "order_type": o.get("order_type"),
-                    "reduce_only": bool(o.get("reduce_only")),
-                    "limit_price": _num(o.get("limit_price")),
-                    "average_fill_price": _num(o.get("average_fill_price")),
-                    "stop_price": _num(o.get("stop_price")),
-                    "stop_order_type": o.get("stop_order_type"),
-                    "stop_trigger_method": o.get("stop_trigger_method"),
-                    "bracket_order": o.get("bracket_order"),
-                    "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
-                    "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
-                    "state": o.get("state"),
-                    "created_at": o.get("created_at"),
-                    "product": _prod(o),
-                    "spot_price": _spot_for(o, spots),
-                })
-            # Newest first (stable).
-            formatted.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-            return formatted
+                    logger.warning(f"Failed to fetch {st} orders for {acc.get('name')}: {e}")
+            orders = [_enrich_order(o, spots) for o in raw_orders]
+            orders.sort(key=lambda x: x.get("created_at") or "", reverse=True)
         except Exception as e:
-            logger.error(f"Failed to fetch master open orders: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch open orders from Delta: {str(e)}")
-        finally:
-            await client.close()
+            logger.warning(f"Open orders failed for {acc.get('name')}: {e}")
+
+        try:
+            history = [_enrich_history(o, spots) for o in await client.get_order_history(page_size=50)]
+            history.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+        except Exception as e:
+            logger.warning(f"Order history failed for {acc.get('name')}: {e}")
+
+        try:
+            fills = [_enrich_fill(f) for f in await client.get_fills(page_size=50)]
+            fills.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        except Exception as e:
+            logger.warning(f"Fills failed for {acc.get('name')}: {e}")
+
+        try:
+            risk = [_enrich_position(p, spots) for p in await client.get_positions() if (_num(p.get("size")) or 0) != 0]
+            risk.sort(key=lambda x: x.get("product_symbol") or "")
+        except Exception as e:
+            logger.warning(f"Risk failed for {acc.get('name')}: {e}")
+    finally:
+        await client.close()
+    return {"orders": orders, "history": history, "fills": fills, "risk": risk}
+
+
+@router.get("/{account_id}/live-view")
+async def get_account_live_view(account_id: str, user: CurrentUser = Depends(get_current_user)):
+    """Full live Delta view (orders / stop orders / fills / history / risk) for
+    one owned account. Admins may view any account. Powers the Delta-style tabs
+    for master AND follower accounts alike."""
+    try:
+        acc = owned_account_or_404(account_id, user)
+        return await _fetch_account_live_view(acc)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching master open orders: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/master/order-history")
-async def get_master_order_history(user: CurrentUser = Depends(get_current_user)):
-    """Fetch recent closed/cancelled orders (order history) from Delta for the
-    caller's Master account."""
-    try:
-        master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
-        if not master_res.data:
-            return []
-        master = master_res.data[0]
-        client = DeltaClient(
-            api_key=master["api_key"],
-            api_secret=master["api_secret"],
-            environment=master.get("environment", "demo"),
-        )
-        try:
-            history = await client.get_order_history(page_size=50)
-            spots = await _spot_map(client)
-            formatted = []
-            for o in history:
-                meta = o.get("meta_data") or {}
-                formatted.append({
-                    "id": o.get("id"),
-                    "client_order_id": o.get("client_order_id"),
-                    "product_symbol": o.get("product_symbol"),
-                    "product_id": o.get("product_id"),
-                    "side": o.get("side"),
-                    "size": _num(o.get("size")),
-                    "unfilled_size": _num(o.get("unfilled_size")),
-                    "order_type": o.get("order_type"),
-                    "reduce_only": bool(o.get("reduce_only")),
-                    "limit_price": _num(o.get("limit_price")),
-                    "average_fill_price": _num(o.get("average_fill_price")),
-                    "stop_price": _num(o.get("stop_price")),
-                    "stop_order_type": o.get("stop_order_type"),
-                    "bracket_order": o.get("bracket_order"),
-                    "bracket_take_profit_price": _num(o.get("bracket_take_profit_price")),
-                    "bracket_stop_loss_price": _num(o.get("bracket_stop_loss_price")),
-                    "state": o.get("state"),
-                    "cancellation_reason": o.get("cancellation_reason") or o.get("reason"),
-                    "realized_pnl": _num(o.get("realized_pnl") or o.get("realised_pnl")),
-                    "meta_data": {
-                        "pnl": _num(meta.get("pnl")),
-                        "order_size": _num(meta.get("order_size")),
-                        "order_type": meta.get("order_type"),
-                    },
-                    "created_at": o.get("created_at"),
-                    "updated_at": o.get("updated_at"),
-                    "product": _prod(o),
-                    "spot_price": _spot_for(o, spots),
-                })
-            # Delta sorts Order History by updated_at (fill/close time) descending.
-            formatted.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
-            return formatted
-        finally:
-            await client.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching master order history: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _master_client_or_none(user):
-    master_res = scope_owned(db.table("accounts").select("*"), user).eq("is_master", True).execute()
-    if not master_res.data:
-        return None
-    m = master_res.data[0]
-    return DeltaClient(api_key=m["api_key"], api_secret=m["api_secret"], environment=m.get("environment", "demo"))
-
-
-@router.get("/master/fills")
-async def get_master_fills(user: CurrentUser = Depends(get_current_user)):
-    """Recent trade fills (executions) for the caller's Master account."""
-    try:
-        client = _master_client_or_none(user)
-        if not client:
-            return []
-        try:
-            fills = await client.get_fills(page_size=50)
-            out = []
-            for f in fills:
-                meta = f.get("meta_data") or {}
-                out.append({
-                    "id": f.get("id") or f.get("fill_id"),
-                    "order_id": f.get("order_id"),
-                    "product_symbol": f.get("product_symbol"),
-                    "side": f.get("side"),
-                    "size": _num(f.get("size")),
-                    "price": _num(f.get("price")),
-                    "notional": _num(f.get("notional")),
-                    "fill_type": f.get("fill_type"),
-                    "role": f.get("role"),  # maker / taker
-                    "commission": _num(f.get("commission")),
-                    "meta_data": {
-                        "order_size": _num(meta.get("order_size")),
-                        "order_type": meta.get("order_type"),
-                    },
-                    "created_at": f.get("created_at"),
-                    "product": _prod(f),
-                })
-            out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-            return out
-        finally:
-            await client.close()
-    except Exception as e:
-        logger.error(f"Error fetching master fills: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/master/risk")
-async def get_master_risk(user: CurrentUser = Depends(get_current_user)):
-    """Per-position risk & margin for the caller's Master account."""
-    try:
-        client = _master_client_or_none(user)
-        if not client:
-            return []
-        try:
-            positions = await client.get_positions()
-            spots = await _spot_map(client)
-            out = []
-            for p in positions:
-                sz = _num(p.get("size")) or 0
-                if sz == 0:
-                    continue
-                out.append({
-                    "product_symbol": p.get("product_symbol") or p.get("symbol"),
-                    "product_id": p.get("product_id"),
-                    "size": sz,  # signed (negative = short)
-                    "side": "long" if sz > 0 else "short",
-                    "entry_price": _num(p.get("entry_price")),
-                    "mark_price": _num(p.get("mark_price")),
-                    "margin": _num(p.get("margin")),
-                    "liquidation_price": _num(p.get("liquidation_price")),
-                    "bankruptcy_price": _num(p.get("bankruptcy_price")),
-                    "unrealized_pnl": _num(p.get("unrealized_pnl") or p.get("unrealised_pnl")),
-                    "realized_cashflow": _num(p.get("realized_cashflow") or p.get("cashflow")),
-                    "adl_level": p.get("adl_level"),
-                    "product": _prod(p),
-                    "spot_price": _spot_for(p, spots),
-                })
-            out.sort(key=lambda x: x.get("product_symbol") or "")
-            return out
-        finally:
-            await client.close()
-    except Exception as e:
-        logger.error(f"Error fetching master risk: {e}")
+        logger.error(f"Error fetching live view for account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

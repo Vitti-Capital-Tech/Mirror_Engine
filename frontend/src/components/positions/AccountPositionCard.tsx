@@ -1,6 +1,7 @@
 'use client';
 import React, { useState } from 'react';
-import { ArrowUpRight, ArrowDownRight, Crown } from 'lucide-react';
+import { Crown, Loader2 } from 'lucide-react';
+import { useAccountLiveView } from '@/hooks/usePositions';
 
 // ── Formatting helpers (mirror the live Delta tables) ─────────────────────
 const num = (v: any): number | null =>
@@ -31,27 +32,33 @@ function Rail({ sell }: { sell: boolean }) {
 const TH_ROW = 'text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none';
 const ROW = 'hover:bg-bg-secondary/10 transition-colors';
 
-export function AccountPositionCard({ acc, positions = [], orders = [], history = [], fills = [], risk = [] }: {
-  acc: any; positions?: any[]; orders?: any[]; history?: any[]; fills?: any[]; risk?: any[];
-}) {
-  const activePnL = positions.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
+export function AccountPositionCard({ acc }: { acc: any }) {
+  // Each card fetches its own full live Delta view, so master AND follower
+  // accounts render the identical Delta-style tabs.
+  const { data, isLoading } = useAccountLiveView(acc.id);
+  const orders = data?.orders ?? [];
+  const history = data?.history ?? [];
+  const fills = data?.fills ?? [];
+  const risk = data?.risk ?? [];
+
+  // Active P&L = mark-to-market across open legs (same math as the Risk tab).
+  const activePnL = risk.reduce((s: number, p: any) => s + positionPnl(p), 0);
 
   // Split resting orders into plain limit (Open Orders) vs stop / SL / TP (Stop Orders).
   const openOrders = orders.filter((o: any) => !o.stop_price && !o.stop_order_type);
   const stopOrders = orders.filter((o: any) => o.stop_price || o.stop_order_type);
 
-  // Delta-style tabs. Followers only get Positions (no order feeds fetched).
-  const tabs = acc.is_master
-    ? [
-        { key: 'positions', label: `Positions (${risk.length})` },
-        { key: 'open', label: `Open Orders (${openOrders.length})` },
-        { key: 'stop', label: `Stop Orders (${stopOrders.length})` },
-        { key: 'fills', label: `Fills (${fills.length})` },
-        { key: 'history', label: `Order History (${history.length})` },
-        { key: 'risk', label: `Risk & Margin (${risk.length})` },
-      ]
-    : [{ key: 'positions', label: `Positions (${positions.length})` }];
+  // Delta-style tabs — identical set for every account.
+  const tabs = [
+    { key: 'positions', label: `Positions (${risk.length})` },
+    { key: 'open', label: `Open Orders (${openOrders.length})` },
+    { key: 'stop', label: `Stop Orders (${stopOrders.length})` },
+    { key: 'fills', label: `Fills (${fills.length})` },
+    { key: 'history', label: `Order History (${history.length})` },
+    { key: 'risk', label: `Risk & Margin (${risk.length})` },
+  ];
   const [tab, setTab] = useState('positions');
+  const loadingFirst = isLoading && !data;
 
   return (
     <div className="card-premium overflow-hidden shadow-md">
@@ -67,6 +74,7 @@ export function AccountPositionCard({ acc, positions = [], orders = [], history 
             )}
           </span>
           <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
+          {loadingFirst && <Loader2 className="w-3.5 h-3.5 text-text-muted animate-spin shrink-0" />}
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs font-bold">
           <div className="flex items-center gap-2">
@@ -110,19 +118,33 @@ export function AccountPositionCard({ acc, positions = [], orders = [], history 
 
       {/* Tab content */}
       <div className="p-4 sm:p-6">
-        {tab === 'positions' && (
-          acc.is_master
-            ? <DeltaPositionsTab positions={risk} stopOrders={stopOrders} />
-            : <PositionsTab positions={positions} />
+        {loadingFirst ? (
+          <div className="py-8 flex items-center justify-center gap-2 text-text-muted text-xs">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading live data from Delta…
+          </div>
+        ) : (
+          <>
+            {tab === 'positions' && <DeltaPositionsTab positions={risk} stopOrders={stopOrders} />}
+            {tab === 'open' && <OpenOrdersTab orders={openOrders} />}
+            {tab === 'stop' && <StopOrdersTab orders={stopOrders} />}
+            {tab === 'fills' && <FillsTab fills={fills} />}
+            {tab === 'history' && <HistoryTab history={history} />}
+            {tab === 'risk' && <RiskTab positions={risk} wallet={acc.balance} />}
+          </>
         )}
-        {tab === 'open' && <OpenOrdersTab orders={openOrders} />}
-        {tab === 'stop' && <StopOrdersTab orders={stopOrders} />}
-        {tab === 'fills' && <FillsTab fills={fills} />}
-        {tab === 'history' && <HistoryTab history={history} />}
-        {tab === 'risk' && <RiskTab positions={risk} wallet={acc.balance} />}
       </div>
     </div>
   );
+}
+
+// Mark-to-market P&L for one open leg (size × contract_value × (mark − entry)),
+// falling back to Delta's own unrealized_pnl when no mark is available.
+function positionPnl(p: any): number {
+  const size = num(p.size) || 0;
+  const cv = num(p.product?.contract_value) ?? 0.001;
+  const entry = num(p.entry_price);
+  const mark = num(p.mark_price);
+  return mark != null && entry != null ? size * cv * (mark - entry) : (num(p.unrealized_pnl) ?? 0);
 }
 
 function Empty({ text }: { text: string }) {
@@ -144,7 +166,7 @@ function stopLevels(stopOrders: any[]) {
   return map;
 }
 
-// ── Positions (live, master) — mirrors Delta's Positions tab ──────────────
+// ── Positions (live) — mirrors Delta's Positions tab ──────────────────────
 function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOrders: any[] }) {
   const open = (positions || []).filter((p) => Number(p.size) !== 0);
   if (open.length === 0) return <Empty text="No active open positions." />;
@@ -171,7 +193,7 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
             const notional = idx != null ? Math.abs(size) * cv * idx : null;
             const entry = num(p.entry_price);
             const mark = num(p.mark_price);
-            const pnl = (mark != null && entry != null) ? size * cv * (mark - entry) : (num(p.unrealized_pnl) ?? 0);
+            const pnl = positionPnl(p);
             const entryCost = entry != null ? Math.abs(size) * cv * entry : null;
             const pnlPct = entryCost && entryCost !== 0 ? (pnl / entryCost) * 100 : null;
             const margin = num(p.margin);
@@ -196,46 +218,6 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
                   {pnlPct != null && <span className={`block text-[10px] ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnl >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</span>}
                 </td>
                 <td className={`text-right font-mono pr-4 ${cashflow == null ? 'text-text-muted' : pnlCls(cashflow)}`}>{cashflow != null ? `${cashflow >= 0 ? '+' : ''}${fmtNum(cashflow)}` : '—'}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-// ── Positions (live, follower) — simple synced view ───────────────────────
-function PositionsTab({ positions }: { positions: any[] }) {
-  if (positions.length === 0) return <Empty text="No active open positions." />;
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs border-collapse">
-        <thead>
-          <tr className={TH_ROW}>
-            <th className="py-2">Symbol</th><th>Side</th>
-            <th className="text-right">Quantity</th><th className="text-right">Entry Price</th>
-            <th className="text-right">Current Price</th><th className="text-right">Unrealized PNL</th>
-            <th className="text-right pr-4">Opened At</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-white/[0.04] font-medium">
-          {positions.map((pos: any) => {
-            const isLong = pos.side?.toLowerCase() === 'long';
-            const pnl = Number(pos.unrealized_pnl || 0);
-            return (
-              <tr key={pos.id} className={ROW}>
-                <td className="py-2.5 font-bold text-text-primary">{pos.symbol}</td>
-                <td>
-                  <span className={`inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-full text-[10px] font-bold ring-1 ${isLong ? 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/25' : 'bg-rose-500/10 text-rose-400 ring-rose-500/25'}`}>
-                    {isLong ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}{pos.side?.toUpperCase()}
-                  </span>
-                </td>
-                <td className="text-right font-mono text-text-primary">{Number(pos.quantity).toFixed(0)}</td>
-                <td className="text-right font-mono text-text-primary">{Number(pos.entry_price).toFixed(2)}</td>
-                <td className="text-right font-mono text-text-primary">{Number(pos.current_price || pos.entry_price).toFixed(2)}</td>
-                <td className={`text-right font-mono ${pnlCls(pnl)}`}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td>
-                <td className="text-right font-mono text-text-secondary pr-4 whitespace-nowrap">{fmtTs(pos.created_at)}</td>
               </tr>
             );
           })}
@@ -406,13 +388,7 @@ function FillsTab({ fills }: { fills: any[] }) {
 // ── Risk & Margin (live) — summary cards + per-leg margin/liquidation ──────
 function RiskTab({ positions, wallet }: { positions: any[]; wallet?: number }) {
   const open = (positions || []).filter((p) => Number(p.size) !== 0);
-  const pnlOf = (p: any) => {
-    const size = num(p.size) || 0;
-    const cv = num(p.product?.contract_value) ?? 0.001;
-    const entry = num(p.entry_price);
-    const mark = num(p.mark_price);
-    return (mark != null && entry != null) ? size * cv * (mark - entry) : (num(p.unrealized_pnl) ?? 0);
-  };
+  const pnlOf = positionPnl;
   const totalMargin = open.reduce((s, p) => s + (num(p.margin) || 0), 0);
   const totalUnrl = open.reduce((s, p) => s + pnlOf(p), 0);
   const w = num(wallet);

@@ -2,14 +2,8 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { AdminHeader, pnlClass, Loader } from '@/components/admin/AdminUI';
-import { Crown, ChevronDown, ArrowUpRight, ArrowDownRight } from 'lucide-react';
-
-function fmtOpenedAt(iso?: string) {
-  if (!iso) return '-';
-  return new Date(iso).toLocaleString('en-IN', {
-    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
-  });
-}
+import { ChevronDown } from 'lucide-react';
+import { AccountPositionCard } from '@/components/positions/AccountPositionCard';
 
 export default function AdminPositions() {
   const [users, setUsers] = useState<any[]>([]);
@@ -20,14 +14,27 @@ export default function AdminPositions() {
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await api.admin.positions();
-      const cleaned = (res.users || [])
-        .map((u: any) => ({ ...u, accounts: (u.accounts || []).filter((a: any) => a.status !== 'paused') }))
-        .filter((u: any) => u.accounts.length > 0);
-      setUsers(cleaned); setError('');
+      const accounts = await api.admin.accounts();
+      // Group active accounts by owner; master first within each owner.
+      const byOwner: Record<string, any> = {};
+      for (const a of accounts) {
+        if (a.status === 'paused') continue;
+        const key = a.owner_id || a.owner_email || 'unknown';
+        const entry = byOwner[key] || (byOwner[key] = { id: key, email: a.owner_email || '—', accounts: [] });
+        entry.accounts.push(a);
+      }
+      const grouped = Object.values(byOwner)
+        .map((u: any) => ({
+          ...u,
+          accounts: u.accounts.sort((x: any, y: any) => (Number(!!y.is_master) - Number(!!x.is_master)) || String(x.name || '').localeCompare(String(y.name || ''))),
+          today_pnl: u.accounts.reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0),
+        }))
+        .filter((u: any) => u.accounts.length > 0)
+        .sort((a: any, b: any) => String(a.email || '').toLowerCase().localeCompare(String(b.email || '').toLowerCase()));
+      setUsers(grouped); setError('');
     } catch (e: any) { setError(e.message || 'Failed to load'); } finally { setLoading(false); }
   }, []);
-  useEffect(() => { load(); const id = setInterval(load, 12000); return () => clearInterval(id); }, [load]);
+  useEffect(() => { load(); const id = setInterval(load, 20000); return () => clearInterval(id); }, [load]);
 
   const toggle = (id: string) => setOpen(o => ({ ...o, [id]: !(o[id] ?? true) }));
   const isOpen = (id: string) => open[id] ?? true;
@@ -40,144 +47,50 @@ export default function AdminPositions() {
 
       {loading && users.length === 0 && <Loader label="Loading positions…" />}
       {!loading && users.length === 0 && (
-        <div className="card-premium p-10 text-center text-text-muted">No open positions.</div>
+        <div className="card-premium p-10 text-center text-text-muted">No active accounts.</div>
       )}
 
       <div className="space-y-4">
-        {users.map((u) => (
-          <div key={u.id} className="card-premium overflow-hidden">
-            {/* User header */}
-            <button onClick={() => toggle(u.id)}
-              className="w-full flex items-center justify-between px-4 py-3 border-b border-bg-border hover:bg-bg-panel/40 transition-colors">
-              <div className="flex items-center gap-2.5 min-w-0">
-                <ChevronDown className={`w-4 h-4 text-text-muted transition-transform ${isOpen(u.id) ? '' : '-rotate-90'}`} />
-                <span className="font-semibold text-text-primary truncate">{u.email}</span>
-              </div>
-              <span className="text-[11px] text-text-muted">
-                {u.accounts.length} account{u.accounts.length === 1 ? '' : 's'} · {u.total_positions} position{u.total_positions === 1 ? '' : 's'}
-              </span>
-            </button>
+        {users.map((u) => {
+          const masters = u.accounts.filter((a: any) => a.is_master);
+          const followers = u.accounts.filter((a: any) => !a.is_master);
+          return (
+            <div key={u.id} className="card-premium overflow-hidden">
+              {/* User header */}
+              <button onClick={() => toggle(u.id)}
+                className="w-full flex items-center justify-between px-4 py-3 border-b border-bg-border hover:bg-bg-panel/40 transition-colors">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <ChevronDown className={`w-4 h-4 text-text-muted transition-transform ${isOpen(u.id) ? '' : '-rotate-90'}`} />
+                  <span className="font-semibold text-text-primary truncate">{u.email}</span>
+                </div>
+                <div className="flex items-center gap-4 text-[11px] shrink-0">
+                  <span className="text-text-muted">{u.accounts.length} account{u.accounts.length === 1 ? '' : 's'}</span>
+                  <span className="font-mono font-bold text-text-muted">
+                    Today: <span className={pnlClass(Number(u.today_pnl))}>{Number(u.today_pnl) >= 0 ? '+' : ''}{Number(u.today_pnl || 0).toFixed(2)}</span>
+                  </span>
+                </div>
+              </button>
 
-            {isOpen(u.id) && (() => {
-              const masters = u.accounts.filter((a: any) => a.is_master);
-              const followers = u.accounts.filter((a: any) => !a.is_master);
-              return (
+              {isOpen(u.id) && (
                 <div className="p-4 space-y-6">
                   {masters.length > 0 && (
                     <div className="space-y-3">
                       <h4 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h4>
-                      <div className="space-y-4">{masters.map((a: any) => <AccountCard key={a.id} acc={a} />)}</div>
+                      <div className="space-y-4">{masters.map((a: any) => <AccountPositionCard key={a.id} acc={a} />)}</div>
                     </div>
                   )}
                   {followers.length > 0 && (
                     <div className="space-y-3">
                       <h4 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Follower Accounts ({followers.length})</h4>
-                      <div className="space-y-4">{followers.map((a: any) => <AccountCard key={a.id} acc={a} />)}</div>
+                      <div className="space-y-4">{followers.map((a: any) => <AccountPositionCard key={a.id} acc={a} />)}</div>
                     </div>
                   )}
                 </div>
-              );
-            })()}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function AccountCard({ acc }: { acc: any }) {
-  const activePnL = (acc.positions || []).reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
-  return (
-    <div className="rounded-xl border border-bg-border overflow-hidden shadow-sm">
-      {/* Header — avatar + crown, name, stats (matches the trader view) */}
-      <div className="flex items-center justify-between border-b border-bg-border bg-bg-panel/40 px-5 py-3.5 gap-4 flex-wrap">
-        <div className="flex items-center gap-3 min-w-0">
-          <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
-            {acc.name?.charAt(0)?.toUpperCase() || '?'}
-            {acc.is_master && (
-              <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm rotate-[18deg]">
-                <Crown className="w-2.5 h-2.5 text-[#1a1205]" fill="currentColor" />
-              </span>
-            )}
-          </span>
-          <h3 className="font-bold text-text-primary text-sm tracking-tight truncate">{acc.name}</h3>
-        </div>
-        <div className="flex items-center gap-5 font-mono text-xs font-bold">
-          <Stat label="Today P&L" value={acc.today_pnl} pnl />
-          <Stat label="Active P&L" value={activePnL} pnl />
-          <div className="flex items-center gap-1.5">
-            <span className="text-text-muted text-[10px] uppercase font-semibold">Balance:</span>
-            <span className="text-text-primary">{acc.balance != null ? `${Number(acc.balance).toFixed(2)}` : '-'}</span>
-          </div>
-          {acc.allocated_balance != null && (
-            <div className="flex items-center gap-1.5">
-              <span className="text-text-muted text-[10px] uppercase font-semibold">Alloc:</span>
-              <span className="text-blue-400">{Number(acc.allocated_balance).toFixed(2)}</span>
+              )}
             </div>
-          )}
-        </div>
+          );
+        })}
       </div>
-
-      {/* Positions table (matches trader layout) */}
-      <div className="p-5">
-        <h4 className="text-[10px] font-bold text-text-muted uppercase tracking-wider mb-2">Open Positions ({acc.positions.length})</h4>
-        {acc.positions.length === 0 ? (
-          <div className="py-4 text-center text-text-muted text-xs border border-dashed border-bg-border rounded-lg">No active open positions.</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead>
-                <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none">
-                  <th className="py-2">Symbol</th>
-                  <th>Side</th>
-                  <th className="text-right">Quantity</th>
-                  <th className="text-right">Entry Price</th>
-                  <th className="text-right">Current Price</th>
-                  <th className="text-right">Unrealized PNL</th>
-                  <th className="text-right">Stop Loss</th>
-                  <th className="text-right">Take Profit</th>
-                  <th className="text-right pr-2">Opened At</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/[0.04] font-medium">
-                {acc.positions.map((pos: any) => {
-                  const isLong = String(pos.side).toLowerCase() === 'long';
-                  const pnl = Number(pos.unrealized_pnl || 0);
-                  return (
-                    <tr key={pos.id} className="hover:bg-bg-secondary/10 transition-colors">
-                      <td className="py-2.5 font-bold text-text-primary">{pos.symbol}</td>
-                      <td>
-                        <span className={`inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-full text-[10px] font-bold ring-1 ${isLong ? 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/25' : 'bg-rose-500/10 text-rose-400 ring-rose-500/25'}`}>
-                          {isLong ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                          {String(pos.side).toUpperCase()}
-                        </span>
-                      </td>
-                      <td className="text-right font-mono text-text-primary">{Number(pos.quantity).toFixed(0)}</td>
-                      <td className="text-right font-mono text-text-primary">{Number(pos.entry_price).toFixed(2)}</td>
-                      <td className="text-right font-mono text-text-primary">{Number(pos.current_price || pos.entry_price).toFixed(2)}</td>
-                      <td className={`text-right font-mono ${pnlClass(pnl)}`}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</td>
-                      <td className="text-right font-mono text-text-muted">{pos.sl_price != null ? Number(pos.sl_price).toFixed(2) : '—'}</td>
-                      <td className="text-right font-mono text-text-muted">{pos.tp_price != null ? Number(pos.tp_price).toFixed(2) : '—'}</td>
-                      <td className="text-right font-mono text-text-secondary pr-2 whitespace-nowrap">{fmtOpenedAt(pos.created_at)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, pnl }: { label: string; value: number; pnl?: boolean }) {
-  return (
-    <div className="flex items-center gap-1.5">
-      <span className="text-text-muted text-[10px] uppercase font-semibold">{label}:</span>
-      <span className={pnl ? pnlClass(Number(value)) : 'text-text-primary'}>
-        {Number(value) >= 0 ? '+' : ''}{Number(value || 0).toFixed(2)}
-      </span>
     </div>
   );
 }
