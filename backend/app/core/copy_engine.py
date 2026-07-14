@@ -556,10 +556,13 @@ class CopyEngine:
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
 
-                    # Plain LIMIT order (not a stop/bracket): if it hasn't filled
-                    # after the wait+retry window, escalate to a full-or-nothing
-                    # market order so the follower actually gets in.
-                    if order_type == "limit_order" and stop_price is None and not is_bracket:
+                    # Plain LIMIT ENTRY (not a stop/bracket/reduce-only): if it
+                    # hasn't filled after the wait+retry window, escalate to a
+                    # full-or-nothing market order so the follower actually gets in.
+                    # Reduce-only closes are intentionally excluded — they mirror
+                    # the master's resting limit EXIT and should sit and fill at
+                    # that price, not be forced to market or cancelled.
+                    if order_type == "limit_order" and stop_price is None and not is_bracket and not reduce_only:
                         asyncio.create_task(self._escalate_unfilled_limit(
                             follower, client, follower_order_id, product_id, symbol,
                             side, int(qty), reduce_only, master_row,
