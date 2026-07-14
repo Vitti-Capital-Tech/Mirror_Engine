@@ -264,6 +264,23 @@ class CopyEngine:
             logger.warning(f"Position size fetch failed for {symbol}: {e}")
         return 0.0
 
+    @staticmethod
+    async def _order_is_live(client, order_id: str) -> bool:
+        """True if the given order id is still resting (open/pending) on the
+        account. On any fetch error, return True so we never risk double-placing
+        just because a status check hiccuped."""
+        try:
+            for st in ("open", "pending"):
+                try:
+                    for o in await client.get_open_orders(state=st):
+                        if str(o.get("id")) == str(order_id):
+                            return True
+                except Exception:
+                    return True
+        except Exception:
+            return True
+        return False
+
     async def _close_follower_position(self, client, symbol: str, name: str = "") -> None:
         """Market-close (reduce-only) any remaining follower position on `symbol`.
         No-op if the follower is already flat (e.g. its own bracket closed it)."""
@@ -406,10 +423,16 @@ class CopyEngine:
             # the create action, so the same resting order can surface on repeated
             # WS updates and via the reconcile pass — this guard stops duplicates
             # across every path (bracket / plain limit / reduce-only close).
+            # BUT verify the mapped follower order still exists: we only listen to
+            # the master's WS, so a mirrored order that already filled/cancelled
+            # leaves a stale map that would otherwise block re-placing forever.
             if not is_update:
                 mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
                 if mapped:
-                    continue
+                    if await self._order_is_live(client, mapped):
+                        continue
+                    # stale mapping — mirrored order is gone; clear and re-place
+                    await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
 
             # Bracket SL/TP attached to a position -> use the bracket endpoint.
             if is_bracket and product_id and stop_price is not None:
