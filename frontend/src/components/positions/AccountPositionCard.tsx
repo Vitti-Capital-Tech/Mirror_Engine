@@ -1,6 +1,6 @@
 'use client';
 import React, { useState } from 'react';
-import { Crown, Loader2 } from 'lucide-react';
+import { Crown, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useAccountLiveView } from '@/hooks/usePositions';
 
 // ── Formatting helpers (mirror the live Delta tables) ─────────────────────
@@ -31,6 +31,54 @@ function Rail({ sell }: { sell: boolean }) {
 
 const TH_ROW = 'text-text-muted border-b border-bg-border uppercase font-bold text-[9px] select-none';
 const ROW = 'hover:bg-bg-secondary/10 transition-colors';
+
+// Client-side pagination so each tab stays short — a tall Order History no
+// longer pushes the next follower's card far down the page.
+const PAGE_SIZES = [5, 10, 20, 30];
+function usePaged<T>(items: T[], initial = 10) {
+  const [pageSize, setPageSize] = useState(initial);
+  const [page, setPage] = useState(0); // 0-indexed
+  const total = items.length;
+  const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+  const safePage = Math.min(page, maxPage);
+  const start = total === 0 ? 0 : safePage * pageSize;
+  const end = Math.min(start + pageSize, total);
+  return {
+    pageItems: items.slice(start, end),
+    page: safePage, setPage, pageSize,
+    setPageSize: (s: number) => { setPageSize(s); setPage(0); },
+    total, start, end, maxPage,
+  };
+}
+
+function Paginator({ page, setPage, pageSize, setPageSize, total, start, end, maxPage }: {
+  page: number; setPage: (n: number) => void; pageSize: number; setPageSize: (n: number) => void;
+  total: number; start: number; end: number; maxPage: number;
+}) {
+  if (total <= PAGE_SIZES[0]) return null; // nothing to paginate
+  const btn = 'w-6 h-6 flex items-center justify-center rounded-md border border-bg-border text-text-secondary disabled:opacity-30 disabled:cursor-not-allowed enabled:hover:bg-bg-panel/60 transition-colors';
+  return (
+    <div className="flex items-center justify-between gap-3 pt-3 mt-2 border-t border-bg-border text-[11px]">
+      <select
+        value={pageSize}
+        onChange={(e) => setPageSize(Number(e.target.value))}
+        className="bg-bg-panel border border-bg-border text-text-secondary rounded-md pl-2 pr-1 py-1 font-semibold outline-none cursor-pointer [color-scheme:dark]"
+        title="Rows per page"
+      >
+        {PAGE_SIZES.map((n) => <option key={n} value={n}>{n} / Page</option>)}
+      </select>
+      <div className="flex items-center gap-2">
+        <span className="text-text-muted font-mono whitespace-nowrap">{start + 1}–{end} of {total}</span>
+        <button className={btn} onClick={() => setPage(Math.max(0, page - 1))} disabled={page <= 0} title="Previous page">
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </button>
+        <button className={btn} onClick={() => setPage(Math.min(maxPage, page + 1))} disabled={page >= maxPage} title="Next page">
+          <ChevronRight className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function AccountPositionCard({ acc }: { acc: any }) {
   // Each card fetches its own full live Delta view, so master AND follower
@@ -167,9 +215,11 @@ function stopLevels(stopOrders: any[]) {
 // ── Positions (live) — mirrors Delta's Positions tab ──────────────────────
 function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOrders: any[] }) {
   const open = (positions || []).filter((p) => Number(p.size) !== 0);
+  const pg = usePaged(open);
   if (open.length === 0) return <Empty text="No active open positions." />;
   const stopBySym = stopLevels(stopOrders);
   return (
+    <>
     <div className="overflow-x-auto">
       <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
         <thead>
@@ -181,7 +231,7 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.04] font-medium">
-          {open.map((p, i) => {
+          {pg.pageItems.map((p, i) => {
             const size = num(p.size) || 0;
             const cv = num(p.product?.contract_value) ?? 0.001;
             const unit = p.product?.underlying_asset?.symbol || 'BTC';
@@ -222,13 +272,17 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
         </tbody>
       </table>
     </div>
+    <Paginator {...pg} />
+    </>
   );
 }
 
 // ── Open Orders (live) — resting limit orders on Delta ────────────────────
 function OpenOrdersTab({ orders }: { orders: any[] }) {
+  const pg = usePaged(orders);
   if (orders.length === 0) return <Empty text="No active open orders." />;
   return (
+    <>
     <div className="overflow-x-auto">
       <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
         <thead>
@@ -240,7 +294,7 @@ function OpenOrdersTab({ orders }: { orders: any[] }) {
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.04] font-medium">
-          {orders.map((o: any, i: number) => {
+          {pg.pageItems.map((o: any, i: number) => {
             const size = num(o.size) || 0;
             const sell = String(o.side) === 'sell';
             const qty = sell ? -size : size;
@@ -276,11 +330,14 @@ function OpenOrdersTab({ orders }: { orders: any[] }) {
         </tbody>
       </table>
     </div>
+    <Paginator {...pg} />
+    </>
   );
 }
 
 // ── Stop Orders (live) — reduce-only stops resting on Delta ────────────────
 function StopOrdersTab({ orders }: { orders: any[] }) {
+  const pg = usePaged(orders);
   if (orders.length === 0) return <Empty text="No active stop orders." />;
   const typeLabel = (o: any) => {
     const t = String(o.stop_order_type || '');
@@ -288,6 +345,7 @@ function StopOrdersTab({ orders }: { orders: any[] }) {
     return o.bracket_order ? `Bracket - ${kind}` : kind;
   };
   return (
+    <>
     <div className="overflow-x-auto">
       <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
         <thead>
@@ -299,7 +357,7 @@ function StopOrdersTab({ orders }: { orders: any[] }) {
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.04] font-medium">
-          {orders.map((o: any, i: number) => {
+          {pg.pageItems.map((o: any, i: number) => {
             const size = num(o.size) || 0;
             const sell = String(o.side) === 'sell';
             const qty = sell ? -size : size;
@@ -333,13 +391,17 @@ function StopOrdersTab({ orders }: { orders: any[] }) {
         </tbody>
       </table>
     </div>
+    <Paginator {...pg} />
+    </>
   );
 }
 
 // ── Fills (live) — individual leg executions from Delta ────────────────────
 function FillsTab({ fills }: { fills: any[] }) {
+  const pg = usePaged(fills);
   if (fills.length === 0) return <Empty text="No fills yet." />;
   return (
+    <>
     <div className="overflow-x-auto">
       <table className="w-full text-left text-xs border-collapse whitespace-nowrap">
         <thead>
@@ -351,7 +413,7 @@ function FillsTab({ fills }: { fills: any[] }) {
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.04] font-medium">
-          {fills.map((f: any, i: number) => {
+          {pg.pageItems.map((f: any, i: number) => {
             const size = num(f.size) || 0;
             const sell = String(f.side) === 'sell';
             const cv = num(f.product?.contract_value) ?? 0.001;
@@ -380,21 +442,23 @@ function FillsTab({ fills }: { fills: any[] }) {
         </tbody>
       </table>
     </div>
+    <Paginator {...pg} />
+    </>
   );
 }
 
 // ── Order History (live) — Delta's real order-history feed ─────────────────
 function HistoryTab({ history }: { history: any[] }) {
   const [filterDate, setFilterDate] = useState('');
-  if (!history?.length) return <Empty text="No recent orders." />;
-
   const localYmd = (v: any) => {
     try {
       const d = new Date(v);
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     } catch { return ''; }
   };
-  const rows = history.filter((o) => !filterDate || localYmd(o.updated_at ?? o.created_at) === filterDate);
+  const rows = (history || []).filter((o) => !filterDate || localYmd(o.updated_at ?? o.created_at) === filterDate);
+  const pg = usePaged(rows);
+  if (!history?.length) return <Empty text="No recent orders." />;
 
   const statusLabel = (o: any) => {
     const s = String(o.state || '').toLowerCase();
@@ -451,7 +515,7 @@ function HistoryTab({ history }: { history: any[] }) {
               </tr>
             </thead>
             <tbody className="divide-y divide-white/[0.04] font-medium">
-              {rows.map((o: any, i: number) => {
+              {pg.pageItems.map((o: any, i: number) => {
                 const size = num(o.size) || 0;
                 const sell = String(o.side) === 'sell';
                 const filled = Math.max(0, size - (num(o.unfilled_size) ?? 0));
@@ -488,6 +552,7 @@ function HistoryTab({ history }: { history: any[] }) {
           </table>
         </div>
       )}
+      <Paginator {...pg} />
     </div>
   );
 }
