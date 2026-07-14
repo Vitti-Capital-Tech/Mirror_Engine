@@ -476,19 +476,25 @@ class CopyEngine:
                         logger.error(f"Failed to (re)place bracket to {follower['name']}: {e} {body}")
                 continue
 
-            # CLOSE via limit (reduce-only): size it by rebalancing to the master's
-            # REMAINING position, not by the master's close-chunk size. Otherwise a
-            # 1-lot master trim would close a whole follower lot (min-1) and wipe a
-            # small follower after a few trims.
+            # CLOSE via limit (reduce-only): REST a matching reduce-only limit on
+            # the follower (same limit price) so it exits at the same level as the
+            # master — rather than waiting to close reactively when the master's
+            # order fills. Size = the follower's share of the master's close order
+            # (min_one=False so a tiny master trim doesn't wipe a small follower),
+            # CAPPED at what the follower actually holds so it can never over-close
+            # or hit a "no position" reject. reduce_only also caps it exchange-side.
             if reduce_only and not is_update:
-                cq, cur = await self._follower_close_qty(client, follower, symbol, master_row, ref_price)
-                if cq is None:
-                    pass  # master size unknown → fall through with the mirrored qty
-                elif cq < 1:
-                    logger.info(f"No close needed for {follower['name']} on {symbol}: holds {cur:.0f} (rebalance says 0)")
+                want = self.risk_engine.calculate_follower_quantity(
+                    master_qty, ref_price, follower, round_up=False, min_one=False
+                )
+                try:
+                    held = int(await self._position_size(client, symbol))
+                except Exception:
+                    held = 0
+                qty = min(int(want), held)
+                if qty < 1:
+                    logger.info(f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest (want {int(want)}, holds {held})")
                     continue
-                else:
-                    qty = cq
 
             # Plain limit order: if the master EDITED it, edit the follower's
             # existing order instead of placing a duplicate.
