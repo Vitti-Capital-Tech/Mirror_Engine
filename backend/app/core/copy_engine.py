@@ -27,6 +27,11 @@ class CopyEngine:
         # burst of protective cancels doesn't fire a get_positions REST call each.
         self._master_pos_cache: dict = {}
         self._MASTER_POS_TTL = 3.0  # seconds
+        # Protective orders seen as "orphan" (master no longer has them) in the
+        # PREVIOUS sync sweep. We only cancel a follower's SL/TP after it's been an
+        # orphan for two consecutive sweeps, so a master bracket edit
+        # (cancel-and-replace, momentarily no stop) can't cause a wrong cancel.
+        self._prot_orphans_prev: set = set()
 
     async def process_fill(self, event_dict: dict) -> None:
         """
@@ -424,6 +429,7 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"sync_protection: failed to load followers: {e}")
             return
+        current_orphans: set = set()
         for fol in followers:
             client = await self._get_follower_client(fol)
             if not client:
@@ -449,7 +455,14 @@ class CopyEngine:
                         continue  # master no longer holds this symbol — exit path handles it
                     if (sym, stype) in master_prot:
                         continue  # master still has this protection — keep it
-                    # Orphan: master holds the position but dropped this SL/TP.
+                    # Orphan candidate: master holds the position but has no such
+                    # SL/TP. Only cancel if it was ALSO an orphan last sweep, so a
+                    # transient mid-edit snapshot can't trigger a wrong cancel.
+                    okey = (fol.get("id"), sym, stype)
+                    current_orphans.add(okey)
+                    if okey not in self._prot_orphans_prev:
+                        logger.info(f"sync_protection: {stype} on {sym} for {fol.get('name')} looks orphaned — confirming next sweep before cancelling")
+                        continue
                     try:
                         await client.cancel_order(str(o.get("id")), product_id=o.get("product_id"))
                         logger.info(f"sync_protection: cancelled orphan {stype} on {sym} for {fol.get('name')} (master removed it)")
@@ -457,6 +470,8 @@ class CopyEngine:
                         logger.warning(f"sync_protection: failed to cancel {stype} on {sym} for {fol.get('name')}: {e}")
             except Exception as e:
                 logger.warning(f"sync_protection: error for {fol.get('name')}: {e}")
+        # Remember this sweep's orphans so the next sweep can confirm them.
+        self._prot_orphans_prev = current_orphans
 
     async def _sync_followers_to_master_exit(self, event: dict) -> None:
         """A master SL/TP order FILLED. If it flattened the master on this symbol,
