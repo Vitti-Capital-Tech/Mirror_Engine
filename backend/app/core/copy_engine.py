@@ -178,7 +178,7 @@ class CopyEngine:
                         )
                         continue
             else:
-                follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=False)
+                follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
 
             tasks.append(order_executor.execute(
                 client=client,
@@ -487,7 +487,7 @@ class CopyEngine:
             follower["master_balance"] = master_balance
             # Floor so the mirrored order quantity matches the follower's position
             # (which was also floored on open). reduce_only caps it anyway.
-            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=False)
+            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
             client = await self._get_follower_client(follower)
             if not client:
                 continue
@@ -598,8 +598,12 @@ class CopyEngine:
                         f"{signed:+.0f} — not reducible by a {side}, skipping (position desync?)"
                     )
                     continue
+                # Ceil (round_up) so a small master close (whose follower share is
+                # a fraction, e.g. 0.5) still punches ≥1 lot instead of flooring to
+                # 0 and silently dropping the order. Capped at the follower's
+                # holding + reduce_only, so it can't over-close.
                 want = self.risk_engine.calculate_follower_quantity(
-                    master_qty, ref_price, follower, round_up=False, min_one=False
+                    master_qty, ref_price, follower, round_up=True, min_one=False
                 )
                 qty = min(int(want), int(abs(signed)))
                 if qty < 1:

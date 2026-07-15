@@ -229,8 +229,9 @@ class PositionMonitor:
             
             follower_account["master_balance"] = master_balance
 
-            # 4. Calculate expected qty
-            expected_qty = self.risk_engine.calculate_follower_quantity(master_qty, follower_price, follower_account)
+            # 4. Calculate expected qty (ceil, to match how orders are actually
+            #    sized/placed — otherwise flooring here would flag false mismatches)
+            expected_qty = self.risk_engine.calculate_follower_quantity(master_qty, follower_price, follower_account, round_up=True)
             if master_qty == 0:
                 expected_qty = 0.0
 

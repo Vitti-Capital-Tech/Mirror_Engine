@@ -90,9 +90,13 @@ class RiskEngine:
 
         Returns the quantity as an integer (Delta Exchange uses integer lot sizes).
 
-        round_up=False (opens): floor the result so we never over-expose.
-        round_up=True (closes): ceil the result so a reduce-only close never
-        leaves a residual — combined with reduce_only it can't over-close.
+        round_up=True: ceil the result — used for all ORDER PLACEMENT (opens and
+        reduce-only closes) so a small master order whose follower share is a
+        fraction (e.g. 0.5) still punches ≥1 lot instead of flooring to 0 and
+        being silently dropped. Over-exposure is at most <1 lot on opens, and
+        reduce_only caps closes so they can't over-close.
+        round_up=False: floor — used ONLY for a rebalance TARGET (how much the
+        follower should still hold), which must be able to reach 0.
         """
         allocation_mode: str = account.get("allocation_mode") or "multiplier"
         allocation_value: float = account.get("allocation_value") or 1.0
