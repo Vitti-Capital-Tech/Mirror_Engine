@@ -397,6 +397,66 @@ class CopyEngine:
             await self._mirror_cancel(master_order_id, event)
         elif action == "exit":
             await self._sync_followers_to_master_exit(event)
+        elif action == "sync_protection":
+            await self._sync_protection(event)
+
+    async def _sync_protection(self, event: dict) -> None:
+        """Cancel any follower SL/TP whose master counterpart no longer exists.
+
+        Removing a position's TP/SL on the master doesn't always emit a WS cancel
+        event, so relying on _mirror_cancel alone can leave a follower's stop
+        resting after the master dropped it. This reconciliation (driven by the
+        listener's periodic sweep) matches by (symbol, stop_order_type), ignoring
+        the jittered price: if the master holds the position but has NO protective
+        order of that type, the follower's matching one is an orphan → cancel it.
+        We only touch symbols the master still holds (a flat master is handled by
+        the exit-close path), so we never strip protection the master still wants."""
+        owner_id = event.get("owner_id")
+        master_prot = {(s, t) for s, t in (event.get("master_protection") or [])}
+        master_symbols = set(event.get("master_symbols") or [])
+        if not master_symbols:
+            return
+        try:
+            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            if owner_id:
+                fq = fq.eq("owner_id", owner_id)
+            followers = fq.execute().data or []
+        except Exception as e:
+            logger.error(f"sync_protection: failed to load followers: {e}")
+            return
+        for fol in followers:
+            client = await self._get_follower_client(fol)
+            if not client:
+                continue
+            try:
+                orders = []
+                seen = set()
+                for st in ("pending", "open"):
+                    try:
+                        for o in await client.get_open_orders(state=st):
+                            if o.get("id") in seen:
+                                continue
+                            seen.add(o.get("id"))
+                            orders.append(o)
+                    except Exception:
+                        pass
+                for o in orders:
+                    stype = o.get("stop_order_type")
+                    sym = o.get("product_symbol")
+                    if not stype or not sym:
+                        continue  # only protective (SL/TP) orders
+                    if sym not in master_symbols:
+                        continue  # master no longer holds this symbol — exit path handles it
+                    if (sym, stype) in master_prot:
+                        continue  # master still has this protection — keep it
+                    # Orphan: master holds the position but dropped this SL/TP.
+                    try:
+                        await client.cancel_order(str(o.get("id")), product_id=o.get("product_id"))
+                        logger.info(f"sync_protection: cancelled orphan {stype} on {sym} for {fol.get('name')} (master removed it)")
+                    except Exception as e:
+                        logger.warning(f"sync_protection: failed to cancel {stype} on {sym} for {fol.get('name')}: {e}")
+            except Exception as e:
+                logger.warning(f"sync_protection: error for {fol.get('name')}: {e}")
 
     async def _sync_followers_to_master_exit(self, event: dict) -> None:
         """A master SL/TP order FILLED. If it flattened the master on this symbol,

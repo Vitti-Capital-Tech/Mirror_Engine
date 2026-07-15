@@ -91,21 +91,33 @@ class TradeListener:
     async def _reconcile_orders(self) -> None:
         if not self.client or not self.master_account:
             return
+        # Fetch the master's resting orders across both states (limits rest in
+        # 'open', stop/SL/TP in 'pending').
+        orders = []
+        seen = set()
         try:
-            orders = await self.client.get_open_orders(state="open")
+            for st in ("open", "pending"):
+                for o in await self.client.get_open_orders(state=st):
+                    if o.get("id") in seen:
+                        continue
+                    seen.add(o.get("id"))
+                    orders.append(o)
         except Exception as e:
             logger.warning("Reconcile: could not fetch master open orders: %s", e)
             return
+
+        # 1) Re-mirror missing plain limit orders (entries + reduce-only closes).
         pushed = 0
-        for o in orders or []:
+        master_protection = []  # (symbol, stop_order_type) the master currently protects with
+        for o in orders:
             order_type = o.get("order_type") or ""
             is_stop = bool(o.get("stop_order_type") or o.get("stop_price"))
             is_bracket = bool(o.get("bracket_order")) or str((o.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL")
-            # Resting limit orders (entries AND reduce-only closes). Brackets/stops
-            # are excluded: they're placed via the position-open path and aren't
-            # tracked by master_order_id, so reconciling them could double-place.
-            # Plain limits are safe — the copy engine's per-order idempotency
-            # guard means this only fills genuine gaps.
+            if is_stop and o.get("stop_order_type") and o.get("product_symbol"):
+                master_protection.append([o.get("product_symbol"), o.get("stop_order_type")])
+            # Brackets/stops excluded from re-mirror (placed via position-open path;
+            # reconciling them could double-place). Plain limits are safe — the copy
+            # engine's per-order idempotency guard means this only fills gaps.
             if order_type != "limit_order" or is_stop or is_bracket:
                 continue
             if (o.get("state") or "").lower() != "open":
@@ -114,6 +126,28 @@ class TradeListener:
             pushed += 1
         if pushed:
             logger.info("Reconcile: re-mirrored %d resting limit order(s) for master %s", pushed, self.master_account.get("name"))
+
+        # 2) Sync protection removal: if the master dropped a position's SL/TP, tell
+        # the copy engine to cancel the follower's orphan. Scoped to symbols the
+        # master still holds, so a flat master (handled by the exit path) is skipped.
+        try:
+            master_symbols = [
+                (p.get("product_symbol") or p.get("symbol"))
+                for p in await self.client.get_positions()
+                if float(p.get("size") or 0) != 0
+            ]
+            master_symbols = [s for s in master_symbols if s]
+        except Exception as e:
+            logger.warning("Reconcile: could not fetch master positions for protection sync: %s", e)
+            master_symbols = []
+        if master_symbols:
+            payload = {
+                "action": "sync_protection",
+                "owner_id": (self.master_account or {}).get("owner_id"),
+                "master_protection": master_protection,
+                "master_symbols": master_symbols,
+            }
+            await self.redis.lpush("order_events", json.dumps(payload))
 
     async def on_order_fill(self, order: dict) -> None:
         """
