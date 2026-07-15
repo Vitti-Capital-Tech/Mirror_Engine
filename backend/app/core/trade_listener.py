@@ -139,12 +139,20 @@ class TradeListener:
 
             # ---- 1. Fills ----
             if reason == "fill" or state == "filled":
-                # Only market (non-stop) fills are copied as market orders.
-                # Limit and stop orders were mirrored as resting orders that fill
-                # on their own, so we skip copying their fills.
                 if order_type == "market_order" and not is_stop:
+                    # Plain market fill -> copy as a market order (entry/close).
                     await self._push_fill_event(order)
+                elif is_stop:
+                    # A master SL/TP just FILLED — it (partly) closed the master's
+                    # position. Push an exit event so the copy engine closes any
+                    # follower still holding, matching the master's exit. This is
+                    # a direct backstop against a naked follower that doesn't rely
+                    # on the OCO cancel of the paired bracket leg.
+                    logger.info("Master stop filled (%s) — syncing followers to master exit", order.get("product_symbol"))
+                    await self._push_order_event(order, "exit")
                 else:
+                    # Plain limit fill: its mirrored follower limit fills on its
+                    # own, so nothing to copy here.
                     logger.info("Skipping fill copy for resting %s (mirrored separately)", order_type)
                 return
 

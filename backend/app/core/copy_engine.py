@@ -386,14 +386,54 @@ class CopyEngine:
         return client
 
     async def process_order_event(self, event: dict) -> None:
-        """Mirror a master's resting order onto followers (place) or cancel the
-        mirrored follower orders (cancel)."""
+        """Mirror a master's resting order onto followers (place), cancel the
+        mirrored follower orders (cancel), or — when a master SL/TP fills —
+        close followers to match the master's exit (exit)."""
         action = event.get("action")
         master_order_id = str(event.get("master_order_id"))
         if action == "place":
             await self._mirror_place(event, master_order_id)
         elif action == "cancel":
             await self._mirror_cancel(master_order_id, event)
+        elif action == "exit":
+            await self._sync_followers_to_master_exit(event)
+
+    async def _sync_followers_to_master_exit(self, event: dict) -> None:
+        """A master SL/TP order FILLED. If it flattened the master on this symbol,
+        market-close (reduce-only) every follower's remaining position so none is
+        left holding a naked position — a direct backstop that doesn't depend on
+        the OCO cancel of the paired bracket leg (covers a lone stop or a missed
+        cancel event). If the master still holds (partial stop fill), do NOTHING:
+        the follower keeps its position and its own protective orders. Safe to run
+        alongside the cancel-path close — reduce-only close is a no-op once flat."""
+        symbol = event.get("symbol")
+        owner_id = event.get("owner_id")
+        if not symbol:
+            return
+        try:
+            mq = self.db.table("accounts").select("*").eq("is_master", True)
+            if owner_id:
+                mq = mq.eq("owner_id", owner_id)
+            mrow = mq.execute()
+            master_row = mrow.data[0] if mrow.data else None
+        except Exception:
+            master_row = None
+        master_sz = await self._master_position_size(master_row, symbol, fresh=True)
+        if master_sz is None or master_sz != 0:
+            logger.info(f"Master stop filled on {symbol} but master still holds ({master_sz}); leaving followers as-is.")
+            return
+        logger.info(f"Master stop hit flattened {symbol} — closing any remaining follower positions to match.")
+        try:
+            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            if owner_id:
+                fq = fq.eq("owner_id", owner_id)
+            fols = fq.execute().data or []
+        except Exception:
+            fols = []
+        for fol in fols:
+            fclient = await self._get_follower_client(fol)
+            if fclient:
+                await self._close_follower_position(fclient, symbol, fol.get("name"))
 
     async def _mirror_place(self, event: dict, master_order_id: str) -> None:
         symbol = event.get("symbol")
