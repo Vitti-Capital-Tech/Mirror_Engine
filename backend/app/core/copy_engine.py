@@ -265,6 +265,41 @@ class CopyEngine:
         return 0.0
 
     @staticmethod
+    async def _position_size_signed(client, symbol: str) -> float:
+        """Live SIGNED position size (negative = short, positive = long; 0 if none)."""
+        try:
+            for p in await client.get_positions():
+                s = p.get("product_symbol") or p.get("symbol")
+                if s == symbol:
+                    return float(p.get("size") or 0)
+        except Exception as e:
+            logger.warning(f"Signed position fetch failed for {symbol}: {e}")
+        return 0.0
+
+    async def _place_order_with_retry(self, client, attempts: int = 2, delay: float = 5.0, **kwargs):
+        """Place an order, retrying TRANSIENT failures (network / 5xx / 429 /
+        timeout) after `delay` seconds — the teammate's "wait 5s then retry"
+        rule. A 4xx validation error (e.g. reduce-only side mismatch, bad price)
+        is deterministic, so we don't waste retries on it; it's raised at once
+        for the caller to log. The 30s reconcile pass is the longer-term retry."""
+        last = None
+        for i in range(max(1, attempts)):
+            try:
+                return await client.place_order(**kwargs)
+            except Exception as e:
+                last = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise  # permanent client error — retrying won't help
+                if i < attempts - 1:
+                    logger.warning(
+                        f"place_order transient failure ({status or e}); retrying in {delay:.0f}s "
+                        f"[{kwargs.get('symbol')} {kwargs.get('side')} {kwargs.get('size')}]"
+                    )
+                    await asyncio.sleep(delay)
+        raise last
+
+    @staticmethod
     async def _order_is_live(client, order_id: str) -> bool:
         """True if the given order id is still resting (open/pending) on the
         account. On any fetch error, return True so we never risk double-placing
@@ -507,16 +542,28 @@ class CopyEngine:
             # CAPPED at what the follower actually holds so it can never over-close
             # or hit a "no position" reject. reduce_only also caps it exchange-side.
             if reduce_only and not is_update:
+                # A reduce-only order must be on the OPPOSITE side of the
+                # follower's position: a buy reduces a short, a sell reduces a
+                # long. If the follower is flat or on the SAME side (a position
+                # desync vs the master), the order can never reduce anything and
+                # Delta rejects it with a 400 — so skip instead of churning.
+                try:
+                    signed = float(await self._position_size_signed(client, symbol))
+                except Exception:
+                    signed = 0.0
+                reduces = (side == "buy" and signed < 0) or (side == "sell" and signed > 0)
+                if not reduces:
+                    logger.info(
+                        f"Reduce-only {side} for {follower['name']} on {symbol}: follower holds "
+                        f"{signed:+.0f} — not reducible by a {side}, skipping (position desync?)"
+                    )
+                    continue
                 want = self.risk_engine.calculate_follower_quantity(
                     master_qty, ref_price, follower, round_up=False, min_one=False
                 )
-                try:
-                    held = int(await self._position_size(client, symbol))
-                except Exception:
-                    held = 0
-                qty = min(int(want), held)
+                qty = min(int(want), int(abs(signed)))
                 if qty < 1:
-                    logger.info(f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest (want {int(want)}, holds {held})")
+                    logger.info(f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest (want {int(want)}, holds {abs(signed):.0f})")
                     continue
 
             # Plain limit order: if the master EDITED it, edit the follower's
@@ -537,7 +584,8 @@ class CopyEngine:
                     # fall through to place a fresh order (the mapped one was gone)
 
             try:
-                resp = await client.place_order(
+                resp = await self._place_order_with_retry(
+                    client,
                     symbol=symbol,
                     side=side,
                     size=int(qty),
@@ -568,8 +616,18 @@ class CopyEngine:
                             side, int(qty), reduce_only, master_row,
                         ))
             except Exception as e:
-                body = getattr(getattr(e, "response", None), "text", "")
-                logger.error(f"Failed to mirror order to {follower['name']}: {e} {body}")
+                resp_obj = getattr(e, "response", None)
+                body = ""
+                if resp_obj is not None:
+                    try:
+                        body = resp_obj.text
+                    except Exception:
+                        body = ""
+                logger.error(
+                    f"Failed to mirror order to {follower['name']} "
+                    f"[{symbol} {side} qty={qty} type={order_type} reduce_only={reduce_only} "
+                    f"limit={limit_price} stop={stop_price}]: {e} | body={body}"
+                )
 
     @staticmethod
     def _order_done(od: dict) -> bool:
