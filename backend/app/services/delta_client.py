@@ -304,12 +304,31 @@ class DeltaClient:
         return resp.json()
 
     async def get_open_orders(self, state: str = "open") -> list:
-        """Fetch active orders in the given state ('open' or 'pending')."""
-        path = f"/v2/orders?state={state}"
-        headers = self._get_headers("GET", path)
-        resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("result", [])
+        """Fetch ALL active orders in the given state ('open' or 'pending').
+
+        Delta's default page size is only 10, so an account with more resting
+        orders was silently truncated — orders past the first page were invisible
+        to mirroring / cancelling / the dashboard. Page through with the `after`
+        cursor (100/page) so we always get the complete set.
+        """
+        import urllib.parse
+
+        all_orders: list = []
+        after: Optional[str] = None
+        for _ in range(50):  # safety cap: 50 pages × 100 = 5000 orders
+            path = f"/v2/orders?state={state}&page_size=100"
+            if after:
+                path += f"&after={urllib.parse.quote(after, safe='')}"
+            headers = self._get_headers("GET", path)
+            resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result", []) or []
+            all_orders.extend(result)
+            after = (data.get("meta") or {}).get("after")
+            if not after or not result:
+                break
+        return all_orders
 
     # ------------------------------------------------------------------
     # WebSocket
