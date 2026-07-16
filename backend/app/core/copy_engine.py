@@ -474,41 +474,13 @@ class CopyEngine:
         self._prot_orphans_prev = current_orphans
 
     async def _sync_followers_to_master_exit(self, event: dict) -> None:
-        """A master SL/TP order FILLED. If it flattened the master on this symbol,
-        market-close (reduce-only) every follower's remaining position so none is
-        left holding a naked position — a direct backstop that doesn't depend on
-        the OCO cancel of the paired bracket leg (covers a lone stop or a missed
-        cancel event). If the master still holds (partial stop fill), do NOTHING:
-        the follower keeps its position and its own protective orders. Safe to run
-        alongside the cancel-path close — reduce-only close is a no-op once flat."""
-        symbol = event.get("symbol")
-        owner_id = event.get("owner_id")
-        if not symbol:
-            return
-        try:
-            mq = self.db.table("accounts").select("*").eq("is_master", True)
-            if owner_id:
-                mq = mq.eq("owner_id", owner_id)
-            mrow = mq.execute()
-            master_row = mrow.data[0] if mrow.data else None
-        except Exception:
-            master_row = None
-        master_sz = await self._master_position_size(master_row, symbol, fresh=True)
-        if master_sz is None or master_sz != 0:
-            logger.info(f"Master stop filled on {symbol} but master still holds ({master_sz}); leaving followers as-is.")
-            return
-        logger.info(f"Master stop hit flattened {symbol} — closing any remaining follower positions to match.")
-        try:
-            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
-            if owner_id:
-                fq = fq.eq("owner_id", owner_id)
-            fols = fq.execute().data or []
-        except Exception:
-            fols = []
-        for fol in fols:
-            fclient = await self._get_follower_client(fol)
-            if fclient:
-                await self._close_follower_position(fclient, symbol, fol.get("name"))
+        """Retired by strategy decision: we no longer force-close followers when a
+        master SL/TP fills. Each follower has its own mirrored (jittered) SL/TP
+        that closes its position at ~the same level; forcing a market close caused
+        wasteful sell-then-buyback round-trips with bad fills in fast moves. Kept
+        as a no-op so any stray 'exit' event can't reintroduce a forced close."""
+        logger.debug("exit event ignored (%s) — followers close via their own jittered SL/TP", (event or {}).get("symbol"))
+        return
 
     async def _mirror_place(self, event: dict, master_order_id: str) -> None:
         symbol = event.get("symbol")
@@ -895,24 +867,13 @@ class CopyEngine:
                 master_row = None
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
-                # Master EXITED this symbol (its SL/TP hit / it closed). Make sure
-                # every follower also exits — market-close any remaining follower
-                # position (reduce-only). If a follower's own jittered bracket
-                # already closed it, this is a no-op. Prevents followers being
-                # left holding a position the master has already closed.
-                logger.info(f"Master exited {symbol} — closing any remaining follower positions to match.")
-                owner_id = event.get("owner_id")
-                try:
-                    fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
-                    if owner_id:
-                        fq = fq.eq("owner_id", owner_id)
-                    fols = fq.execute().data or []
-                except Exception:
-                    fols = []
-                for fol in fols:
-                    fclient = await self._get_follower_client(fol)
-                    if fclient:
-                        await self._close_follower_position(fclient, symbol, fol.get("name"))
+                # Master EXITED this symbol (its SL/TP hit / it closed). By strategy
+                # decision we do NOT force-close followers and we do NOT strip their
+                # protection: each follower has its own mirrored (jittered) SL/TP
+                # that closes its position at ~the same level. Forcing a market
+                # close caused wasteful sell-then-buyback round-trips with bad fills
+                # in fast moves. Leave the follower's brackets to do the work.
+                logger.info(f"Master exited {symbol} — leaving followers to their own jittered SL/TP (no forced close).")
                 return
             # else: master still holds it (or size unknown) -> genuine cancel, propagate.
 

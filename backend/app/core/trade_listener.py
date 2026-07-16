@@ -177,13 +177,12 @@ class TradeListener:
                     # Plain market fill -> copy as a market order (entry/close).
                     await self._push_fill_event(order)
                 elif is_stop:
-                    # A master SL/TP just FILLED — it (partly) closed the master's
-                    # position. Push an exit event so the copy engine closes any
-                    # follower still holding, matching the master's exit. This is
-                    # a direct backstop against a naked follower that doesn't rely
-                    # on the OCO cancel of the paired bracket leg.
-                    logger.info("Master stop filled (%s) — syncing followers to master exit", order.get("product_symbol"))
-                    await self._push_order_event(order, "exit")
+                    # A master SL/TP just FILLED. By strategy decision we do NOT
+                    # force-close followers here — each follower has its own
+                    # mirrored (jittered) SL/TP that closes its position at ~the
+                    # same level. Forcing a market close caused wasteful
+                    # sell-then-buyback round-trips with bad fills in fast moves.
+                    logger.info("Master stop filled (%s) — leaving followers to their own jittered SL/TP (no forced close)", order.get("product_symbol"))
                 else:
                     # Plain limit fill: its mirrored follower limit fills on its
                     # own, so nothing to copy here.
