@@ -26,6 +26,7 @@ class CopyEngine:
         # Short-lived cache of master position sizes {symbol: (size, ts)} so a
         # burst of protective cancels doesn't fire a get_positions REST call each.
         self._master_pos_cache: dict = {}
+        self._master_signed_cache: dict = {}  # {symbol: (signed_size, ts)}
         self._MASTER_POS_TTL = 3.0  # seconds
         # Protective orders seen as "orphan" (master no longer has them) in the
         # PREVIOUS sync sweep. We only cancel a follower's SL/TP after it's been an
@@ -138,11 +139,18 @@ class CopyEngine:
         # (the old ceil(master_close × ratio) rounded every tiny trim up to a
         # full follower lot).
         is_exit = trade_type in ("exit", "sl")
+        master_row = master_acc.data[0] if master_acc.data else None
 
         master_remaining = None
+        master_signed_now = None
         if is_exit:
-            master_row = master_acc.data[0] if master_acc.data else None
             master_remaining = await self._master_position_size(master_row, symbol)
+        else:
+            # Entry: confirm the master actually holds a SAME-side position. Guards
+            # against a master CLOSE that wasn't flagged reduce_only — without this
+            # the follower would OPEN an opposite position the master doesn't have
+            # ("we were closing and we opened"). Fresh read to avoid a stale cache.
+            master_signed_now = await self._master_position_signed(master_row, symbol, fresh=True)
 
         tasks = []
         for follower in followers:
@@ -183,6 +191,19 @@ class CopyEngine:
                         )
                         continue
             else:
+                # Only open if the master genuinely holds a same-side position.
+                # If the master is flat/opposite, this "entry" was really a close
+                # that wasn't flagged reduce_only — don't open on the follower.
+                same_side = master_signed_now is not None and (
+                    (side.lower() == "buy" and master_signed_now > 0)
+                    or (side.lower() == "sell" and master_signed_now < 0)
+                )
+                if master_signed_now is not None and not same_side:
+                    logger.info(
+                        f"Skipping follower OPEN for {follower['name']} {symbol} {side}: "
+                        f"master holds {master_signed_now:+.0f} — not a genuine open (likely an unflagged close)."
+                    )
+                    continue
                 follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
 
             tasks.append(order_executor.execute(
@@ -380,6 +401,29 @@ class CopyEngine:
             logger.error(f"Master position size fetch failed for {symbol}: {e}")
             return None
 
+    async def _master_position_signed(self, master_row: dict, symbol: str, fresh: bool = False):
+        """Live SIGNED master position for a symbol (negative=short, positive=long,
+        0=flat). Cached ~3s. Used to tell whether a master order OPENS or CLOSES:
+        an order opposite the master's held side is a close/reduce, even when the
+        master didn't set the reduce_only flag. Returns None if undeterminable."""
+        if not master_row:
+            return None
+        if not fresh:
+            cached = self._master_signed_cache.get(symbol)
+            if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
+                return cached[0]
+        try:
+            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
+            try:
+                signed = await self._position_size_signed(mc, symbol)
+            finally:
+                await mc.close()
+            self._master_signed_cache[symbol] = (signed, time.time())
+            return signed
+        except Exception as e:
+            logger.error(f"Master signed position fetch failed for {symbol}: {e}")
+            return None
+
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
         if not client:
@@ -528,6 +572,22 @@ class CopyEngine:
         product_id = event.get("product_id")
         stop_order_type = event.get("stop_order_type")
         trigger_method = event.get("stop_trigger_method") or "mark_price"
+
+        # Infer a CLOSE even when the master didn't set reduce_only: if this order
+        # is on the OPPOSITE side of the master's current position, it's reducing
+        # the master (a close/trim), not opening. Treat it as reduce-only so we
+        # NEVER open a fresh follower position for a master close — followers then
+        # only reduce their matching position (and do nothing if they hold none).
+        if not reduce_only and not is_bracket and stop_price is None and master_row:
+            msigned = await self._master_position_signed(master_row, symbol)
+            if msigned is not None and (
+                (side == "sell" and msigned > 0) or (side == "buy" and msigned < 0)
+            ):
+                logger.info(
+                    f"Inferred reduce-only for {symbol} {side}: master holds {msigned:+.0f} "
+                    f"(order reduces it, reduce_only flag was not set)"
+                )
+                reduce_only = True
 
         ref_price = limit_price or stop_price or 0.0
         for follower in followers:
