@@ -8,8 +8,28 @@ from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
 from app.services.delta_client import DeltaClient
+from app.services import telegram_client as tg
 
 logger = logging.getLogger(__name__)
+
+
+def _short_reason(exc, body: str = "") -> str:
+    """Turn a Delta error into a short human reason for a notification."""
+    import json as _json
+    if body:
+        try:
+            j = _json.loads(body)
+            err = (j or {}).get("error")
+            if isinstance(err, dict):
+                code = err.get("code") or err.get("message")
+                if code:
+                    return str(code).replace("_", " ")
+            if isinstance(err, str):
+                return err.replace("_", " ")
+        except Exception:
+            pass
+    s = str(exc)
+    return (s[:120] + "…") if len(s) > 120 else s
 
 # If a mirrored LIMIT order hasn't filled after this window (checked twice:
 # wait, then retry-wait), escalate it to a full-or-nothing market order.
@@ -223,6 +243,22 @@ class CopyEngine:
             results = await asyncio.gather(*tasks)
         if ts_detected:
             logger.info(f"[LATENCY] {symbol}: {(time.time() - ts_detected):.2f}s end-to-end (detection → followers executed)")
+
+        # 4b. Telegram notifications — one clean message per follower outcome.
+        for r in results:
+            acct = r.get("account_name") or "Follower"
+            st = r.get("status")
+            if st == "filled":
+                lots = r.get("filled_quantity")
+                px = r.get("execution_price")
+                if is_exit:
+                    asyncio.create_task(tg.notify_close(acct, symbol, lots, px))
+                else:
+                    asyncio.create_task(tg.notify_open(acct, symbol, side, lots, px))
+            elif st == "failed":
+                reason = r.get("failure_reason") or "order not filled"
+                key = f"fail:{r.get('account_id')}:{symbol}:{side}:{'exit' if is_exit else 'entry'}"
+                asyncio.create_task(tg.notify_fail(acct, symbol, side, None, reason, key=key))
 
         # 5. Determine final master trade status
         filled_count = sum(1 for r in results if r.get("status") == "filled")
@@ -779,6 +815,10 @@ class CopyEngine:
                     f"[{symbol} {side} qty={qty} type={order_type} reduce_only={reduce_only} "
                     f"limit={limit_price} stop={stop_price}]: {e} | body={body}"
                 )
+                key = f"fail:{follower['id']}:{symbol}:{side}:place"
+                asyncio.create_task(tg.notify_fail(
+                    follower.get("name"), symbol, side, int(qty), _short_reason(e, body), key=key,
+                ))
 
     @staticmethod
     def _order_done(od: dict) -> bool:
@@ -861,6 +901,11 @@ class CopyEngine:
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {market_qty} (order {oid})")
+                acct = follower.get("name") or "Follower"
+                if reduce_only:
+                    asyncio.create_task(tg.notify_close(acct, symbol, int(market_qty)))
+                else:
+                    asyncio.create_task(tg.notify_open(acct, symbol, side, int(market_qty)))
             except Exception as e:
                 resp_obj = getattr(e, "response", None)
                 body = ""
@@ -874,6 +919,10 @@ class CopyEngine:
                     f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} tif=fok]: "
                     f"{e} | body={body}"
                 )
+                key = f"fail:{follower.get('id')}:{symbol}:{side}:escalate"
+                asyncio.create_task(tg.notify_fail(
+                    follower.get("name"), symbol, side, int(market_qty), _short_reason(e, body), key=key,
+                ))
         except Exception as e:
             logger.error(f"Escalation error for {symbol}: {e}")
 

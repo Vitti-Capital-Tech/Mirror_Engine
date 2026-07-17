@@ -43,6 +43,72 @@ async def send_message(text: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Trade notifications (open / close / mirror-failure)
+# ---------------------------------------------------------------------------
+
+# Keyed dedupe so a persistent failure retried every reconcile only alerts once
+# per window (not every 30s). key -> last-sent ts.
+_seen: dict = {}
+
+
+def _dedupe(key: str, window: float) -> bool:
+    """True if we should SEND (this key hasn't been sent within `window`)."""
+    now = time.time()
+    ts = _seen.get(key)
+    if ts is not None and (now - ts) < window:
+        return False
+    _seen[key] = now
+    return True
+
+
+def _num(v) -> str:
+    if v is None or v == "":
+        return "—"
+    try:
+        return f"{float(v):g}"
+    except Exception:
+        return str(v)
+
+
+async def notify_open(account: str, symbol: str, side: str, lots, price=None) -> None:
+    """Follower opened / added to a position."""
+    if not telegram_enabled():
+        return
+    d = str(side).lower()
+    icon = "🟢" if d in ("buy", "long") else "🔴"
+    direction = "LONG" if d in ("buy", "long") else "SHORT"
+    text = (f"{icon} <b>Position Opened</b> · {account}\n"
+            f"<code>{symbol}</code>\n"
+            f"{direction} · {_num(lots)} lot(s)" + (f" @ {_num(price)}" if price is not None else ""))
+    await send_message(text)
+
+
+async def notify_close(account: str, symbol: str, lots, price=None) -> None:
+    """Follower closed / reduced a position."""
+    if not telegram_enabled():
+        return
+    text = (f"✅ <b>Position Closed</b> · {account}\n"
+            f"<code>{symbol}</code>\n"
+            f"{_num(lots)} lot(s)" + (f" @ {_num(price)}" if price is not None else ""))
+    await send_message(text)
+
+
+async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
+                      key: str = None, window: float = 3600.0) -> None:
+    """Follower could NOT mirror an order. Deduped so a repeatedly-retried
+    failure only alerts once per `window`."""
+    if not telegram_enabled():
+        return
+    if key and not _dedupe(key, window):
+        return
+    lot_str = f" {_num(lots)} lot(s)" if lots not in (None, "", 0) else ""
+    text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
+            f"<code>{symbol}</code>\n"
+            f"{str(side).title()}{lot_str} — {reason}")
+    await send_message(text)
+
+
 async def send_alert(alert: dict) -> None:
     """Format an alert row and push it to Telegram."""
     if not telegram_enabled():
