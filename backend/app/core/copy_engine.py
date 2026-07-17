@@ -862,7 +862,18 @@ class CopyEngine:
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {market_qty} (order {oid})")
             except Exception as e:
-                logger.error(f"Escalation market order failed for {follower['name']} {symbol}: {e}")
+                resp_obj = getattr(e, "response", None)
+                body = ""
+                if resp_obj is not None:
+                    try:
+                        body = resp_obj.text
+                    except Exception:
+                        body = ""
+                logger.error(
+                    f"Escalation market order failed for {follower['name']} "
+                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} tif=fok]: "
+                    f"{e} | body={body}"
+                )
         except Exception as e:
             logger.error(f"Escalation error for {symbol}: {e}")
 
