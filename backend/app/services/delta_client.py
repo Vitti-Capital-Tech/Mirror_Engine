@@ -178,7 +178,8 @@ class DeltaClient:
         reduce_only=True can only reduce/close an existing position (never flips).
         Pass stop_price (+ optional stop_order_type/stop_trigger_method) to place
         a stop / take-profit / bracket-style triggered order.
-        time_in_force='fok' = fill-or-kill (fills the whole size or nothing).
+        time_in_force: Delta accepts only 'ioc' or 'gtc' ('fok' is rejected with
+        a bad_schema error). Leave unset for a plain market order.
         """
         path = "/v2/orders"
         body_dict: dict = {

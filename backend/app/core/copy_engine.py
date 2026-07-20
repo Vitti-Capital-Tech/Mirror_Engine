@@ -895,9 +895,12 @@ class CopyEngine:
             if market_qty < 1:
                 return
             try:
+                # Plain market order — NOT time_in_force='fok' (Delta rejects fok
+                # with bad_schema: "allowed values are ioc, gtc"). A bare market
+                # order fills against the book immediately.
                 resp = await client.place_order(
                     symbol=symbol, side=(side or "").lower(), size=int(market_qty),
-                    order_type="market_order", time_in_force="fok", reduce_only=reduce_only,
+                    order_type="market_order", reduce_only=reduce_only,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {market_qty} (order {oid})")
@@ -916,7 +919,7 @@ class CopyEngine:
                         body = ""
                 logger.error(
                     f"Escalation market order failed for {follower['name']} "
-                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} tif=fok]: "
+                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} type=market]: "
                     f"{e} | body={body}"
                 )
                 key = f"fail:{follower.get('id')}:{symbol}:{side}:escalate"
