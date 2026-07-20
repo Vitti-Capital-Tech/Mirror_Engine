@@ -10,13 +10,13 @@ from app.websocket.socket_manager import socket_manager
 
 logger = logging.getLogger(__name__)
 
-# All-or-nothing (FOK) for BOTH entries and exits: fill the full size or nothing.
-# If the book can't supply it, wait FILL_RETRY_DELAY and retry up to
-# MAX_FILL_RETRIES; if it still can't, the trade is skipped (no partial fills).
-# The delay only applies when the first attempt can't fill — normal instant fills
-# are unaffected.
-MAX_FILL_RETRIES = 2
-FILL_RETRY_DELAY = 5.0  # seconds (per desk: wait 5s before retrying)
+# Fill policy (per desk): rest a GTC LIMIT at the MASTER's price to match the
+# price; if it hasn't filled within FILL_WAIT_SEC, MARKET the unfilled remainder
+# so the copy still goes through. Never use time_in_force='fok' — Delta rejects
+# it ("allowed values are ioc, gtc").
+FILL_WAIT_SEC = 5.0  # seconds to let the price-matching GTC limit fill
+MAX_FILL_RETRIES = 2  # (retained for reference / other callers)
+FILL_RETRY_DELAY = 5.0
 
 class OrderExecutor:
     def __init__(self) -> None:
@@ -90,13 +90,9 @@ class OrderExecutor:
                 "failure_reason": f"Quantity rounded to 0: {quantity}"
             }
 
-        # Fill with an IOC LIMIT at the MASTER's price — never a plain market
-        # order. A market order takes whatever the book offers (slippage); we must
-        # match the master's price, so we cross with a limit capped at the master's
-        # fill price and let IOC fill-immediately-or-cancel (Delta rejects 'fok';
-        # 'ioc' is allowed). If the price isn't available the order simply doesn't
-        # fill — we won't chase a worse price. Each retry orders only the UNFILLED
-        # remainder (no over-fill). Exits are reduce-only.
+        # Rest a GTC LIMIT at the MASTER's price (match the price); if it hasn't
+        # filled within FILL_WAIT_SEC, cancel the remainder and MARKET it so the
+        # copy still goes through. Never fok (Delta rejects it). Exits reduce-only.
         is_exit = trade_type in ("exit", "sl")
 
         filled_qty = 0
@@ -119,39 +115,64 @@ class OrderExecutor:
             avg = od.get("average_fill_price")
             return filled, (float(avg) if avg else None)
 
-        if not limit_px or limit_px <= 0:
-            return {
-                "account_id": account_id, "account_name": account_name,
-                "status": "failed", "failure_reason": f"No master price to match for {symbol}",
-            }
+        # Phase 1 — GTC limit at the master's price, wait up to FILL_WAIT_SEC.
+        if limit_px and limit_px > 0:
+            oid = None
+            product_id = None
+            try:
+                resp = await client.place_order(
+                    symbol=symbol, side=side.lower(), size=order_size,
+                    order_type='limit_order', limit_price=limit_px, reduce_only=is_exit,
+                )
+                result = resp.get("result", resp) if isinstance(resp, dict) else {}
+                oid = result.get("id") or resp.get("id")
+                product_id = result.get("product_id")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Limit place failed for {account_name} on {symbol} @ {limit_px}: {last_error}")
+            if oid:
+                waited = 0.0
+                while waited < FILL_WAIT_SEC:
+                    await asyncio.sleep(1.0)
+                    waited += 1.0
+                    f, avg = await _confirm(oid, order_size)
+                    if f >= order_size:
+                        filled_qty = f
+                        if avg:
+                            exec_price = avg
+                        break
+                if filled_qty < order_size:
+                    f, avg = await _confirm(oid, order_size)
+                    filled_qty = max(filled_qty, f)
+                    if avg:
+                        exec_price = avg
+                    # Cancel the unfilled remainder before marketing (no double-fill).
+                    try:
+                        await client.cancel_order(str(oid), product_id=product_id)
+                    except Exception as e:
+                        logger.warning(f"Could not cancel unfilled limit {oid} for {account_name}: {e}")
 
-        for attempt in range(MAX_FILL_RETRIES + 1):
+        # Phase 2 — still short → MARKET the remainder so the copy goes through.
+        if filled_qty < order_size:
             remaining = order_size - filled_qty
-            if remaining < 1:
-                break
-            if attempt > 0:
-                await asyncio.sleep(FILL_RETRY_DELAY)
-                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol} ({'exit' if is_exit else 'entry'}) @ {limit_px}")
             try:
                 resp = await client.place_order(
                     symbol=symbol, side=side.lower(), size=remaining,
-                    order_type='limit_order', limit_price=limit_px,
-                    time_in_force='ioc', reduce_only=is_exit,
+                    order_type='market_order', reduce_only=is_exit,
                 )
-                oid = resp.get("id") or resp.get("result", {}).get("id")
-                if not oid:
-                    last_error = f"Invalid API response: {resp}"
-                    continue
-                f, avg = await _confirm(oid, remaining)
-                filled_qty += max(0, f)
-                if avg:
-                    exec_price = avg
-                if filled_qty >= order_size:
-                    break
-                last_error = f"Filled {filled_qty}/{order_size} at master price {limit_px} (price not fully available)"
+                oid2 = resp.get("id") or resp.get("result", {}).get("id")
+                if oid2:
+                    f2, avg2 = await _confirm(oid2, remaining)
+                    filled_qty += max(0, f2)
+                    if avg2:
+                        exec_price = avg2
+                    if f2 <= 0:
+                        last_error = f"Market fill empty for {symbol} (no liquidity)"
+                    else:
+                        logger.info(f"Market fallback filled {f2}/{remaining} for {account_name} on {symbol}")
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"IOC-limit attempt {attempt + 1} for {account_name} on {symbol} @ {limit_px}: {last_error}")
+                logger.warning(f"Market fallback failed for {account_name} on {symbol}: {last_error}")
 
         execution_time_ms = int((time.time() - start_time) * 1000)
         logger.info(f"[LATENCY] {account_name} {symbol}: follower order {'filled' if filled_qty > 0 else 'not filled'} in {execution_time_ms}ms")

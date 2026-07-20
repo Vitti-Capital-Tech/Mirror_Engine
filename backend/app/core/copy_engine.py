@@ -853,15 +853,15 @@ class CopyEngine:
     async def _escalate_unfilled_limit(self, follower, client, order_id, product_id,
                                        symbol, side, qty, reduce_only, master_row,
                                        limit_price=None) -> None:
-        """If a mirrored limit order hasn't executed after wait+retry, force the
-        follower in/out with a full-or-nothing market order — but only when it's
-        still warranted, and without ever double-filling."""
+        """The follower's mirrored order rests as a GTC limit at the master's
+        price. If it hasn't filled within ESCALATE_WAIT_SEC, MARKET it so the
+        follower still gets in/out (team rule: "GTC daalo, 5s me fill na ho to
+        market"). Only forces when still warranted, and never double-fills."""
         try:
-            # Wait, then retry-wait; bail the moment it fills.
-            for _ in range(2):
-                await asyncio.sleep(ESCALATE_WAIT_SEC)
-                if self._order_done(await self._safe_get_order(client, order_id)):
-                    return
+            # Give the GTC limit the full window to fill at the master's price.
+            await asyncio.sleep(ESCALATE_WAIT_SEC)
+            if self._order_done(await self._safe_get_order(client, order_id)):
+                return
 
             # Is forcing still warranted?
             if reduce_only:
@@ -895,21 +895,17 @@ class CopyEngine:
                     market_qty = min(market_qty, cq)
             if market_qty < 1:
                 return
-            # Re-cross at the MASTER's price, never a plain market order (that
-            # would take a worse book price — we must match the master's price).
-            # IOC limit fills immediately-or-cancels at ≤/≥ the master's price;
-            # if the price isn't there it simply doesn't fill (no bad-price chase).
-            if not limit_price or float(limit_price) <= 0:
-                logger.info(f"Escalation skipped for {follower['name']} {symbol}: no master price to match.")
-                return
+            # The GTC limit didn't fill at the master's price within the window —
+            # MARKET the remainder so the follower gets filled (team rule: GTC,
+            # then market after 5s). NOT fok (Delta rejects it); a bare market
+            # order fills against the book immediately.
             try:
                 resp = await client.place_order(
                     symbol=symbol, side=(side or "").lower(), size=int(market_qty),
-                    order_type="limit_order", limit_price=float(limit_price),
-                    time_in_force="ioc", reduce_only=reduce_only,
+                    order_type="market_order", reduce_only=reduce_only,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
-                logger.info(f"Escalated unfilled limit -> IOC @ master price {limit_price} for {follower['name']} {symbol} qty {market_qty} (order {oid})")
+                logger.info(f"Escalated unfilled limit -> MARKET for {follower['name']} {symbol} qty {market_qty} (order {oid})")
                 acct = follower.get("name") or "Follower"
                 if reduce_only:
                     asyncio.create_task(tg.notify_close(acct, symbol, int(market_qty)))
@@ -925,7 +921,7 @@ class CopyEngine:
                         body = ""
                 logger.error(
                     f"Escalation market order failed for {follower['name']} "
-                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} type=ioc-limit @ {limit_price}]: "
+                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} type=market]: "
                     f"{e} | body={body}"
                 )
                 key = f"fail:{follower.get('id')}:{symbol}:{side}:escalate"
