@@ -800,7 +800,7 @@ class CopyEngine:
                     if order_type == "limit_order" and stop_price is None and not is_bracket and not reduce_only:
                         asyncio.create_task(self._escalate_unfilled_limit(
                             follower, client, follower_order_id, product_id, symbol,
-                            side, int(qty), reduce_only, master_row,
+                            side, int(qty), reduce_only, master_row, limit_price,
                         ))
             except Exception as e:
                 resp_obj = getattr(e, "response", None)
@@ -851,7 +851,8 @@ class CopyEngine:
             return False
 
     async def _escalate_unfilled_limit(self, follower, client, order_id, product_id,
-                                       symbol, side, qty, reduce_only, master_row) -> None:
+                                       symbol, side, qty, reduce_only, master_row,
+                                       limit_price=None) -> None:
         """If a mirrored limit order hasn't executed after wait+retry, force the
         follower in/out with a full-or-nothing market order — but only when it's
         still warranted, and without ever double-filling."""
@@ -894,16 +895,21 @@ class CopyEngine:
                     market_qty = min(market_qty, cq)
             if market_qty < 1:
                 return
+            # Re-cross at the MASTER's price, never a plain market order (that
+            # would take a worse book price — we must match the master's price).
+            # IOC limit fills immediately-or-cancels at ≤/≥ the master's price;
+            # if the price isn't there it simply doesn't fill (no bad-price chase).
+            if not limit_price or float(limit_price) <= 0:
+                logger.info(f"Escalation skipped for {follower['name']} {symbol}: no master price to match.")
+                return
             try:
-                # Plain market order — NOT time_in_force='fok' (Delta rejects fok
-                # with bad_schema: "allowed values are ioc, gtc"). A bare market
-                # order fills against the book immediately.
                 resp = await client.place_order(
                     symbol=symbol, side=(side or "").lower(), size=int(market_qty),
-                    order_type="market_order", reduce_only=reduce_only,
+                    order_type="limit_order", limit_price=float(limit_price),
+                    time_in_force="ioc", reduce_only=reduce_only,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
-                logger.info(f"Escalated unfilled limit -> market for {follower['name']} {symbol} qty {market_qty} (order {oid})")
+                logger.info(f"Escalated unfilled limit -> IOC @ master price {limit_price} for {follower['name']} {symbol} qty {market_qty} (order {oid})")
                 acct = follower.get("name") or "Follower"
                 if reduce_only:
                     asyncio.create_task(tg.notify_close(acct, symbol, int(market_qty)))
@@ -919,7 +925,7 @@ class CopyEngine:
                         body = ""
                 logger.error(
                     f"Escalation market order failed for {follower['name']} "
-                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} type=market]: "
+                    f"[{symbol} {(side or '').lower()} qty={int(market_qty)} reduce_only={reduce_only} type=ioc-limit @ {limit_price}]: "
                     f"{e} | body={body}"
                 )
                 key = f"fail:{follower.get('id')}:{symbol}:{side}:escalate"

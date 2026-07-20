@@ -90,16 +90,18 @@ class OrderExecutor:
                 "failure_reason": f"Quantity rounded to 0: {quantity}"
             }
 
-        # Fill with a plain market order (takes whatever the book offers), retrying
-        # if the API errors or nothing fills. We do NOT set time_in_force='fok':
-        # Delta rejects it ("allowed values are ioc, gtc") with a bad_schema error,
-        # which was silently killing copies. A bare market order fills immediately.
-        # Each retry orders only the UNFILLED remainder, so a partial fill on one
-        # attempt can never cause an over-fill on the next. Exits are reduce-only.
+        # Fill with an IOC LIMIT at the MASTER's price — never a plain market
+        # order. A market order takes whatever the book offers (slippage); we must
+        # match the master's price, so we cross with a limit capped at the master's
+        # fill price and let IOC fill-immediately-or-cancel (Delta rejects 'fok';
+        # 'ioc' is allowed). If the price isn't available the order simply doesn't
+        # fill — we won't chase a worse price. Each retry orders only the UNFILLED
+        # remainder (no over-fill). Exits are reduce-only.
         is_exit = trade_type in ("exit", "sl")
 
         filled_qty = 0
         exec_price = master_price
+        limit_px = float(master_price) if master_price else None
 
         async def _confirm(order_id, placed_size):
             """Return (filled_lots, avg_price) for THIS order. Delta exposes
@@ -117,17 +119,24 @@ class OrderExecutor:
             avg = od.get("average_fill_price")
             return filled, (float(avg) if avg else None)
 
+        if not limit_px or limit_px <= 0:
+            return {
+                "account_id": account_id, "account_name": account_name,
+                "status": "failed", "failure_reason": f"No master price to match for {symbol}",
+            }
+
         for attempt in range(MAX_FILL_RETRIES + 1):
             remaining = order_size - filled_qty
             if remaining < 1:
                 break
             if attempt > 0:
                 await asyncio.sleep(FILL_RETRY_DELAY)
-                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol} ({'exit' if is_exit else 'entry'})")
+                logger.info(f"Retry {attempt}/{MAX_FILL_RETRIES} for {account_name} on {symbol} ({'exit' if is_exit else 'entry'}) @ {limit_px}")
             try:
                 resp = await client.place_order(
                     symbol=symbol, side=side.lower(), size=remaining,
-                    order_type='market_order', reduce_only=is_exit,
+                    order_type='limit_order', limit_price=limit_px,
+                    time_in_force='ioc', reduce_only=is_exit,
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 if not oid:
@@ -139,10 +148,10 @@ class OrderExecutor:
                     exec_price = avg
                 if filled_qty >= order_size:
                     break
-                last_error = f"Filled {filled_qty}/{order_size}, retrying remainder"
+                last_error = f"Filled {filled_qty}/{order_size} at master price {limit_px} (price not fully available)"
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"Market attempt {attempt + 1} for {account_name} on {symbol}: {last_error}")
+                logger.warning(f"IOC-limit attempt {attempt + 1} for {account_name} on {symbol} @ {limit_px}: {last_error}")
 
         execution_time_ms = int((time.time() - start_time) * 1000)
         logger.info(f"[LATENCY] {account_name} {symbol}: follower order {'filled' if filled_qty > 0 else 'not filled'} in {execution_time_ms}ms")
