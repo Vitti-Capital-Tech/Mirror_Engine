@@ -53,6 +53,12 @@ class CopyEngine:
         # orphan for two consecutive sweeps, so a master bracket edit
         # (cancel-and-replace, momentarily no stop) can't cause a wrong cancel.
         self._prot_orphans_prev: set = set()
+        # Debounce for the 10s position reconciler's OPEN action, per
+        # (follower_id, symbol): don't re-fire a recovery open within this window
+        # (avoids spamming a margin-rejected open every cycle, and gives a fill
+        # time to reflect before we'd consider re-opening).
+        self._recon_open_ts: dict = {}
+        self._RECON_OPEN_DEBOUNCE = 30.0  # seconds
 
     async def process_fill(self, event_dict: dict) -> None:
         """
@@ -484,6 +490,131 @@ class CopyEngine:
             await self._sync_followers_to_master_exit(event)
         elif action == "sync_protection":
             await self._sync_protection(event)
+        elif action == "reconcile_positions":
+            await self._reconcile_positions(event)
+
+    async def _reconcile_positions(self, event: dict) -> None:
+        """Every 10s: make each follower's OPEN POSITIONS match the master's,
+        recovering anything the live copy missed (e.g. a WS-dropped entry).
+
+          • Master holds a leg the follower is FLAT on -> OPEN it (market, current
+            price — the master's entry moment has passed). Skipped if the follower
+            already has a resting order on that symbol (live copy is on it) or if
+            we opened it within the debounce window.
+          • Follower holds a leg the master is FLAT on, or on the OPPOSITE side
+            (a desync) -> CLOSE it (reduce-only market).
+
+        NOTE: the close side actively flattens follower legs the master no longer
+        holds — this supersedes the earlier "don't force-close on SL/TP hit, let
+        the follower's own jittered stop close it" behaviour for the master-flat
+        case (the reconcile now closes within ~10s instead)."""
+        owner_id = event.get("owner_id")
+        master_map = {}
+        for p in (event.get("positions") or []):
+            sym = p.get("symbol")
+            if sym:
+                master_map[sym] = (float(p.get("size") or 0), p.get("mark"))
+
+        # Master balance for proportional sizing of any recovery open.
+        master_balance = 0.0
+        try:
+            mq = self.db.table("accounts").select("*").eq("is_master", True)
+            if owner_id:
+                mq = mq.eq("owner_id", owner_id)
+            m = mq.execute()
+            if m.data:
+                mr = m.data[0]
+                master_balance = float(mr.get("allocated_balance") or mr.get("available_margin") or mr.get("balance") or 0.0)
+        except Exception:
+            pass
+
+        try:
+            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            if owner_id:
+                fq = fq.eq("owner_id", owner_id)
+            followers = fq.execute().data or []
+        except Exception as e:
+            logger.error(f"reconcile_positions: failed to load followers: {e}")
+            return
+
+        now = time.time()
+        for fol in followers:
+            fol["master_balance"] = master_balance
+            client = await self._get_follower_client(fol)
+            if not client:
+                continue
+            try:
+                fpos = {}
+                for p in await client.get_positions():
+                    s = p.get("product_symbol") or p.get("symbol")
+                    sz = float(p.get("size") or 0)
+                    if s and sz != 0:
+                        fpos[s] = sz
+                resting = set()
+                for st in ("open", "pending"):
+                    try:
+                        for o in await client.get_open_orders(state=st):
+                            if o.get("product_symbol"):
+                                resting.add(o.get("product_symbol"))
+                    except Exception:
+                        pass
+
+                # 1) CLOSE — follower holds a leg the master is flat on / opposite.
+                for sym, fsz in list(fpos.items()):
+                    msz = master_map.get(sym, (0, None))[0]
+                    same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
+                    if same_side:
+                        continue  # follower on the right side — keep it
+                    # Master is FLAT but the follower still has its own resting
+                    # SL/TP on this symbol -> leave it, let that (jittered) stop
+                    # close it at its own price (respects "no forced close on SL/TP
+                    # hit"). A wrong-SIDE desync is always closed.
+                    if msz == 0 and sym in resting:
+                        continue
+                    if True:
+                        side = "sell" if fsz > 0 else "buy"
+                        try:
+                            await client.place_order(
+                                symbol=sym, side=side, size=int(abs(fsz)),
+                                order_type="market_order", reduce_only=True,
+                            )
+                            logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master holds {msz:+.0f}) — mismatch")
+                            asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
+                        except Exception as e:
+                            body = getattr(getattr(e, "response", None), "text", "")
+                            logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
+
+                # 2) OPEN — master holds a leg the follower is flat on (recover miss).
+                for sym, (msz, mark) in master_map.items():
+                    if msz == 0 or fpos.get(sym, 0) != 0:
+                        continue
+                    if sym in resting:
+                        continue  # live copy already has a resting order here
+                    key = (fol.get("id"), sym)
+                    if now - self._recon_open_ts.get(key, 0) < self._RECON_OPEN_DEBOUNCE:
+                        continue
+                    price = float(mark) if mark else 0.0
+                    target = self.risk_engine.calculate_follower_quantity(abs(msz), price, fol, round_up=True)
+                    if target < 1:
+                        continue
+                    self._recon_open_ts[key] = now
+                    side = "buy" if msz > 0 else "sell"
+                    try:
+                        await client.place_order(
+                            symbol=sym, side=side, size=int(target),
+                            order_type="market_order", reduce_only=False,
+                        )
+                        logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
+                        asyncio.create_task(tg.notify_open(fol.get("name"), sym, side, int(target), price or None))
+                    except Exception as e:
+                        body = getattr(getattr(e, "response", None), "text", "")
+                        logger.warning(f"reconcile open failed for {fol.get('name')} {sym}: {e} {body}")
+                        asyncio.create_task(tg.notify_fail(
+                            fol.get("name"), sym, side, int(target), _short_reason(e, body),
+                            key=f"recon:{fol.get('id')}:{sym}", window=1800,
+                        ))
+            except Exception as e:
+                logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
 
     async def _sync_protection(self, event: dict) -> None:
         """Cancel any follower SL/TP whose master counterpart no longer exists.

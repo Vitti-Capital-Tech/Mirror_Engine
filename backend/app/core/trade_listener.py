@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 # safety net for any order the WS create event missed (or that was resting while
 # the backend was down). Idempotent, so it only ever places what's missing.
 RECONCILE_INTERVAL_SEC = 30
+# How often to reconcile follower POSITIONS against the master's — recovers a
+# leg the live copy missed (e.g. a WS-dropped entry) and closes any follower leg
+# the master no longer holds. Faster than the order reconcile (per desk: 10s).
+POSITION_RECONCILE_SEC = 10
 
 
 class TradeListener:
@@ -21,6 +25,7 @@ class TradeListener:
         self.master_account: Optional[dict] = None
         self._running = False
         self._reconcile_task: Optional[asyncio.Task] = None
+        self._pos_reconcile_task: Optional[asyncio.Task] = None
 
     async def start(self, master_account: dict) -> None:
         """
@@ -45,19 +50,23 @@ class TradeListener:
 
         # Safety net: periodically re-mirror the master's resting limit orders.
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        # Faster safety net: reconcile follower POSITIONS to the master every 10s.
+        self._pos_reconcile_task = asyncio.create_task(self._position_reconcile_loop())
 
     async def stop(self) -> None:
         """
         Stop the listener and close connections.
         """
         self._running = False
-        if self._reconcile_task and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
-            try:
-                await self._reconcile_task
-            except asyncio.CancelledError:
-                pass
-            self._reconcile_task = None
+        for attr in ("_reconcile_task", "_pos_reconcile_task"):
+            t = getattr(self, attr, None)
+            if t and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            setattr(self, attr, None)
         if self.client:
             logger.info("Stopping TradeListener and DeltaClient websocket connection...")
             await self.client.close()
@@ -87,6 +96,50 @@ class TradeListener:
                 await asyncio.sleep(RECONCILE_INTERVAL_SEC)
             except asyncio.CancelledError:
                 break
+
+    async def _position_reconcile_loop(self) -> None:
+        """Every POSITION_RECONCILE_SEC, snapshot the master's open positions and
+        hand them to the copy engine, which opens any leg a follower is missing
+        and closes any leg the master no longer holds."""
+        try:
+            await asyncio.sleep(8)  # let the WS + first order-reconcile settle
+        except asyncio.CancelledError:
+            return
+        while self._running:
+            try:
+                await self._push_position_reconcile()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Position reconcile pass failed: %s", e)
+            try:
+                await asyncio.sleep(POSITION_RECONCILE_SEC)
+            except asyncio.CancelledError:
+                break
+
+    async def _push_position_reconcile(self) -> None:
+        if not self.client or not self.master_account:
+            return
+        try:
+            positions = []
+            for p in await self.client.get_positions():
+                sz = float(p.get("size") or 0)
+                if sz == 0:
+                    continue
+                positions.append({
+                    "symbol": p.get("product_symbol") or p.get("symbol"),
+                    "size": sz,
+                    "mark": p.get("mark_price"),
+                })
+        except Exception as e:
+            logger.warning("Position reconcile: could not fetch master positions: %s", e)
+            return
+        payload = {
+            "action": "reconcile_positions",
+            "owner_id": (self.master_account or {}).get("owner_id"),
+            "positions": positions,
+        }
+        await self.redis.lpush("order_events", json.dumps(payload))
 
     async def _reconcile_orders(self) -> None:
         if not self.client or not self.master_account:
