@@ -101,6 +101,8 @@ class TradeListener:
         """Every POSITION_RECONCILE_SEC, snapshot the master's open positions and
         hand them to the copy engine, which opens any leg a follower is missing
         and closes any leg the master no longer holds."""
+        logger.info("Position reconcile loop started for master %s (every %ss)",
+                    (self.master_account or {}).get("name"), POSITION_RECONCILE_SEC)
         try:
             await asyncio.sleep(8)  # let the WS + first order-reconcile settle
         except asyncio.CancelledError:
