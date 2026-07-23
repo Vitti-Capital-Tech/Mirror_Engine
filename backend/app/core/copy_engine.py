@@ -174,14 +174,27 @@ class CopyEngine:
 
         master_remaining = None
         master_signed_now = None
+        if not is_exit:
+            # Decide open vs close from the master's post-fill position. If this
+            # fill (not flagged reduce_only) leaves the master NOT on the side this
+            # order would open (buy=>long / sell=>short), it actually REDUCED/closed
+            # the master's position -> reclassify as EXIT. This makes a MANUAL
+            # master close propagate to followers immediately, instead of the
+            # follower only exiting ~20s later via its own jittered stop.
+            master_signed_now = await self._master_position_signed(master_row, symbol, fresh=True)
+            sl = (side or "").lower()
+            opens = master_signed_now is not None and (
+                (sl == "buy" and master_signed_now > 0) or (sl == "sell" and master_signed_now < 0)
+            )
+            if master_signed_now is not None and not opens:
+                is_exit = True
+                trade_type = "exit"  # so the follower order is reduce-only
+                logger.info(
+                    f"Reclassified {symbol} {side} as EXIT (master now {master_signed_now:+.0f}) — "
+                    f"unflagged close, mirroring follower close immediately"
+                )
         if is_exit:
             master_remaining = await self._master_position_size(master_row, symbol)
-        else:
-            # Entry: confirm the master actually holds a SAME-side position. Guards
-            # against a master CLOSE that wasn't flagged reduce_only — without this
-            # the follower would OPEN an opposite position the master doesn't have
-            # ("we were closing and we opened"). Fresh read to avoid a stale cache.
-            master_signed_now = await self._master_position_signed(master_row, symbol, fresh=True)
 
         tasks = []
         for follower in followers:
