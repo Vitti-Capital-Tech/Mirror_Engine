@@ -905,16 +905,27 @@ class CopyEngine:
                         f"{signed:+.0f} — not reducible by a {side}, skipping (position desync?)"
                     )
                     continue
-                # Ceil (round_up) so a small master close (whose follower share is
-                # a fraction, e.g. 0.5) still punches ≥1 lot instead of flooring to
-                # 0 and silently dropping the order. Capped at the follower's
-                # holding + reduce_only, so it can't over-close.
-                want = self.risk_engine.calculate_follower_quantity(
-                    master_qty, ref_price, follower, round_up=True, min_one=False
+                # Size the close by REBALANCING to the master's position AFTER this
+                # close fills — NOT by ceil(close_chunk × ratio). Ceiling each chunk
+                # over-closes a small follower on repeated trims: a 50-lot master
+                # trim is ~0.5 follower lots but ceil'd to 1 EVERY time, so the
+                # follower sheds far more than its share (600→400 master = 33%, but
+                # 6→2 follower = 67%). Instead: follower's proportional TARGET for
+                # the master's REMAINING (current − this close), and close only the
+                # difference. A tiny trim that leaves the follower already at target
+                # closes nothing (correct), never over-shoots.
+                follower_held = int(abs(signed))
+                master_now = await self._master_position_size(master_row, symbol, fresh=True) or 0.0
+                intended_remaining = max(0.0, float(master_now) - float(master_qty))
+                target = self.risk_engine.calculate_follower_quantity(
+                    intended_remaining, ref_price, follower, round_up=False, min_one=False
                 )
-                qty = min(int(want), int(abs(signed)))
+                qty = min(follower_held - int(target), follower_held)
                 if qty < 1:
-                    logger.info(f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest (want {int(want)}, holds {abs(signed):.0f})")
+                    logger.info(
+                        f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest "
+                        f"(holds {follower_held}, target {int(target)} for master remaining {intended_remaining:.0f})"
+                    )
                     continue
 
             # Plain limit order: if the master EDITED it, edit the follower's
