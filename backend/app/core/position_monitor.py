@@ -243,24 +243,25 @@ class PositionMonitor:
                 status = "out_of_sync"
                 msg = f"Position mismatch for {account_name} on {symbol}: actual size={follower_qty}, expected size={expected_qty} (diff={diff})"
 
-                # Notify BOTH the follower and the master account, but at most
-                # ONCE per (account, symbol) within MISMATCH_COOLDOWN_MIN — even
-                # if the mismatch resolves and re-triggers repeatedly while the
-                # master trades. Time-window based so resolve/re-create churn
-                # can't defeat it.
+                # Notify BOTH the follower and the master account, but only ONCE
+                # per mismatch episode: if an UNRESOLVED mismatch alert already
+                # exists for this (account, symbol), stay silent — no repeated
+                # pinging every 30 min while it persists. It re-arms automatically
+                # when the mismatch resolves (_resolve_mismatch_alert flips
+                # is_resolved), so a fresh mismatch later alerts once again.
                 owner_id = follower_account.get("owner_id")
                 targets = [account_id, master_id]
-                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=MISMATCH_COOLDOWN_MIN)).isoformat()
-                recent = (
+                open_alerts = (
                     self.db.table("alerts")
-                    .select("account_id, metadata, created_at")
+                    .select("account_id, metadata")
                     .eq("type", "position_mismatch")
+                    .eq("is_resolved", False)
                     .in_("account_id", targets)
-                    .gte("created_at", cutoff).execute()
+                    .execute()
                 )
                 have = {
                     (a.get("account_id"), (a.get("metadata") or {}).get("symbol"))
-                    for a in (recent.data or [])
+                    for a in (open_alerts.data or [])
                 }
                 meta = {
                     "symbol": symbol,
