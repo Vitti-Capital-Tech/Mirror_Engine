@@ -59,6 +59,11 @@ class CopyEngine:
         # time to reflect before we'd consider re-opening).
         self._recon_open_ts: dict = {}
         self._RECON_OPEN_DEBOUNCE = 30.0  # seconds
+        # A mismatch must persist across TWO consecutive 10s reconcile passes
+        # before we act — so a transient race (a just-filled mirror whose position
+        # hasn't shown in get_positions yet) can never trigger a duplicate.
+        self._recon_open_prev: set = set()
+        self._recon_close_prev: set = set()
 
     async def process_fill(self, event_dict: dict) -> None:
         """
@@ -538,10 +543,14 @@ class CopyEngine:
             return
 
         now = time.time()
+        current_open: set = set()   # (follower_id, sym) missing THIS pass
+        current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
         for fol in followers:
             fol["master_balance"] = master_balance
+            fid = fol.get("id")
             client = await self._get_follower_client(fol)
             if not client:
+                # keep prior candidates alive so a fetch blip doesn't reset the streak
                 continue
             try:
                 fpos = {}
@@ -565,24 +574,26 @@ class CopyEngine:
                     same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
                     if same_side:
                         continue  # follower on the right side — keep it
-                    # Master is FLAT but the follower still has its own resting
-                    # SL/TP on this symbol -> leave it, let that (jittered) stop
-                    # close it at its own price (respects "no forced close on SL/TP
-                    # hit"). A wrong-SIDE desync is always closed.
+                    # Master FLAT but follower still has its own resting SL/TP ->
+                    # leave it, let that (jittered) stop close it (respects "no
+                    # forced close on SL/TP hit"). Wrong-SIDE desync always closes.
                     if msz == 0 and sym in resting:
                         continue
-                    if True:
-                        side = "sell" if fsz > 0 else "buy"
-                        try:
-                            await client.place_order(
-                                symbol=sym, side=side, size=int(abs(fsz)),
-                                order_type="market_order", reduce_only=True,
-                            )
-                            logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master holds {msz:+.0f}) — mismatch")
-                            asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
-                        except Exception as e:
-                            body = getattr(getattr(e, "response", None), "text", "")
-                            logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
+                    key = (fid, sym)
+                    current_close.add(key)
+                    if key not in self._recon_close_prev:
+                        continue  # first sighting — confirm next pass before acting
+                    side = "sell" if fsz > 0 else "buy"
+                    try:
+                        await client.place_order(
+                            symbol=sym, side=side, size=int(abs(fsz)),
+                            order_type="market_order", reduce_only=True,
+                        )
+                        logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master holds {msz:+.0f}) — mismatch")
+                        asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
+                    except Exception as e:
+                        body = getattr(getattr(e, "response", None), "text", "")
+                        logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
 
                 # 2) OPEN — master holds a leg the follower is flat on (recover miss).
                 for sym, (msz, mark) in master_map.items():
@@ -590,7 +601,12 @@ class CopyEngine:
                         continue
                     if sym in resting:
                         continue  # live copy already has a resting order here
-                    key = (fol.get("id"), sym)
+                    key = (fid, sym)
+                    current_open.add(key)
+                    if key not in self._recon_open_prev:
+                        continue  # first sighting — a just-filled mirror may not be
+                                  # reflected yet; confirm on the next pass (avoids a
+                                  # duplicate entry racing the live copy)
                     if now - self._recon_open_ts.get(key, 0) < self._RECON_OPEN_DEBOUNCE:
                         continue
                     price = float(mark) if mark else 0.0
@@ -615,6 +631,10 @@ class CopyEngine:
                         ))
             except Exception as e:
                 logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
+
+        # Remember this pass's candidates so the next pass can confirm them.
+        self._recon_open_prev = current_open
+        self._recon_close_prev = current_close
 
     async def _sync_protection(self, event: dict) -> None:
         """Cancel any follower SL/TP whose master counterpart no longer exists.
