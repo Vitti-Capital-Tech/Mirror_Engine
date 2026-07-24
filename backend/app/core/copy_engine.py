@@ -64,6 +64,11 @@ class CopyEngine:
         # hasn't shown in get_positions yet) can never trigger a duplicate.
         self._recon_open_prev: set = set()
         self._recon_close_prev: set = set()
+        # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
+        # cached so the 10s reconcile loop doesn't re-pull order history every
+        # pass while it waits for a follower's own stop to (or fail to) hit.
+        self._master_exit_cache: dict = {}  # {symbol: (reason, ts)}
+        self._MASTER_EXIT_TTL = 20.0  # seconds
 
     async def process_fill(self, event_dict: dict) -> None:
         """
@@ -423,6 +428,83 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Failed to close {name} position on {symbol}: {e}")
 
+    async def _classify_master_exit(self, master_row: dict, symbol: str) -> str:
+        """How did the master most recently CLOSE its position on `symbol`?
+
+        Returns one of:
+          "sl_tp"   — the last fill on the symbol came from a stop (SL/TP trigger
+                      or close-on-trigger bracket). The follower's own jittered
+                      stop sits at ~the same price and will close it, so reconcile
+                      should LEAVE the follower alone (force-closing just churns).
+          "manual"  — the last fill was a plain market/limit close (a manual /
+                      discretionary close the live copy missed). The follower's
+                      stop is far from price and will NEVER hit, so the follower
+                      is an orphan reconcile must close.
+          "unknown" — couldn't determine (REST error, or no filled order for the
+                      symbol in the recent history window). Caller LEAVES the
+                      position and retries next pass — we never force-close on a
+                      guess.
+
+        Reads the master's own order history, so it works even when the live WS
+        dropped the master's close (the exact case reconcile exists for). Cached
+        ~_MASTER_EXIT_TTL s per symbol so the 10s loop doesn't re-pull history
+        every pass while waiting."""
+        if not master_row:
+            return "unknown"
+        cached = self._master_exit_cache.get(symbol)
+        if cached and (time.time() - cached[1]) < self._MASTER_EXIT_TTL:
+            return cached[0]
+        try:
+            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
+            try:
+                history = await mc.get_order_history(page_size=100)
+            finally:
+                await mc.close()
+        except Exception as e:
+            logger.warning(f"classify_master_exit: order-history fetch failed for {symbol}: {e}")
+            return "unknown"  # transient — do NOT cache; retry next pass
+
+        # Master is flat, so the most recent FILLED order on the symbol is the one
+        # that closed it (whether or not reduce_only was set — a manual close via
+        # the exchange UI doesn't always set the flag). A stop_order_type on that
+        # order => the master exited via SL/TP; anything else => a manual close.
+        def _created(o):
+            return str(o.get("created_at") or o.get("updated_at") or "")
+        result = "unknown"
+        for o in sorted(history, key=_created, reverse=True):
+            if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                continue
+            if float(o.get("filled_size") or 0) <= 0:
+                continue  # never executed (e.g. a cancelled resting order)
+            result = "sl_tp" if o.get("stop_order_type") else "manual"
+            break
+        if result != "unknown":
+            self._master_exit_cache[symbol] = (result, time.time())
+            logger.info(f"classify_master_exit: {symbol} -> {result}")
+        return result
+
+    async def _cancel_follower_stops(self, client, symbol: str, name: str = "") -> None:
+        """Cancel any resting SL/TP (stop) orders the follower still has on
+        `symbol`. Called after force-closing an orphaned master-flat leg so no
+        protective order is left resting on a now-flat position."""
+        try:
+            for st in ("open", "pending"):
+                try:
+                    for o in await client.get_open_orders(state=st):
+                        if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                            continue
+                        if not o.get("stop_order_type"):
+                            continue  # only protective (SL/TP) orders
+                        try:
+                            await client.cancel_order(str(o.get("id")), product_id=o.get("product_id"))
+                            logger.info(f"reconcile: cancelled stale {o.get('stop_order_type')} on {symbol} for {name} (orphan close)")
+                        except Exception as e:
+                            logger.warning(f"reconcile: failed to cancel stale stop on {symbol} for {name}: {e}")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"reconcile: cancel-stops sweep failed on {symbol} for {name}: {e}")
+
     async def _follower_close_qty(self, client, follower: dict, symbol: str, master_row: dict, ref_price: float = 0.0):
         """How many lots the follower should CLOSE to rebalance to the master's
         REMAINING position: follower_current - floor(master_remaining × ratio).
@@ -522,10 +604,15 @@ class CopyEngine:
           • Follower holds a leg the master is FLAT on, or on the OPPOSITE side
             (a desync) -> CLOSE it (reduce-only market).
 
-        NOTE: the close side actively flattens follower legs the master no longer
-        holds — this supersedes the earlier "don't force-close on SL/TP hit, let
-        the follower's own jittered stop close it" behaviour for the master-flat
-        case (the reconcile now closes within ~10s instead)."""
+        NOTE on the master-FLAT case when the follower still has its own resting
+        SL/TP: whether we close depends on HOW the master got flat (see
+        _classify_master_exit). If the master exited via its own SL/TP hit, we
+        LEAVE the follower — its jittered stop sits at ~the same price and closes
+        it on its own within seconds; force-closing would just churn. If the
+        master closed MANUALLY (a market/limit close the live copy missed), the
+        follower's stop is far from price and will NEVER hit, so the follower is
+        an orphan we close (and we cancel its now-stale stop). A wrong-SIDE desync
+        (master NOT flat) always closes, unconditionally."""
         owner_id = event.get("owner_id")
         master_map = {}
         for p in (event.get("positions") or []):
@@ -533,16 +620,18 @@ class CopyEngine:
             if sym:
                 master_map[sym] = (float(p.get("size") or 0), p.get("mark"))
 
-        # Master balance for proportional sizing of any recovery open.
+        # Master balance for proportional sizing of any recovery open, and the
+        # master row itself so we can classify how the master closed a symbol.
         master_balance = 0.0
+        master_row = None
         try:
             mq = self.db.table("accounts").select("*").eq("is_master", True)
             if owner_id:
                 mq = mq.eq("owner_id", owner_id)
             m = mq.execute()
             if m.data:
-                mr = m.data[0]
-                master_balance = float(mr.get("allocated_balance") or mr.get("available_margin") or mr.get("balance") or 0.0)
+                master_row = m.data[0]
+                master_balance = float(master_row.get("allocated_balance") or master_row.get("available_margin") or master_row.get("balance") or 0.0)
         except Exception:
             pass
 
@@ -587,11 +676,16 @@ class CopyEngine:
                     same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
                     if same_side:
                         continue  # follower on the right side — keep it
-                    # Master FLAT but follower still has its own resting SL/TP ->
-                    # leave it, let that (jittered) stop close it (respects "no
-                    # forced close on SL/TP hit"). Wrong-SIDE desync always closes.
+                    # Master FLAT but the follower still holds AND has its own
+                    # resting SL/TP: only close it if the master got flat by a
+                    # MANUAL close (its stop won't hit -> orphan). If the master
+                    # exited via SL/TP, leave it — the follower's own jittered stop
+                    # is at ~the same price and closes it on its own (no churn). If
+                    # we can't tell, leave it and retry next pass (never guess).
                     if msz == 0 and sym in resting:
-                        continue
+                        reason = await self._classify_master_exit(master_row, sym)
+                        if reason != "manual":
+                            continue
                     key = (fid, sym)
                     current_close.add(key)
                     if key not in self._recon_close_prev:
@@ -602,8 +696,14 @@ class CopyEngine:
                             symbol=sym, side=side, size=int(abs(fsz)),
                             order_type="market_order", reduce_only=True,
                         )
-                        logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master holds {msz:+.0f}) — mismatch")
+                        why = "manual master close orphan" if msz == 0 else "wrong-side desync"
+                        logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) — {why}")
                         asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
+                        # Master-flat close leaves the follower's own SL/TP resting
+                        # on a now-flat leg — nothing else cancels it once the
+                        # master's gone, so clear it here.
+                        if msz == 0:
+                            await self._cancel_follower_stops(client, sym, fol.get("name"))
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
                         logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
