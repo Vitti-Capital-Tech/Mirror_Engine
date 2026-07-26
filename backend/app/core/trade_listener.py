@@ -15,7 +15,7 @@ RECONCILE_INTERVAL_SEC = 30
 # How often to reconcile follower POSITIONS against the master's — recovers a
 # leg the live copy missed (e.g. a WS-dropped entry) and closes any follower leg
 # the master no longer holds. Faster than the order reconcile (per desk: 10s).
-POSITION_RECONCILE_SEC = 10
+POSITION_RECONCILE_SEC = 15
 
 
 class TradeListener:

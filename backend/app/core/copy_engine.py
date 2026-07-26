@@ -1138,6 +1138,14 @@ class CopyEngine:
             if self._order_done(await self._safe_get_order(client, order_id)):
                 return
 
+            # ---- Point 3 exceptions: leave the GTC limit RESTING (no market, no
+            # cancel) and let it wait, when: ----
+            # (a) cheap tail options (limit < 2): a market order gives an awful fill
+            #     on a sub-$2 premium — better to keep resting at the master's price.
+            if limit_price is not None and float(limit_price) < 2:
+                logger.info(f"Escalation: {follower['name']} {symbol} limit {limit_price} < 2 — leaving it resting (no market).")
+                return
+
             # Is forcing still warranted?
             if reduce_only:
                 # Only force-close if the follower is STILL over its rebalance
@@ -1148,11 +1156,12 @@ class CopyEngine:
                     await self._safe_cancel(client, order_id, product_id)
                     return
             else:
-                # Only force-enter if the master actually holds the position.
+                # (b) master's own order isn't filled yet (master has no position):
+                #     don't force the follower in AHEAD of the master — leave the
+                #     limit resting and wait (the 15s reconcile matches it later).
                 msz = await self._master_position_size(master_row, symbol)
                 if msz is not None and msz == 0:
-                    logger.info(f"Escalation skipped for {follower['name']} {symbol}: master has no position.")
-                    await self._safe_cancel(client, order_id, product_id)
+                    logger.info(f"Escalation: master not in {symbol} yet — leaving {follower['name']} limit resting to wait.")
                     return
 
             # Cancel, then CONFIRM it didn't fill during the race before marketing.
