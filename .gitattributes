@@ -1,0 +1,5 @@
+# Shell scripts and CI workflows run on Linux — force LF so a Windows checkout
+# can never introduce CRLF that would break the shebang / embedded shell.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

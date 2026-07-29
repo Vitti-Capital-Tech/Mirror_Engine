@@ -1,0 +1,74 @@
+name: uptime-monitor
+
+# External watchdog: pings the backend health endpoint from OUTSIDE AWS, so it
+# catches the case the on-EC2 host watchdog cannot — the whole instance/network
+# being down. Alerts Telegram only on state transitions (unreachable / back).
+#
+# Requires two repo secrets (Settings -> Secrets and variables -> Actions):
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   (copy the values from backend/.env)
+#
+# NOTE: GitHub's scheduled cron is best-effort and can lag 5-15+ min under load,
+# and Actions schedules pause after ~60 days with no repo activity. This layer is
+# a backstop for instance-down; the on-host watchdog is the fast path.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: uptime-monitor
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Restore last state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: |
+            uptime-state-
+
+      - name: Check health and alert on transition
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          URL: http://13.232.100.56:8000/health
+        run: |
+          set -u
+          prev=up
+          [ -f state.txt ] && prev="$(cat state.txt || echo up)"
+          code="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL" 2>/dev/null || echo 000)"
+          echo "external health=$code prev=$prev"
+          send() {
+            [ -n "${BOT:-}" ] && [ -n "${CHAT:-}" ] || { echo "telegram secrets missing"; return 0; }
+            curl -s -m 10 -o /dev/null "https://api.telegram.org/bot${BOT}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              --data-urlencode "text=$1" || true
+          }
+          if [ "$code" = "200" ]; then
+            if [ "$prev" = "down" ]; then
+              send "✅ <b>Mirror Engine reachable again</b>
+External monitor: ${URL} is back (HTTP 200)."
+            fi
+            echo up > state.txt
+          else
+            if [ "$prev" != "down" ]; then
+              send "🚨 <b>Mirror Engine UNREACHABLE from outside AWS</b>
+External monitor could not reach ${URL} (HTTP ${code}). The EC2 instance or its network may be down."
+            fi
+            echo down > state.txt
+          fi
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
