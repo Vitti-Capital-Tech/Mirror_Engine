@@ -1,7 +1,9 @@
 import logging
 import asyncio
 import hashlib
+import os
 import time
+from datetime import datetime
 from typing import List, Dict, Any
 from app.database import db
 from app.websocket.socket_manager import socket_manager
@@ -34,6 +36,38 @@ def _short_reason(exc, body: str = "") -> str:
 # If a mirrored LIMIT order hasn't filled after this window (checked twice:
 # wait, then retry-wait), escalate it to a full-or-nothing market order.
 ESCALATE_WAIT_SEC = 5
+
+# A copied ENTRY is only "fresh" if the master's entry happened within this
+# window. After downtime the master may still hold hours-old positions (the
+# reconciler would otherwise re-enter the follower at today's drifted price),
+# or a stale fill event may sit queued in Redis across the outage and replay
+# hours later. Either way an entry this old is NOT copied — a late entry at a
+# moved price is worse than sitting the trade out. Exits/closes are NEVER gated
+# on age (a late close still matters). (Prathav, 2026-07-29)
+FRESH_ENTRY_SEC = float(os.getenv("FRESH_ENTRY_SEC", "180"))  # 3 minutes
+
+
+def _parse_epoch(v):
+    """Best-effort convert a Delta timestamp to epoch SECONDS (UTC). Accepts an
+    ISO-8601 string like '2026-07-28T12:00:01.174513Z' or an epoch in s/ms/µs.
+    Returns None if it can't be parsed."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        n = float(v)
+    elif isinstance(v, str) and v.strip().isdigit():
+        n = float(v.strip())
+    else:
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+    # normalise ms / µs epochs down to seconds
+    if n > 1e14:
+        n /= 1e6
+    elif n > 1e11:
+        n /= 1e3
+    return n
 
 
 class CopyEngine:
@@ -93,6 +127,19 @@ class CopyEngine:
             logger.info(f"[LATENCY] {symbol}: {(_t0 - ts_detected):.2f}s from master-fill detection to dispatch start")
 
         logger.info(f"Processing master fill: {side.upper()} {quantity} {symbol} @ {entry_price} (ID: {master_trade_id})")
+
+        # Stale-ENTRY guard: after downtime a fill event can sit queued in Redis
+        # across the outage and replay hours later. Re-entering at a price that
+        # has since drifted is worse than skipping, so drop entries older than
+        # FRESH_ENTRY_SEC. Exits are always processed — a late close still matters.
+        if trade_type == "entry" and ts_detected:
+            age = _t0 - float(ts_detected)
+            if age > FRESH_ENTRY_SEC:
+                logger.warning(
+                    f"Skipping STALE entry {side.upper()} {quantity} {symbol} — detected "
+                    f"{age:.0f}s ago (> {FRESH_ENTRY_SEC:.0f}s). Not copying a late entry."
+                )
+                return
 
         # 1. Save master trade to Supabase
         try:
@@ -566,6 +613,31 @@ class CopyEngine:
             logger.error(f"Master signed position fetch failed for {symbol}: {e}")
             return None
 
+    async def _master_recent_fill_ts(self, master_row: dict) -> dict:
+        """Map {symbol: epoch seconds of the master's MOST RECENT fill}. Used to
+        gate reconcile-recovery opens on freshness: after downtime the master
+        still holds hours-old positions, and re-entering the follower now (at a
+        drifted price) is worse than staying out. Fetches the 100 most recent
+        fills once; a symbol absent from that window has had no recent activity
+        and is therefore treated as stale. (Prathav, 2026-07-29)"""
+        out: dict = {}
+        if not master_row:
+            return out
+        try:
+            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
+            try:
+                fills = await mc.get_fills(page_size=100)
+            finally:
+                await mc.close()
+            for f in fills:
+                sym = f.get("product_symbol") or f.get("symbol")
+                ts = _parse_epoch(f.get("created_at"))
+                if sym and ts is not None and ts > out.get(sym, 0):
+                    out[sym] = ts
+        except Exception as e:
+            logger.warning(f"reconcile freshness: could not fetch master fills: {e}")
+        return out
+
     async def _get_follower_client(self, follower: dict):
         client = self.connection_manager.get_client(follower["id"])
         if not client:
@@ -647,6 +719,9 @@ class CopyEngine:
         now = time.time()
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
+        # Lazily fetched once per pass (shared across followers): {sym: last master
+        # fill epoch}. Gates recovery-opens so we never re-enter a stale leg.
+        master_fresh_ts = None
         for fol in followers:
             fol["master_balance"] = master_balance
             fid = fol.get("id")
@@ -725,6 +800,25 @@ class CopyEngine:
                     price = float(mark) if mark else 0.0
                     target = self.risk_engine.calculate_follower_quantity(abs(msz), price, fol, round_up=True)
                     if target < 1:
+                        continue
+                    # Freshness gate: only RECOVER a leg the master entered
+                    # recently. After downtime the master still holds hours-old
+                    # positions; re-entering the follower now (at a drifted price)
+                    # is worse than staying out — so if the master's last fill on
+                    # this symbol is older than FRESH_ENTRY_SEC, do nothing.
+                    # (Prathav, 2026-07-29)
+                    if master_fresh_ts is None:
+                        master_fresh_ts = await self._master_recent_fill_ts(master_row)
+                    last_fill = master_fresh_ts.get(sym)
+                    if last_fill is None or (now - last_fill) > FRESH_ENTRY_SEC:
+                        age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "no recent fill"
+                        logger.info(
+                            f"reconcile: SKIP stale entry {fol.get('name')} {sym} "
+                            f"(master last fill {age_txt}, > {FRESH_ENTRY_SEC:.0f}s) — leaving follower flat"
+                        )
+                        # Throttle re-check/re-log of a persistently-held stale leg
+                        # via the same debounce used after a real open.
+                        self._recon_open_ts[key] = now
                         continue
                     self._recon_open_ts[key] = now
                     side = "buy" if msz > 0 else "sell"
