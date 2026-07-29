@@ -38,12 +38,13 @@ jobs:
           BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           URL: http://13.232.100.56:8000/health
+          EVENT: ${{ github.event_name }}
         run: |
           set -u
           prev=up
           [ -f state.txt ] && prev="$(cat state.txt || echo up)"
           code="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL" 2>/dev/null || echo 000)"
-          echo "external health=$code prev=$prev"
+          echo "external health=$code prev=$prev event=$EVENT"
           send() {
             [ -n "${BOT:-}" ] && [ -n "${CHAT:-}" ] || { echo "telegram secrets missing"; return 0; }
             curl -s -m 10 -o /dev/null "https://api.telegram.org/bot${BOT}/sendMessage" \
@@ -57,9 +58,15 @@ jobs:
               send "✅ <b>Mirror Engine reachable again</b>
 External monitor: ${URL} is back (HTTP 200)."
             fi
+            # A manual run is always confirmed, so the secrets/pipe can be tested
+            # even while everything is healthy (scheduled runs stay transition-only).
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              send "✅ <b>External monitor OK</b>
+Manual test: reached ${URL} (HTTP 200). GitHub Actions alerting is wired correctly."
+            fi
             echo up > state.txt
           else
-            if [ "$prev" != "down" ]; then
+            if [ "$prev" != "down" ] || [ "$EVENT" = "workflow_dispatch" ]; then
               send "🚨 <b>Mirror Engine UNREACHABLE from outside AWS</b>
 External monitor could not reach ${URL} (HTTP ${code}). The EC2 instance or its network may be down."
             fi
