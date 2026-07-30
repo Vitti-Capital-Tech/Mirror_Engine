@@ -1,11 +1,17 @@
 import logging
 from typing import List, Optional
+import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Query, Depends
+from app.config import settings
 from app.database import db
 from app.models.trade import TradeResponse, TradeStatsResponse
 from app.core.auth import get_current_user, CurrentUser, scope_owned
+from app.core import order_ledger as ledger
 
 logger = logging.getLogger(__name__)
+
+# Read-only Redis handle for the order-ID ledger endpoints below.
+_redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
@@ -103,6 +109,97 @@ async def get_trade_stats(user: CurrentUser = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Error calculating stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --------------------------------------------------------------------------
+# Order-ID ledger — "was master order X mirrored to every follower?"
+#
+# The trades/trade_copies tables only record copies the engine ACTUALLY
+# attempted. The ledger additionally records master orders whose copy never
+# happened, which is the only way to see a silently-missed exit (e.g. a partial
+# exit lost during a backend outage). Read-only, owner-scoped.
+# Declared above GET /{id} — both are distinct path shapes, but keeping the
+# specific routes first avoids any future shadowing.
+# --------------------------------------------------------------------------
+
+def _follower_names(ids) -> dict:
+    """{account_id: name} for the given ids (best effort — a missing account
+    shouldn't blank out the whole ledger view)."""
+    ids = [i for i in set(ids) if i]
+    if not ids:
+        return {}
+    try:
+        res = db.table("accounts").select("id, name").in_("id", ids).execute()
+        return {r["id"]: r.get("name") for r in (res.data or [])}
+    except Exception as e:
+        logger.warning(f"ledger: could not resolve follower names: {e}")
+        return {}
+
+
+def _decorate(entry: dict, active_followers: dict, names: dict) -> dict:
+    """Annotate a ledger entry with follower names and who is MISSING it.
+    `names` is resolved once per REQUEST by the caller — decorating a 200-entry
+    listing must not mean 200 account lookups."""
+    legs = entry.get("legs") or {}
+    entry["legs"] = [
+        {"follower_id": fid, "follower": names.get(fid, fid), **leg}
+        for fid, leg in legs.items()
+    ]
+    # Missing = an active follower with no leg at all, or one whose leg failed.
+    entry["missing_followers"] = [
+        {"follower_id": fid, "follower": names.get(fid, fid),
+         "reason": (legs.get(fid) or {}).get("reason") or "no copy attempted"}
+        for fid in active_followers
+        if (legs.get(fid) or {}).get("status") not in ledger.ACCOUNTED_STATUSES
+    ]
+    return entry
+
+
+def _active_followers(user: CurrentUser) -> dict:
+    try:
+        q = db.table("accounts").select("id, name").eq("is_master", False).eq("status", "active")
+        res = scope_owned(q, user).execute()
+        return {r["id"]: r.get("name") for r in (res.data or [])}
+    except Exception as e:
+        logger.warning(f"ledger: could not load active followers: {e}")
+        return {}
+
+
+@router.get("/ledger/order/{master_order_id}")
+async def ledger_by_order(master_order_id: str, user: CurrentUser = Depends(get_current_user)):
+    """Full copy trail for one MASTER order id: what the master did, and what
+    each follower did about it (or why nothing happened)."""
+    entry = await ledger.get_entry(_redis, master_order_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="No ledger entry for that master order id.")
+    # Strict tenant check: a master order id is a guessable integer, so a
+    # non-admin must own the entry outright. An entry with no recorded owner is
+    # admin-only rather than open to everyone.
+    if not user.is_admin and entry.get("owner_id") != user.id:
+        raise HTTPException(status_code=404, detail="No ledger entry for that master order id.")
+    active = _active_followers(user)
+    names = _follower_names(list((entry.get("legs") or {}).keys()) + list(active.keys()))
+    return _decorate(entry, active, names)
+
+
+@router.get("/ledger/symbol/{symbol}")
+async def ledger_by_symbol(
+    symbol: str,
+    limit: int = Query(50, ge=1, le=200),
+    missing_only: bool = False,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Order-ID trail for a symbol, newest first. `missing_only=true` narrows it
+    to master orders at least one active follower never received — the fastest
+    way to answer "which exit didn't get copied?"."""
+    active = _active_followers(user)
+    entries = await ledger.recent(_redis, user.id, symbol.upper(), limit=limit)
+    seen_ids = [fid for e in entries for fid in (e.get("legs") or {})]
+    names = _follower_names(seen_ids + list(active.keys()))
+    out = [_decorate(e, active, names) for e in entries]
+    if missing_only:
+        out = [e for e in out if e["missing_followers"]]
+    return {"symbol": symbol.upper(), "count": len(out), "entries": out}
+
 
 @router.get("/{id}", response_model=TradeResponse)
 async def get_trade(id: str, user: CurrentUser = Depends(get_current_user)):

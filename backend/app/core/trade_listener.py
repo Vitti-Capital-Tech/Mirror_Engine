@@ -132,6 +132,10 @@ class TradeListener:
                     "symbol": p.get("product_symbol") or p.get("symbol"),
                     "size": sz,
                     "mark": p.get("mark_price"),
+                    # Master's entry price — the reconciler compares it against the
+                    # current mark to decide whether recovering a STALE leg is still
+                    # worth doing, instead of refusing outright (see _price_drift_ok).
+                    "entry": p.get("entry_price"),
                 })
         except Exception as e:
             logger.warning("Position reconcile: could not fetch master positions: %s", e)
@@ -169,7 +173,20 @@ class TradeListener:
             is_stop = bool(o.get("stop_order_type") or o.get("stop_price"))
             is_bracket = bool(o.get("bracket_order")) or str((o.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL")
             if is_stop and o.get("stop_order_type") and o.get("product_symbol"):
-                master_protection.append([o.get("product_symbol"), o.get("stop_order_type")])
+                # Full detail, not just (symbol, type): the copy engine now also
+                # PLACES protection a follower is missing, which needs the trigger
+                # price and product. Previously it could only cancel orphans, so a
+                # follower whose SL/TP mirror ever failed stayed unprotected forever.
+                master_protection.append({
+                    "master_order_id": str(o.get("id")),
+                    "symbol": o.get("product_symbol"),
+                    "stop_order_type": o.get("stop_order_type"),
+                    "stop_price": o.get("stop_price"),
+                    "product_id": o.get("product_id"),
+                    "order_type": o.get("order_type") or "market_order",
+                    "limit_price": o.get("limit_price"),
+                    "trigger": o.get("stop_trigger_method") or "mark_price",
+                })
             # Brackets/stops excluded from re-mirror (placed via position-open path;
             # reconciling them could double-place). Plain limits are safe — the copy
             # engine's per-order idempotency guard means this only fills gaps.

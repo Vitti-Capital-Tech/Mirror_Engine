@@ -9,6 +9,7 @@ from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
+from app.core import order_ledger as ledger
 from app.services.delta_client import DeltaClient
 from app.services import telegram_client as tg
 
@@ -45,6 +46,34 @@ ESCALATE_WAIT_SEC = 5
 # moved price is worse than sitting the trade out. Exits/closes are NEVER gated
 # on age (a late close still matters). (Prathav, 2026-07-29)
 FRESH_ENTRY_SEC = float(os.getenv("FRESH_ENTRY_SEC", "180"))  # 3 minutes
+
+# A follower may briefly hold MORE than its target while a mirrored close is
+# still working (order in flight, escalation pending). Only trim over-exposure
+# that has survived this long since the master's last fill on the symbol, so we
+# never race a close that's about to land.
+TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "45"))
+
+# When the master is FLAT, the follower still holds, and we CAN'T tell how the
+# master exited (`_classify_master_exit` -> "unknown", e.g. the master's close
+# has already rolled out of the recent order-history window — common for a grid
+# trader), we normally leave the follower alone and retry. That deferral is
+# unbounded, which is how an orphan can sit forever. Escape hatch: once the
+# master's last fill on that symbol is older than this, a follower's own jittered
+# stop was never going to fire alongside it either — so treat it as an orphan and
+# close. Generous vs FRESH_ENTRY_SEC because a real SL/TP mirror fires in seconds.
+STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "360"))  # 6 minutes
+
+# Recovering a leg the master entered a long time ago used to be refused outright:
+# the reconciler logged "SKIP stale entry ... leaving follower flat" every 15s,
+# forever. Safe against price drift, but it meant ANY entry a follower missed was
+# never recovered — the follower silently diverged further from the master all day
+# (2026-07-30 audit: 5 missing legs, one 3.8h old and still being skipped).
+#
+# Instead of refusing on AGE, judge on PRICE: recover the leg if the current mark
+# is still within this much of the master's own entry price. A leg the master got
+# at a similar price is worth having; one that has run away is not, and that case
+# alerts instead of silently doing nothing. Percent, e.g. 15 = ±15%.
+SYNC_PRICE_TOLERANCE_PCT = float(os.getenv("SYNC_PRICE_TOLERANCE_PCT", "15"))
 
 
 def _parse_epoch(v):
@@ -98,6 +127,19 @@ class CopyEngine:
         # hasn't shown in get_positions yet) can never trigger a duplicate.
         self._recon_open_prev: set = set()
         self._recon_close_prev: set = set()
+        # Same two-pass confirmation for a TRIM (follower on the correct side but
+        # holding more than its share of the master's remaining position — i.e. a
+        # partial exit that never got copied). Keyed on the excess too, so a size
+        # that's still moving restarts the confirmation instead of acting mid-flight.
+        self._recon_trim_prev: set = set()
+        # Same, for a TOP-UP (follower on the correct side but holding LESS than its
+        # share — a partially-missed entry). Adds exposure, so it gets the same
+        # two-pass confirmation, the open debounce, and a price-drift guard.
+        self._recon_topup_prev: set = set()
+        # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
+        # previous sweep. Protection is only ADDED after two consecutive sightings,
+        # so a partial order read can never cause a duplicate stop.
+        self._prot_missing_prev: set = set()
         # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
@@ -248,6 +290,15 @@ class CopyEngine:
         if is_exit:
             master_remaining = await self._master_position_size(master_row, symbol)
 
+        # Order-ID ledger: record the MASTER order before dispatching anything, so
+        # a crash mid-dispatch still leaves an entry with no follower legs (i.e.
+        # visibly unmirrored) instead of no trace at all.
+        await ledger.record_master_order(
+            self.redis, master_trade_id, symbol=symbol, side=side, size=quantity,
+            price=entry_price, kind="exit" if is_exit else "entry",
+            owner_id=owner_id, source="fill", ts=ts_detected,
+        )
+
         tasks = []
         for follower in followers:
             # Inject master balance context
@@ -267,6 +318,10 @@ class CopyEngine:
                         "failure_reason": f"Connection error: {e}",
                         "owner_id": follower.get("owner_id"),
                     }).execute()
+                    await ledger.record_follower_leg(
+                        self.redis, master_trade_id, follower["id"],
+                        status="failed", reason=f"connection error: {e}",
+                    )
                     continue
             if not client:
                 continue
@@ -285,6 +340,10 @@ class CopyEngine:
                             f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
                             f"target {int(target)} (master left {master_remaining:.0f})"
                         )
+                        await ledger.record_follower_leg(
+                            self.redis, master_trade_id, follower["id"], status="skipped",
+                            reason=f"already at target {int(target)} (holds {current:.0f})",
+                        )
                         continue
             else:
                 # Only open if the master genuinely holds a same-side position.
@@ -298,6 +357,10 @@ class CopyEngine:
                     logger.info(
                         f"Skipping follower OPEN for {follower['name']} {symbol} {side}: "
                         f"master holds {master_signed_now:+.0f} — not a genuine open (likely an unflagged close)."
+                    )
+                    await ledger.record_follower_leg(
+                        self.redis, master_trade_id, follower["id"], status="skipped",
+                        reason=f"not a genuine open (master holds {master_signed_now:+.0f})",
                     )
                     continue
                 follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
@@ -321,9 +384,21 @@ class CopyEngine:
             logger.info(f"[LATENCY] {symbol}: {(time.time() - ts_detected):.2f}s end-to-end (detection → followers executed)")
 
         # 4b. Telegram notifications — one clean message per follower outcome.
+        #     Each outcome is also written to the order-ID ledger against this
+        #     master order, so "did follower X get master order Y?" is answerable
+        #     later without re-deriving it from positions. (The executor may place
+        #     a limit AND a market remainder, so we record the status/qty rather
+        #     than a single follower order id.)
         for r in results:
             acct = r.get("account_name") or "Follower"
             st = r.get("status")
+            if r.get("account_id"):
+                await ledger.record_follower_leg(
+                    self.redis, master_trade_id, r["account_id"],
+                    status="filled" if st == "filled" else ("skipped" if st in ("skipped", "skipped_circuit_breaker") else "failed"),
+                    qty=r.get("filled_quantity"),
+                    reason=r.get("failure_reason"),
+                )
             if st == "filled":
                 lots = r.get("filled_quantity")
                 px = r.get("execution_price")
@@ -530,6 +605,42 @@ class CopyEngine:
             logger.info(f"classify_master_exit: {symbol} -> {result}")
         return result
 
+    @staticmethod
+    def _price_drift_ok(mark, entry) -> tuple:
+        """Is the current price still close enough to the master's entry to make
+        recovering/topping-up a stale leg worthwhile?
+
+        Returns (ok, drift_pct). Unknown prices return ok=True: the alternative is
+        the old behaviour of never recovering anything, and a missing leg is a
+        certain divergence while price drift is only a possible cost."""
+        try:
+            e = float(entry or 0)
+            m = float(mark or 0)
+        except (TypeError, ValueError):
+            return True, 0.0
+        if e <= 0 or m <= 0:
+            return True, 0.0
+        drift = abs(m - e) / e * 100.0
+        return drift <= SYNC_PRICE_TOLERANCE_PCT, drift
+
+    async def _missed_exit_ids(self, follower: dict, symbol: str) -> str:
+        """Master EXIT order ids on `symbol` that never reached this follower, per
+        the order-ID ledger — comma-joined for logging.
+
+        This is the audit trail the position-only reconciler never had: when we
+        heal a mismatch we can now name the master order that caused it, instead
+        of just reporting a net size difference. Diagnostic only — the heal itself
+        never depends on it, so an empty result never blocks the fix."""
+        try:
+            rows = await ledger.missing_for_follower(
+                self.redis, follower.get("owner_id"), symbol, follower.get("id"),
+                kind="exit",
+            )
+            return ", ".join(str(r.get("master_order_id")) for r in rows[:5])
+        except Exception as e:
+            logger.debug(f"ledger lookup failed for {symbol}: {e}")
+            return ""
+
     async def _cancel_follower_stops(self, client, symbol: str, name: str = "") -> None:
         """Cancel any resting SL/TP (stop) orders the follower still has on
         `symbol`. Called after force-closing an orphaned master-flat leg so no
@@ -675,6 +786,15 @@ class CopyEngine:
             we opened it within the debounce window.
           • Follower holds a leg the master is FLAT on, or on the OPPOSITE side
             (a desync) -> CLOSE it (reduce-only market).
+          • Follower holds the RIGHT side but MORE than its share of what the
+            master still holds -> TRIM the excess (reduce-only market). This is
+            the incomplete-exit case: side-only comparison saw "follower is short,
+            master is short, fine" and left the follower carrying lots the master
+            had already sold. Guarded so rounding, positions still being built and
+            transient reads can't cause a wrong trim (see the block itself), and
+            the order-ID ledger names the master exit involved. NOTE this is the
+            BACKSTOP — a master that cancels its exit is settled immediately by
+            _settle_exit_after_cancel; this catches the case where it never does.
 
         NOTE on the master-FLAT case when the follower still has its own resting
         SL/TP: whether we close depends on HOW the master got flat (see
@@ -690,7 +810,7 @@ class CopyEngine:
         for p in (event.get("positions") or []):
             sym = p.get("symbol")
             if sym:
-                master_map[sym] = (float(p.get("size") or 0), p.get("mark"))
+                master_map[sym] = (float(p.get("size") or 0), p.get("mark"), p.get("entry"))
 
         # Master balance for proportional sizing of any recovery open, and the
         # master row itself so we can classify how the master closed a symbol.
@@ -719,6 +839,8 @@ class CopyEngine:
         now = time.time()
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
+        current_trim: set = set()   # (follower_id, sym, excess) over-exposed THIS pass
+        current_topup: set = set()  # (follower_id, sym, short_by) under-exposed THIS pass
         # Lazily fetched once per pass (shared across followers): {sym: last master
         # fill epoch}. Gates recovery-opens so we never re-enter a stale leg.
         master_fresh_ts = None
@@ -736,21 +858,173 @@ class CopyEngine:
                     sz = float(p.get("size") or 0)
                     if s and sz != 0:
                         fpos[s] = sz
-                resting = set()
+                resting = set()          # symbols with ANY resting order (incl. SL/TP)
+                resting_plain: dict = {}  # symbol -> [non-protective resting orders]
                 for st in ("open", "pending"):
                     try:
                         for o in await client.get_open_orders(state=st):
-                            if o.get("product_symbol"):
-                                resting.add(o.get("product_symbol"))
+                            psym = o.get("product_symbol")
+                            if not psym:
+                                continue
+                            resting.add(psym)
+                            if not o.get("stop_order_type"):
+                                resting_plain.setdefault(psym, []).append(o)
                     except Exception:
                         pass
 
-                # 1) CLOSE — follower holds a leg the master is flat on / opposite.
+                # 1) CLOSE / TRIM — follower holds a leg the master is flat on, is
+                #    on the OPPOSITE side, or is on the right side at the wrong SIZE.
                 for sym, fsz in list(fpos.items()):
-                    msz = master_map.get(sym, (0, None))[0]
+                    msz = master_map.get(sym, (0, None, None))[0]
                     same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
                     if same_side:
-                        continue  # follower on the right side — keep it
+                        # Right side — but is it the right SIZE? An exit the follower
+                        # didn't complete leaves it over-exposed on the CORRECT side,
+                        # which a side-only comparison cannot see. On
+                        # C-BTC-67200-300726 (2026-07-29) the master's exit limit
+                        # half-filled while the follower's mirrored copy filled
+                        # nothing, so the follower held 30 against a target of 15 for
+                        # hours and every check said "both short, fine".
+                        #
+                        # The target uses round_up=True — the same rounding the OPEN
+                        # path used to size the position — so ordinary ceil/floor
+                        # rounding can never masquerade as over-exposure and trigger
+                        # a spurious trim. Only a genuinely missed reduction shows up.
+                        # A plain resting order on this symbol USED to skip the trim
+                        # outright ("a close is in flight, don't race it"). That was
+                        # the flaw that would have missed 67200 entirely: the
+                        # follower's mirrored exit sat there unfilled for 2.5h, so the
+                        # guard suppressed the fix for the whole incident. It can't
+                        # tell "in flight" from "stuck".
+                        #
+                        # Split the two cases by what the order would DO (derived from
+                        # the side, not the reduce_only flag, which the exchange
+                        # doesn't always set):
+                        #   • anything that would ADD to the position -> genuinely
+                        #     unsettled (the follower may be building) -> skip.
+                        #   • only reducing orders -> a stuck close. Cancel them, then
+                        #     trim. Cancelling FIRST matters: leaving a reduce-only
+                        #     order resting while we market the excess would double-
+                        #     close the follower if it later filled.
+                        stuck_closes = []
+                        adding = False
+                        for o in resting_plain.get(sym, []):
+                            oside = (o.get("side") or "").lower()
+                            reduces = (oside == "buy" and fsz < 0) or (oside == "sell" and fsz > 0)
+                            if reduces:
+                                stuck_closes.append(o)
+                            else:
+                                adding = True
+                        if adding:
+                            continue  # position still being built — size not settled
+                        held = int(abs(fsz))
+                        _m = master_map.get(sym, (0, None, None))
+                        mark, mentry = _m[1], _m[2]
+                        target = self.risk_engine.calculate_follower_quantity(
+                            abs(msz), float(mark) if mark else 0.0, fol, round_up=True
+                        )
+                        excess = held - int(target)
+                        if excess == 0:
+                            continue
+                        # Don't act while the master is still trading this symbol —
+                        # its size is moving and any diff we see is transient.
+                        if master_fresh_ts is None:
+                            master_fresh_ts = await self._master_recent_fill_ts(master_row)
+                        last_fill = master_fresh_ts.get(sym)
+                        if last_fill is not None and (now - last_fill) < TRIM_SETTLE_SEC:
+                            continue
+
+                        # ---- UNDER-exposed: the follower holds LESS than its share.
+                        # Nothing used to handle this at all — the open path only fires
+                        # when the follower is completely FLAT, so a partially-filled or
+                        # partially-missed entry stayed short of target indefinitely
+                        # (2026-07-30 audit: 4 symbols, all under). Top up the shortfall,
+                        # subject to the same price guard as a stale recovery since this
+                        # is ADDING exposure at today's price.
+                        if excess <= -1:
+                            short_by = -excess
+                            ok, drift = self._price_drift_ok(mark, mentry)
+                            if not ok:
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
+                                    f"({held} vs target {int(target)}) but price drifted "
+                                    f"{drift:.1f}% from master entry {mentry} — NOT topping up"
+                                )
+                                asyncio.create_task(tg.notify_fail(
+                                    fol.get("name"), sym, "topup", short_by,
+                                    f"price drifted {drift:.0f}% from master entry",
+                                    key=f"drift:{fid}:{sym}", window=3600,
+                                ))
+                                self._recon_open_ts[(fid, sym)] = now
+                                continue
+                            ukey = (fid, sym, short_by)
+                            current_topup.add(ukey)
+                            if ukey not in self._recon_topup_prev:
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} under-exposed on {sym} — holds "
+                                    f"{held}, target {int(target)} (short {short_by}) — confirming "
+                                    f"next pass before topping up"
+                                )
+                                continue
+                            if now - self._recon_open_ts.get((fid, sym), 0) < self._RECON_OPEN_DEBOUNCE:
+                                continue
+                            self._recon_open_ts[(fid, sym)] = now
+                            side = "buy" if fsz > 0 else "sell"
+                            try:
+                                await client.place_order(
+                                    symbol=sym, side=side, size=int(short_by),
+                                    order_type="market_order", reduce_only=False,
+                                )
+                                logger.info(
+                                    f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
+                                    f"({held} -> {int(target)}, master {msz:+.0f}, drift {drift:.1f}%)"
+                                )
+                                asyncio.create_task(tg.notify_open(
+                                    fol.get("name"), sym, side, int(short_by), mark or None))
+                            except Exception as e:
+                                body = getattr(getattr(e, "response", None), "text", "")
+                                logger.warning(f"reconcile top-up failed for {fol.get('name')} {sym}: {e} {body}")
+                                asyncio.create_task(tg.notify_fail(
+                                    fol.get("name"), sym, side, int(short_by), _short_reason(e, body),
+                                    key=f"topup:{fid}:{sym}", window=1800,
+                                ))
+                            continue
+
+                        # ---- OVER-exposed: an exit the follower didn't complete.
+                        tkey = (fid, sym, excess)
+                        current_trim.add(tkey)
+                        if tkey not in self._recon_trim_prev:
+                            logger.info(
+                                f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
+                                f"{held}, target {int(target)} for master {msz:+.0f} "
+                                f"(excess {excess}) — confirming next pass before trimming"
+                            )
+                            continue
+                        missed = await self._missed_exit_ids(fol, sym)
+                        side = "sell" if fsz > 0 else "buy"
+                        try:
+                            # Clear any stuck reduce-only limit first, so it can't
+                            # fill on top of the market close below.
+                            for o in stuck_closes:
+                                if await self._safe_cancel(client, o.get("id"), o.get("product_id")):
+                                    logger.info(
+                                        f"reconcile: cancelled stuck close {o.get('id')} on {sym} "
+                                        f"for {fol.get('name')} before trimming (never filled)"
+                                    )
+                            await client.place_order(
+                                symbol=sym, side=side, size=int(excess),
+                                order_type="market_order", reduce_only=True,
+                            )
+                            logger.info(
+                                f"reconcile: TRIMMED {fol.get('name')} {sym} by {excess} "
+                                f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
+                                f"exit order(s): {missed or 'none recorded in ledger'}"
+                            )
+                            asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(excess)))
+                        except Exception as e:
+                            body = getattr(getattr(e, "response", None), "text", "")
+                            logger.warning(f"reconcile trim failed for {fol.get('name')} {sym}: {e} {body}")
+                        continue
                     # Master FLAT but the follower still holds AND has its own
                     # resting SL/TP: only close it if the master got flat by a
                     # MANUAL close (its stop won't hit -> orphan). If the master
@@ -760,7 +1034,26 @@ class CopyEngine:
                     if msz == 0 and sym in resting:
                         reason = await self._classify_master_exit(master_row, sym)
                         if reason != "manual":
-                            continue
+                            # That deferral is UNBOUNDED, which is how an orphan can
+                            # sit forever: for a busy (grid) master the close rolls
+                            # out of the recent order-history window and classify
+                            # returns "unknown" on every pass. Escape hatch — if the
+                            # master hasn't filled anything on this symbol in a long
+                            # while, the follower's own jittered stop was never going
+                            # to fire alongside the master's either, so it IS an
+                            # orphan and we stop waiting.
+                            if master_fresh_ts is None:
+                                master_fresh_ts = await self._master_recent_fill_ts(master_row)
+                            last_fill = master_fresh_ts.get(sym)
+                            if last_fill is not None and (now - last_fill) <= STALE_ORPHAN_SEC:
+                                continue  # recent master exit — let the follower's
+                                          # own stop have its chance first
+                            age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "not in recent window"
+                            logger.info(
+                                f"reconcile: {fol.get('name')} still holds {sym} {fsz:+.0f} behind a "
+                                f"resting stop; master exit reads '{reason}' but is stale (last master "
+                                f"fill {age_txt}) — treating as an orphan and closing"
+                            )
                     key = (fid, sym)
                     current_close.add(key)
                     if key not in self._recon_close_prev:
@@ -772,7 +1065,11 @@ class CopyEngine:
                             order_type="market_order", reduce_only=True,
                         )
                         why = "manual master close orphan" if msz == 0 else "wrong-side desync"
-                        logger.info(f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) — {why}")
+                        missed = await self._missed_exit_ids(fol, sym)
+                        logger.info(
+                            f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) "
+                            f"— {why}; missed master exit order(s): {missed or 'none recorded in ledger'}"
+                        )
                         asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
                         # Master-flat close leaves the follower's own SL/TP resting
                         # on a now-flat leg — nothing else cancels it once the
@@ -784,7 +1081,7 @@ class CopyEngine:
                         logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
 
                 # 2) OPEN — master holds a leg the follower is flat on (recover miss).
-                for sym, (msz, mark) in master_map.items():
+                for sym, (msz, mark, mentry) in master_map.items():
                     if msz == 0 or fpos.get(sym, 0) != 0:
                         continue
                     if sym in resting:
@@ -801,25 +1098,42 @@ class CopyEngine:
                     target = self.risk_engine.calculate_follower_quantity(abs(msz), price, fol, round_up=True)
                     if target < 1:
                         continue
-                    # Freshness gate: only RECOVER a leg the master entered
-                    # recently. After downtime the master still holds hours-old
-                    # positions; re-entering the follower now (at a drifted price)
-                    # is worse than staying out — so if the master's last fill on
-                    # this symbol is older than FRESH_ENTRY_SEC, do nothing.
-                    # (Prathav, 2026-07-29)
+                    # A leg the master entered RECENTLY is recovered outright. An
+                    # older one used to be refused unconditionally, which meant a
+                    # missed entry was never recovered — the reconciler logged "SKIP
+                    # stale entry ... leaving follower flat" every 15s indefinitely
+                    # while the follower drifted further from the master (2026-07-30
+                    # audit: 5 missing legs, the oldest 3.8h and still being skipped).
+                    #
+                    # Age is the wrong test. What actually matters is whether the
+                    # price has moved away from what the master paid: judge on PRICE
+                    # drift instead, and when it IS too far, say so loudly rather
+                    # than silently doing nothing forever. (desk call, 2026-07-30)
                     if master_fresh_ts is None:
                         master_fresh_ts = await self._master_recent_fill_ts(master_row)
                     last_fill = master_fresh_ts.get(sym)
-                    if last_fill is None or (now - last_fill) > FRESH_ENTRY_SEC:
+                    is_fresh = last_fill is not None and (now - last_fill) <= FRESH_ENTRY_SEC
+                    if not is_fresh:
+                        ok, drift = self._price_drift_ok(mark, mentry)
                         age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "no recent fill"
+                        if not ok:
+                            logger.info(
+                                f"reconcile: NOT recovering {fol.get('name')} {sym} — price drifted "
+                                f"{drift:.1f}% from master entry {mentry} (mark {mark}, master last "
+                                f"fill {age_txt}, tolerance {SYNC_PRICE_TOLERANCE_PCT:.0f}%)"
+                            )
+                            asyncio.create_task(tg.notify_fail(
+                                fol.get("name"), sym, "recover", int(target),
+                                f"price drifted {drift:.0f}% from master entry — follower left flat",
+                                key=f"drift:{fid}:{sym}", window=3600,
+                            ))
+                            self._recon_open_ts[key] = now
+                            continue
                         logger.info(
-                            f"reconcile: SKIP stale entry {fol.get('name')} {sym} "
-                            f"(master last fill {age_txt}, > {FRESH_ENTRY_SEC:.0f}s) — leaving follower flat"
+                            f"reconcile: recovering stale leg {fol.get('name')} {sym} "
+                            f"(master last fill {age_txt}) — price within {drift:.1f}% of master "
+                            f"entry {mentry}, inside the {SYNC_PRICE_TOLERANCE_PCT:.0f}% tolerance"
                         )
-                        # Throttle re-check/re-log of a persistently-held stale leg
-                        # via the same debounce used after a real open.
-                        self._recon_open_ts[key] = now
-                        continue
                     self._recon_open_ts[key] = now
                     side = "buy" if msz > 0 else "sell"
                     try:
@@ -842,6 +1156,8 @@ class CopyEngine:
         # Remember this pass's candidates so the next pass can confirm them.
         self._recon_open_prev = current_open
         self._recon_close_prev = current_close
+        self._recon_trim_prev = current_trim
+        self._recon_topup_prev = current_topup
 
     async def _sync_protection(self, event: dict) -> None:
         """Cancel any follower SL/TP whose master counterpart no longer exists.
@@ -855,7 +1171,19 @@ class CopyEngine:
         We only touch symbols the master still holds (a flat master is handled by
         the exit-close path), so we never strip protection the master still wants."""
         owner_id = event.get("owner_id")
-        master_prot = {(s, t) for s, t in (event.get("master_protection") or [])}
+        # Payload is now a list of dicts (symbol + trigger detail) so we can PLACE
+        # missing protection, not just cancel orphans. Older queued events used
+        # [symbol, type] pairs — accept both so a deploy mid-flight can't break.
+        master_prot: set = set()
+        prot_detail: dict = {}
+        for item in (event.get("master_protection") or []):
+            if isinstance(item, dict):
+                s, t = item.get("symbol"), item.get("stop_order_type")
+                if s and t:
+                    master_prot.add((s, t))
+                    prot_detail[(s, t)] = item
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                master_prot.add((item[0], item[1]))
         master_symbols = set(event.get("master_symbols") or [])
         if not master_symbols:
             return
@@ -868,6 +1196,7 @@ class CopyEngine:
             logger.error(f"sync_protection: failed to load followers: {e}")
             return
         current_orphans: set = set()
+        current_missing: set = set()
         for fol in followers:
             client = await self._get_follower_client(fol)
             if not client:
@@ -875,6 +1204,7 @@ class CopyEngine:
             try:
                 orders = []
                 seen = set()
+                read_ok = False
                 for st in ("pending", "open"):
                     try:
                         for o in await client.get_open_orders(state=st):
@@ -882,6 +1212,7 @@ class CopyEngine:
                                 continue
                             seen.add(o.get("id"))
                             orders.append(o)
+                        read_ok = True
                     except Exception:
                         pass
                 for o in orders:
@@ -906,10 +1237,94 @@ class CopyEngine:
                         logger.info(f"sync_protection: cancelled orphan {stype} on {sym} for {fol.get('name')} (master removed it)")
                     except Exception as e:
                         logger.warning(f"sync_protection: failed to cancel {stype} on {sym} for {fol.get('name')}: {e}")
+
+                # ---- ADD protection the follower is MISSING. ----
+                # Until now this sweep could only ever CANCEL: nothing anywhere in
+                # the engine could place a stop a follower never got. Brackets are
+                # excluded from the order re-mirror (reconciling them could
+                # double-place), so a single failed bracket mirror left that position
+                # unprotected indefinitely — 2026-07-30 audit found a follower short
+                # 31 lots of C-BTC-67500-310726 with no stop at all, and another
+                # holding C-BTC-65400-300726 with no TP.
+                if not read_ok or not prot_detail:
+                    continue  # couldn't read the follower's orders — never guess
+                try:
+                    fheld = {}
+                    for p in await client.get_positions():
+                        s = p.get("product_symbol") or p.get("symbol")
+                        sz = float(p.get("size") or 0)
+                        if s and sz:
+                            fheld[s] = sz
+                except Exception as e:
+                    logger.warning(f"sync_protection: positions read failed for {fol.get('name')}: {e}")
+                    continue
+                have = {(o.get("product_symbol"), o.get("stop_order_type"))
+                        for o in orders if o.get("stop_order_type")}
+                for (sym, stype), det in prot_detail.items():
+                    if sym not in fheld:
+                        continue  # follower doesn't hold it — nothing to protect
+                    if (sym, stype) in have:
+                        continue  # already protected
+                    mkey = (fol.get("id"), sym, stype)
+                    current_missing.add(mkey)
+                    if mkey not in self._prot_missing_prev:
+                        logger.info(
+                            f"sync_protection: {fol.get('name')} holds {sym} with no {stype} "
+                            f"— confirming next sweep before placing"
+                        )
+                        continue
+                    stop_price = det.get("stop_price")
+                    product_id = det.get("product_id")
+                    if stop_price is None or not product_id:
+                        continue
+                    try:
+                        jittered = self._jitter_trigger(float(stop_price), seed=str(fol.get("id")))
+                        otype = det.get("order_type") or "market_order"
+                        leg = {"order_type": otype, "stop_price": str(jittered)}
+                        if otype == "limit_order" and det.get("limit_price") is not None:
+                            leg["limit_price"] = str(det["limit_price"])
+                        sl = leg if stype == "stop_loss_order" else None
+                        tp = leg if stype == "take_profit_order" else None
+                        resp = await client.place_bracket(
+                            product_id=product_id, stop_loss=sl, take_profit=tp,
+                            trigger_method=det.get("trigger") or "mark_price",
+                        )
+                        result = resp.get("result", resp) if isinstance(resp, dict) else {}
+                        foid = (result.get(stype) or {}).get("id") if isinstance(result, dict) else None
+                        moid = det.get("master_order_id")
+                        if foid and moid:
+                            # Map it like a live mirror would, so a later master
+                            # cancel/edit of this stop can find the follower's copy.
+                            await self.redis.hset(f"ordermap:{moid}", fol["id"], str(foid))
+                            await self.redis.expire(f"ordermap:{moid}", 7 * 24 * 3600)
+                            await ledger.record_follower_leg(
+                                self.redis, moid, fol["id"], status="placed",
+                                follower_order_id=foid, reason="protection restored by sweep",
+                            )
+                        logger.info(
+                            f"sync_protection: PLACED missing {stype} on {sym} for "
+                            f"{fol.get('name')} @ {jittered} (master {stop_price}, order {foid})"
+                        )
+                        asyncio.create_task(tg.send_alert({
+                            "level": "warning", "type": "protection_restored",
+                            "message": (f"{fol.get('name')} was holding {sym} with no {stype} — "
+                                        f"restored at {jittered}"),
+                        }))
+                    except Exception as e:
+                        body = getattr(getattr(e, "response", None), "text", "")
+                        logger.error(
+                            f"sync_protection: FAILED to place {stype} on {sym} for "
+                            f"{fol.get('name')}: {e} {body}"
+                        )
+                        asyncio.create_task(tg.notify_fail(
+                            fol.get("name"), sym, stype, None, _short_reason(e, body),
+                            key=f"prot:{fol.get('id')}:{sym}:{stype}", window=1800,
+                        ))
             except Exception as e:
                 logger.warning(f"sync_protection: error for {fol.get('name')}: {e}")
-        # Remember this sweep's orphans so the next sweep can confirm them.
+        # Remember this sweep's candidates so the next sweep can confirm them.
         self._prot_orphans_prev = current_orphans
+        self._prot_missing_prev = current_missing
 
     async def _sync_followers_to_master_exit(self, event: dict) -> None:
         """Retired by strategy decision: we no longer force-close followers when a
@@ -984,11 +1399,30 @@ class CopyEngine:
                 reduce_only = True
 
         ref_price = limit_price or stop_price or 0.0
+
+        # Order-ID ledger: record the master's resting order. Called again on every
+        # WS update / reconcile pass for the same order — record_master_order is
+        # idempotent, so that just refreshes the entry. Brackets are the master's
+        # own protection, not a directional order, so they're logged as such and
+        # never counted as a missed entry/exit.
+        _kind = "bracket" if is_bracket else ("exit" if reduce_only else "entry")
+        await ledger.record_master_order(
+            self.redis, master_order_id, symbol=symbol, side=side, size=master_qty,
+            price=ref_price or None, kind=_kind, owner_id=owner_id, source="order",
+            ts=event.get("ts"),
+        )
+
+        # Is this the master's PROTECTION (SL/TP) rather than a directional order?
+        # Decided once: it changes how the mirror is sized (cover the position, not
+        # "close the difference") — see the branch in the follower loop below.
+        is_protective_order = bool(stop_order_type or stop_price is not None)
+
         for follower in followers:
             follower["master_balance"] = master_balance
             # Floor so the mirrored order quantity matches the follower's position
             # (which was also floored on open). reduce_only caps it anyway.
             qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
+            place_stop_price = stop_price  # per-follower (jittered for protection)
             client = await self._get_follower_client(follower)
             if not client:
                 continue
@@ -1069,6 +1503,10 @@ class CopyEngine:
                         if foid:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(foid))
                             await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
+                            await ledger.record_follower_leg(
+                                self.redis, master_order_id, follower["id"],
+                                status="placed", follower_order_id=foid,
+                            )
                         logger.info(f"Mirrored bracket {master_order_id} ({stop_order_type}, trigger={trigger_method}) -> {follower['name']}")
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
@@ -1082,7 +1520,43 @@ class CopyEngine:
             # (min_one=False so a tiny master trim doesn't wipe a small follower),
             # CAPPED at what the follower actually holds so it can never over-close
             # or hit a "no position" reject. reduce_only also caps it exchange-side.
-            if reduce_only and not is_update:
+            # A PROTECTIVE order (SL/TP) is reduce_only too, but it is NOT a
+            # close-now instruction — it's cover that should REST until triggered.
+            # Running it through the close-rebalance logic below asks "how much does
+            # this follower need to close right now?", and for a correctly-sized
+            # follower the answer is always "nothing" — so the protection was
+            # silently dropped. That is why C-BTC-65400-300726 logged
+            #   "Reduce-only close ... nothing to rest (holds 1, target 1)"
+            # 175 times while the follower sat there with no TP at all, and why
+            # C-BTC-67500-310726 was short 31 lots with no stop (2026-07-30 audit).
+            # Protection only ever got placed by accident, on the passes where the
+            # follower happened to be OVER target so the rebalance returned qty >= 1.
+            #
+            # Size it proportionally like any other mirror, capped at what the
+            # follower actually holds so the cover can't exceed the position.
+            if is_protective_order and not is_update:
+                try:
+                    held = int(abs(float(await self._position_size_signed(client, symbol))))
+                except Exception:
+                    held = 0
+                if held < 1:
+                    logger.info(
+                        f"Protection {stop_order_type or 'stop'} for {follower['name']} on "
+                        f"{symbol}: follower holds nothing to protect, skipping"
+                    )
+                    await ledger.record_follower_leg(
+                        self.redis, master_order_id, follower["id"], status="skipped",
+                        reason="no position to protect",
+                    )
+                    continue
+                qty = min(int(qty), held)
+                # Jitter like the bracket path, so followers don't all trigger at the
+                # same instant on the same price. Per-follower local — mutating the
+                # shared stop_price would compound the jitter for the next follower.
+                if stop_price is not None:
+                    place_stop_price = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
+
+            elif reduce_only and not is_update:
                 # A reduce-only order must be on the OPPOSITE side of the
                 # follower's position: a buy reduces a short, a sell reduces a
                 # long. If the follower is flat or on the SAME side (a position
@@ -1097,6 +1571,10 @@ class CopyEngine:
                     logger.info(
                         f"Reduce-only {side} for {follower['name']} on {symbol}: follower holds "
                         f"{signed:+.0f} — not reducible by a {side}, skipping (position desync?)"
+                    )
+                    await ledger.record_follower_leg(
+                        self.redis, master_order_id, follower["id"], status="skipped",
+                        reason=f"holds {signed:+.0f}, not reducible by {side}",
                     )
                     continue
                 # Size the close by REBALANCING to the master's position AFTER this
@@ -1119,6 +1597,10 @@ class CopyEngine:
                     logger.info(
                         f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest "
                         f"(holds {follower_held}, target {int(target)} for master remaining {intended_remaining:.0f})"
+                    )
+                    await ledger.record_follower_leg(
+                        self.redis, master_order_id, follower["id"], status="skipped",
+                        reason=f"already at target {int(target)} (holds {follower_held})",
                     )
                     continue
 
@@ -1148,7 +1630,7 @@ class CopyEngine:
                     order_type=order_type,
                     limit_price=limit_price,
                     reduce_only=reduce_only,
-                    stop_price=stop_price,
+                    stop_price=place_stop_price,
                     stop_order_type=event.get("stop_order_type"),
                     stop_trigger_method=event.get("stop_trigger_method"),
                 )
@@ -1158,15 +1640,26 @@ class CopyEngine:
                     # Map master order -> this follower's order, so we can cancel/edit it later.
                     await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
+                    await ledger.record_follower_leg(
+                        self.redis, master_order_id, follower["id"], status="placed",
+                        follower_order_id=follower_order_id, qty=qty,
+                    )
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
 
-                    # Plain LIMIT ENTRY (not a stop/bracket/reduce-only): if it
-                    # hasn't filled after the wait+retry window, escalate to a
-                    # full-or-nothing market order so the follower actually gets in.
-                    # Reduce-only closes are intentionally excluded — they mirror
-                    # the master's resting limit EXIT and should sit and fill at
-                    # that price, not be forced to market or cancelled.
-                    if order_type == "limit_order" and stop_price is None and not is_bracket and not reduce_only:
+                    # Plain LIMIT order (not a stop/bracket): if it hasn't filled
+                    # after the wait+retry window, escalate to market so the follower
+                    # actually gets in — or OUT. Reduce-only closes used to be
+                    # excluded here on the theory that they should sit and fill at the
+                    # master's price. 67200 showed the flaw: the master's exit limit
+                    # only half-filled and was then cancelled, so the follower's
+                    # mirrored exit rested 2.5h, never filled, and died with the
+                    # master's cancel — leaving the follower holding a position the
+                    # master had left. Exits now escalate too ("limit wait 5s, then
+                    # market", to maintain relative position). The escalation body
+                    # already sizes a reduce-only force correctly: it re-derives how
+                    # much the follower still owes and cancels the stale limit if the
+                    # answer is nothing.
+                    if order_type == "limit_order" and stop_price is None and not is_bracket:
                         asyncio.create_task(self._escalate_unfilled_limit(
                             follower, client, follower_order_id, product_id, symbol,
                             side, int(qty), reduce_only, master_row, limit_price,
@@ -1183,6 +1676,10 @@ class CopyEngine:
                     f"Failed to mirror order to {follower['name']} "
                     f"[{symbol} {side} qty={qty} type={order_type} reduce_only={reduce_only} "
                     f"limit={limit_price} stop={stop_price}]: {e} | body={body}"
+                )
+                await ledger.record_follower_leg(
+                    self.redis, master_order_id, follower["id"], status="failed",
+                    qty=qty, reason=_short_reason(e, body),
                 )
                 key = f"fail:{follower['id']}:{symbol}:{side}:place"
                 asyncio.create_task(tg.notify_fail(
@@ -1234,10 +1731,15 @@ class CopyEngine:
 
             # ---- Point 3 exceptions: leave the GTC limit RESTING (no market, no
             # cancel) and let it wait, when: ----
-            # (a) cheap tail options (limit < 2): a market order gives an awful fill
-            #     on a sub-$2 premium — better to keep resting at the master's price.
-            if limit_price is not None and float(limit_price) < 2:
-                logger.info(f"Escalation: {follower['name']} {symbol} limit {limit_price} < 2 — leaving it resting (no market).")
+            # (a) cheap tail ENTRIES (limit < 2): a market order gives an awful fill
+            #     on a sub-$2 premium, and not getting in is a free option — so wait.
+            #     EXITS are deliberately exempt: staying in a position the master has
+            #     already left is open-ended risk, while the slippage is bounded, so
+            #     relative position wins over fill price. This exemption is the whole
+            #     reason 67200 (a 1.2 option) sat unexited for 2.5h — the guard fired
+            #     and the follower was left holding. (desk call, 2026-07-30)
+            if not reduce_only and limit_price is not None and float(limit_price) < 2:
+                logger.info(f"Escalation: {follower['name']} {symbol} ENTRY limit {limit_price} < 2 — leaving it resting (no market).")
                 return
 
             # Is forcing still warranted?
@@ -1335,6 +1837,65 @@ class CopyEngine:
                         return str(o.get("id"))
         return None
 
+    async def _settle_exit_after_cancel(self, follower: dict, client, symbol: str,
+                                        master_row: dict, ref_price: float = 0.0) -> None:
+        """The master cancelled a plain resting order on `symbol`. If that leaves the
+        follower holding MORE than its share of what the master still holds, close the
+        difference at market now.
+
+        This is the 67200 fix. The master rested a full-size exit limit at 1.2; it
+        half-filled, so the master ended at -1464. The follower's mirrored exit limit
+        never filled at all, and when the master cancelled the remainder we faithfully
+        cancelled the follower's copy too — taking the follower out of the queue while
+        it was still holding everything. Mirroring the cancel is literally correct and
+        semantically backwards: the master cancels because it GOT what it wanted, so
+        copying that to a follower which achieved nothing locks in the divergence.
+
+        A cancel is the ideal moment to settle: unlike a timer, it's the master itself
+        telling us the episode is over, so there's nothing left to wait for. Market
+        (not limit) is right here — the master just abandoned that price.
+
+        Only ever REDUCES, and only when the follower is genuinely above target, so a
+        cancel on an unrelated/unfilled entry order is a no-op. The 15s reconciler
+        remains the backstop for a master that never cancels at all."""
+        name = follower.get("name") or "Follower"
+        try:
+            signed = float(await self._position_size_signed(client, symbol))
+            if signed == 0:
+                return  # follower already flat — nothing owed
+            master_now = await self._master_position_size(master_row, symbol, fresh=True)
+            if master_now is None:
+                return  # can't read the master — leave it to the reconciler
+            # Target with round_up=True deliberately: the SAME rounding the open used
+            # to size this position, and the same the reconciler's trim uses. Using
+            # the floor-based _follower_close_qty here would close one lot more than
+            # the reconciler considers correct, and the two would disagree forever.
+            target = self.risk_engine.calculate_follower_quantity(
+                abs(float(master_now)), ref_price or 0.0, follower, round_up=True
+            )
+            held = int(abs(signed))
+            close_qty = held - int(target)
+            if close_qty < 1:
+                return  # already at (or under) target — nothing owed
+            side = "buy" if signed < 0 else "sell"
+            await client.place_order(
+                symbol=symbol, side=side, size=int(close_qty),
+                order_type="market_order", reduce_only=True,
+            )
+            logger.info(
+                f"Exit settle after master cancel: closed {int(close_qty)} on {symbol} for "
+                f"{name} ({held} -> {int(target)}, master now {master_now:+.0f}) — the master "
+                f"abandoned its exit price but the follower had not exited"
+            )
+            asyncio.create_task(tg.notify_close(name, symbol, int(close_qty)))
+        except Exception as e:
+            body = getattr(getattr(e, "response", None), "text", "")
+            logger.warning(f"Exit settle after cancel failed for {name} {symbol}: {e} {body}")
+            asyncio.create_task(tg.notify_fail(
+                name, symbol, "close", None, _short_reason(e, body),
+                key=f"settle:{follower.get('id')}:{symbol}", window=900,
+            ))
+
     async def _mirror_cancel(self, master_order_id: str, event: dict | None = None) -> None:
         key = f"ordermap:{master_order_id}"
         try:
@@ -1358,16 +1919,19 @@ class CopyEngine:
             or (event or {}).get("stop_price")
             or (event or {}).get("is_bracket")
         )
-        if is_protective and symbol and event:
-            owner_id = event.get("owner_id")
+        # Master row is needed both for the protective check below and for the
+        # post-cancel exit settle further down, so resolve it once.
+        master_row = None
+        if symbol and event:
             try:
                 mq = self.db.table("accounts").select("*").eq("is_master", True)
-                if owner_id:
-                    mq = mq.eq("owner_id", owner_id)
+                if event.get("owner_id"):
+                    mq = mq.eq("owner_id", event["owner_id"])
                 mrow = mq.execute()
                 master_row = mrow.data[0] if mrow.data else None
             except Exception:
                 master_row = None
+        if is_protective and symbol and event:
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
                 # Master EXITED this symbol (its SL/TP hit / it closed). By strategy
@@ -1418,6 +1982,25 @@ class CopyEngine:
                         logger.warning(f"Failed self-heal cancel for {follower_id}: {e2}")
                 else:
                     logger.warning(f"Failed to cancel mirrored order {follower_order_id}: {e}")
+
+            # The follower's mirrored order is now gone. If this was an EXIT the
+            # follower never actually completed, finish it — see the method docstring.
+            # Runs AFTER the cancel so there's no resting reduce-only left to fill
+            # on top of the market close (which would over-close the follower).
+            if not is_protective and symbol and master_row:
+                await self._settle_exit_after_cancel(
+                    acc_res.data[0], client, symbol, master_row,
+                    ref_price=float((event or {}).get("limit_price") or 0.0),
+                )
+        # The ordermap entry goes away below, but the ledger keeps the audit trail:
+        # stamp the master order cancelled so a mirrored-then-cancelled order is
+        # never read back as "the follower still has this".
+        await ledger.mark_state(self.redis, master_order_id, "cancelled")
+        for follower_id in targets:
+            await ledger.record_follower_leg(
+                self.redis, master_order_id, follower_id,
+                status="cancelled", reason="master cancelled the order",
+            )
         try:
             await self.redis.delete(key)
         except Exception:
