@@ -459,6 +459,26 @@ async def main():
     ok &= check("exchange read failure answers LIVE (never risk a duplicate)",
                 await eng._order_is_live(client, "555", "f1") is True)
 
+    # ---- 12b. Master client reuse. Four hot helpers used to construct AND close a
+    #           DeltaClient per call - a fresh TLS handshake to Delta every time,
+    #           several times per 15s reconcile pass. That handshake cost sat on the
+    #           event loop and helped push signed orders past the ~5s window.
+    eng, _, _ = build(-30, -1464)
+    c1 = eng._get_master_client(MASTER)
+    c2 = eng._get_master_client(MASTER)
+    ok &= check("master client is reused across calls (no TLS handshake per call)",
+                c1 is c2 and c1 is not None)
+
+    rotated = dict(MASTER, api_key="rotated-key")
+    c3 = eng._get_master_client(rotated)
+    ok &= check("rotated credentials build a fresh client, not a stale one",
+                c3 is not c1)
+    ok &= check("only one client kept per master after rotation",
+                len([k for k in eng._master_clients if k[0] == MASTER["id"]]) == 1,
+                f"clients={list(eng._master_clients)}")
+    ok &= check("a missing master row yields no client rather than raising",
+                eng._get_master_client(None) is None)
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",

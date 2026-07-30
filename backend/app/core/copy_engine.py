@@ -164,6 +164,9 @@ class CopyEngine:
         # TTL: this only shortcuts the "yes, still live" answer, never "gone".
         self._open_orders_cache: dict = {}
         self._OPEN_ORDERS_TTL = 3.0  # seconds
+        # {(master_id, api_key): DeltaClient} — reused so the hot master helpers
+        # don't pay a TLS handshake per call. See _get_master_client.
+        self._master_clients: dict = {}
         # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
@@ -541,6 +544,36 @@ class CopyEngine:
                     await asyncio.sleep(delay)
         raise last
 
+    def _get_master_client(self, master_row: dict):
+        """Reusable DeltaClient for the master, kept alive across calls.
+
+        Four hot helpers (_master_position_size, _master_position_signed,
+        _master_recent_fill_ts, _classify_master_exit) each used to CONSTRUCT and
+        close a DeltaClient per call. Every construction is a fresh httpx client,
+        so every call paid a full TLS handshake to Delta — several times per
+        15-second reconcile pass, per symbol. That handshake cost sat directly on
+        the event loop and was a large part of why signed orders were reaching the
+        exchange 13-21s late.
+
+        Keyed on api_key too, so rotating credentials transparently builds a new
+        client rather than reusing a stale one."""
+        if not master_row:
+            return None
+        key = (master_row.get("id"), master_row.get("api_key"))
+        client = self._master_clients.get(key)
+        if client is None:
+            client = DeltaClient(
+                master_row["api_key"], master_row["api_secret"],
+                master_row.get("environment", "demo"),
+            )
+            # Only ever one live client per master; drop any older credential.
+            for stale in [k for k in self._master_clients if k[0] == key[0]]:
+                old = self._master_clients.pop(stale, None)
+                if old is not None:
+                    asyncio.create_task(old.close())
+            self._master_clients[key] = client
+        return client
+
     async def _live_order_ids(self, client, account_id, fresh: bool = False):
         """Set of the follower's resting order ids, cached briefly per account.
 
@@ -638,11 +671,7 @@ class CopyEngine:
         if cached and (time.time() - cached[1]) < self._MASTER_EXIT_TTL:
             return cached[0]
         try:
-            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
-            try:
-                history = await mc.get_order_history(page_size=100)
-            finally:
-                await mc.close()
+            history = await self._get_master_client(master_row).get_order_history(page_size=100)
         except Exception as e:
             logger.warning(f"classify_master_exit: order-history fetch failed for {symbol}: {e}")
             return "unknown"  # transient — do NOT cache; retry next pass
@@ -763,11 +792,7 @@ class CopyEngine:
             if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
                 return cached[0]
         try:
-            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
-            try:
-                size = await self._position_size(mc, symbol)
-            finally:
-                await mc.close()
+            size = await self._position_size(self._get_master_client(master_row), symbol)
             self._master_pos_cache[symbol] = (size, time.time())
             return size
         except Exception as e:
@@ -786,11 +811,7 @@ class CopyEngine:
             if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
                 return cached[0]
         try:
-            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
-            try:
-                signed = await self._position_size_signed(mc, symbol)
-            finally:
-                await mc.close()
+            signed = await self._position_size_signed(self._get_master_client(master_row), symbol)
             self._master_signed_cache[symbol] = (signed, time.time())
             return signed
         except Exception as e:
@@ -808,11 +829,7 @@ class CopyEngine:
         if not master_row:
             return out
         try:
-            mc = DeltaClient(master_row["api_key"], master_row["api_secret"], master_row.get("environment", "demo"))
-            try:
-                fills = await mc.get_fills(page_size=100)
-            finally:
-                await mc.close()
+            fills = await self._get_master_client(master_row).get_fills(page_size=100)
             for f in fills:
                 sym = f.get("product_symbol") or f.get("symbol")
                 ts = _parse_epoch(f.get("created_at"))
