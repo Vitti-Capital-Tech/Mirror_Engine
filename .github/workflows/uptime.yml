@@ -55,20 +55,17 @@ jobs:
           }
           if [ "$code" = "200" ]; then
             if [ "$prev" = "down" ]; then
-              send "✅ <b>Mirror Engine reachable again</b>
-External monitor: ${URL} is back (HTTP 200)."
+              send "$(printf '✅ <b>Mirror Engine reachable again</b>\nExternal monitor: %s is back (HTTP 200).' "$URL")"
             fi
             # A manual run is always confirmed, so the secrets/pipe can be tested
             # even while everything is healthy (scheduled runs stay transition-only).
             if [ "$EVENT" = "workflow_dispatch" ]; then
-              send "✅ <b>External monitor OK</b>
-Manual test: reached ${URL} (HTTP 200). GitHub Actions alerting is wired correctly."
+              send "$(printf '✅ <b>External monitor OK</b>\nManual test: reached %s (HTTP 200). GitHub Actions alerting is wired correctly.' "$URL")"
             fi
             echo up > state.txt
           else
             if [ "$prev" != "down" ] || [ "$EVENT" = "workflow_dispatch" ]; then
-              send "🚨 <b>Mirror Engine UNREACHABLE from outside AWS</b>
-External monitor could not reach ${URL} (HTTP ${code}). The EC2 instance or its network may be down."
+              send "$(printf '🚨 <b>Mirror Engine UNREACHABLE from outside AWS</b>\nExternal monitor could not reach %s (HTTP %s). The EC2 instance or its network may be down.' "$URL" "$code")"
             fi
             echo down > state.txt
           fi
