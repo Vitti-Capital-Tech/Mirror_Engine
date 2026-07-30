@@ -371,7 +371,39 @@ async def main():
     ok &= check("no protection placed when the follower holds nothing",
                 client.placed == [], f"placed={client.placed}")
 
-    # ---- 11. The ledger itself.
+    # ---- 11. DEADBAND. auto_ratio derives the target from a LIVE balance ratio, so
+    #          it drifts continuously; a 3050-lot master leg sat right on the 30/31
+    #          boundary. Acting on that 1-lot difference churned real money live on
+    #          2026-07-30 (trimmed P-BTC-60000 and P-BTC-60500 by 1 each, which the
+    #          top-up would then buy back). Differences within 5% must be ignored.
+    # master -3000 -> target ceil(30.0) = 30, so +/-1 lot is 3.3% - inside the band.
+    eng, client, event = build(-31, -3000, mark=1.2, entry=1.2)
+    await passes(eng, event)
+    ok &= check("1-lot noise on a 30-lot leg does NOT trim",
+                client.placed == [], f"placed={client.placed}")
+
+    eng, client, event = build(-29, -3000, mark=1.2, entry=1.2)
+    await passes(eng, event)
+    ok &= check("1-lot noise on a 30-lot leg does NOT top up",
+                client.placed == [], f"placed={client.placed}")
+
+    # ...but a genuine miss still clears the deadband comfortably.
+    eng, client, event = build(-15, -3000, mark=1.2, entry=1.2)
+    await passes(eng, event)
+    ok &= check("a real 15-lot shortfall still tops up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    eng, client, _ = build(-30, -1464)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle still fires on a real 15-lot excess", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    eng, client, _ = build(-31, -3000)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle ignores 1 lot on a 30-lot leg (no churn against the trim)",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 12. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
                                      size=3000, kind="entry", owner_id="u1")

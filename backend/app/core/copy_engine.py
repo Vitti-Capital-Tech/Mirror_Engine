@@ -75,6 +75,26 @@ STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "360"))  # 6 minutes
 # alerts instead of silently doing nothing. Percent, e.g. 15 = ±15%.
 SYNC_PRICE_TOLERANCE_PCT = float(os.getenv("SYNC_PRICE_TOLERANCE_PCT", "15"))
 
+# Deadband before the reconciler will resize a follower that is on the correct
+# side. The target is derived from a LIVE balance ratio (auto_ratio divides the
+# follower's balance by the master's), so it drifts continuously as both accounts
+# mark to market: a 3050-lot master leg sat exactly on the 30/31 boundary and the
+# target flipped between the two. Acting on that 1-lot difference produced a
+# trim-then-top-up churn loop, paying spread and fees on every oscillation
+# (observed live 2026-07-30, trimmed P-BTC-60000 and P-BTC-60500 by 1 each).
+#
+# Same threshold position_monitor already uses to decide a mismatch is worth
+# alerting on, so the alert and the correction now agree on what "out of sync"
+# means. A real miss (a whole missing leg, or half a position) clears this
+# comfortably; ratio noise never does.
+RECON_SIZE_TOLERANCE_PCT = float(os.getenv("RECON_SIZE_TOLERANCE_PCT", "5"))
+
+
+def _size_deadband(target: float) -> float:
+    """Minimum |held - target| worth acting on: at least 1 lot, and at least
+    RECON_SIZE_TOLERANCE_PCT of the target."""
+    return max(1.0, abs(float(target)) * RECON_SIZE_TOLERANCE_PCT / 100.0)
+
 
 def _parse_epoch(v):
     """Best-effort convert a Delta timestamp to epoch SECONDS (UTC). Accepts an
@@ -924,7 +944,11 @@ class CopyEngine:
                             abs(msz), float(mark) if mark else 0.0, fol, round_up=True
                         )
                         excess = held - int(target)
-                        if excess == 0:
+                        # Deadband: the target moves with a live balance ratio, so a
+                        # 1-lot difference on a 30-lot leg is noise, not a miss.
+                        # Acting on it churns (trim 1, top-up 1, repeat) — see
+                        # RECON_SIZE_TOLERANCE_PCT.
+                        if abs(excess) < _size_deadband(target):
                             continue
                         # Don't act while the master is still trading this symbol —
                         # its size is moving and any diff we see is transient.
@@ -1875,8 +1899,10 @@ class CopyEngine:
             )
             held = int(abs(signed))
             close_qty = held - int(target)
-            if close_qty < 1:
-                return  # already at (or under) target — nothing owed
+            # Same deadband as the reconciler, so the two can't disagree about what
+            # counts as out of sync and undo each other.
+            if close_qty < _size_deadband(target):
+                return  # already at (or near) target — nothing owed
             side = "buy" if signed < 0 else "sell"
             await client.place_order(
                 symbol=symbol, side=side, size=int(close_qty),
