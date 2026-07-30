@@ -88,7 +88,14 @@ async def record_master_order(
     try:
         now = float(ts or time.time())
         key = _key(master_order_id)
-        await redis.hset(key, mapping={
+        idx = _idx(owner_id, symbol)
+        # ONE round trip, not five. The master re-sends the same resting order
+        # constantly (one stop was pushed 556 times in a session), so this runs on
+        # the hot path — five sequential awaits each cost event-loop time and were
+        # measurably delaying order placement. transaction=False: these are
+        # independent writes, we need the batching, not atomicity.
+        pipe = redis.pipeline(transaction=False)
+        pipe.hset(key, mapping={
             "master_order_id": str(master_order_id),
             "symbol": str(symbol),
             "side": str(side or ""),
@@ -99,11 +106,11 @@ async def record_master_order(
             "owner_id": str(owner_id or ""),
             "ts": str(now),
         })
-        await redis.expire(key, LEDGER_TTL)
-        idx = _idx(owner_id, symbol)
-        await redis.zadd(idx, {str(master_order_id): now})
-        await redis.zremrangebyscore(idx, 0, now - LEDGER_TTL)
-        await redis.expire(idx, LEDGER_TTL)
+        pipe.expire(key, LEDGER_TTL)
+        pipe.zadd(idx, {str(master_order_id): now})
+        pipe.zremrangebyscore(idx, 0, now - LEDGER_TTL)
+        pipe.expire(idx, LEDGER_TTL)
+        await pipe.execute()
     except Exception as e:
         logger.debug(f"ledger: record_master_order failed for {master_order_id}: {e}")
 
@@ -137,8 +144,10 @@ async def record_follower_leg(
         if reason:
             leg["reason"] = str(reason)[:200]
         key = _key(master_order_id)
-        await redis.hset(key, f"f:{follower_id}", json.dumps(leg))
-        await redis.expire(key, LEDGER_TTL)
+        pipe = redis.pipeline(transaction=False)  # one round trip, see above
+        pipe.hset(key, f"f:{follower_id}", json.dumps(leg))
+        pipe.expire(key, LEDGER_TTL)
+        await pipe.execute()
     except Exception as e:
         logger.debug(f"ledger: record_follower_leg failed for {master_order_id}/{follower_id}: {e}")
 

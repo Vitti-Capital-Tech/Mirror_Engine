@@ -160,6 +160,10 @@ class CopyEngine:
         # previous sweep. Protection is only ADDED after two consecutive sightings,
         # so a partial order read can never cause a duplicate stop.
         self._prot_missing_prev: set = set()
+        # {account_id: (set_of_resting_order_ids, ts)} — see _order_is_live. Short
+        # TTL: this only shortcuts the "yes, still live" answer, never "gone".
+        self._open_orders_cache: dict = {}
+        self._OPEN_ORDERS_TTL = 3.0  # seconds
         # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
@@ -537,22 +541,54 @@ class CopyEngine:
                     await asyncio.sleep(delay)
         raise last
 
-    @staticmethod
-    async def _order_is_live(client, order_id: str) -> bool:
-        """True if the given order id is still resting (open/pending) on the
-        account. On any fetch error, return True so we never risk double-placing
-        just because a status check hiccuped."""
-        try:
-            for st in ("open", "pending"):
-                try:
-                    for o in await client.get_open_orders(state=st):
-                        if str(o.get("id")) == str(order_id):
-                            return True
-                except Exception:
-                    return True
-        except Exception:
-            return True
-        return False
+    async def _live_order_ids(self, client, account_id, fresh: bool = False):
+        """Set of the follower's resting order ids, cached briefly per account.
+
+        Returns None if the orders couldn't be read at all (callers must then
+        assume the order IS live — see _order_is_live)."""
+        if not fresh and account_id:
+            hit = self._open_orders_cache.get(account_id)
+            if hit and (time.time() - hit[1]) < self._OPEN_ORDERS_TTL:
+                return hit[0]
+        ids, ok = set(), False
+        for st in ("open", "pending"):
+            try:
+                for o in await client.get_open_orders(state=st):
+                    ids.add(str(o.get("id")))
+                ok = True
+            except Exception:
+                pass
+        if not ok:
+            return None
+        if account_id:
+            self._open_orders_cache[account_id] = (ids, time.time())
+        return ids
+
+    async def _order_is_live(self, client, order_id: str, account_id=None) -> bool:
+        """True if the given order id is still resting (open/pending).
+
+        This is the single hottest call in the engine: the master re-sends the
+        same resting order on every WS update and every reconcile pass, and each
+        repeat asked the exchange twice (open + pending) PER FOLLOWER. That REST
+        volume was congesting the event loop badly enough to delay order placement
+        past Delta's ~5s signature window, so orders were being rejected outright
+        with expired_signature (13-21s late, observed 2026-07-30).
+
+        Cached, but ASYMMETRICALLY, because the two wrong answers are not equally
+        costly. A stale "live" just skips a re-place for a few seconds and the
+        reconciler covers it. A stale "not live" makes us place a DUPLICATE order.
+        So a cache hit can only ever answer YES; anything not in the cached set is
+        re-checked fresh before we act on it.
+
+        On any read failure, return True — never risk double-placing because a
+        status check hiccuped."""
+        cached = await self._live_order_ids(client, account_id)
+        if cached is not None and str(order_id) in cached:
+            return True  # fast path: still resting, no REST call needed
+        fresh = await self._live_order_ids(client, account_id, fresh=True)
+        if fresh is None:
+            return True  # couldn't read — assume live rather than duplicate
+        return str(order_id) in fresh
 
     async def _close_follower_position(self, client, symbol: str, name: str = "") -> None:
         """Market-close (reduce-only) any remaining follower position on `symbol`.
@@ -1480,7 +1516,7 @@ class CopyEngine:
             if not is_update:
                 mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
                 if mapped:
-                    if await self._order_is_live(client, mapped):
+                    if await self._order_is_live(client, mapped, follower["id"]):
                         continue
                     # stale mapping — mirrored order is gone; clear and re-place
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
@@ -1682,6 +1718,9 @@ class CopyEngine:
                 follower_order_id = result.get("id")
                 if follower_order_id:
                     # Map master order -> this follower's order, so we can cancel/edit it later.
+                    # This follower's resting set just changed — drop the cache so
+                    # the next liveness check reads fresh.
+                    self._open_orders_cache.pop(follower["id"], None)
                     await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     await ledger.record_follower_leg(

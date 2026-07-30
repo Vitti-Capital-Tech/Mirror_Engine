@@ -200,10 +200,24 @@ class DeltaClient:
             body_dict["stop_trigger_method"] = stop_trigger_method or "mark_price"
 
         body = json.dumps(body_dict)
-        headers = self._get_headers("POST", path, body)
-        resp = await self._client.post(
-            f"{self.rest_url}{path}", headers=headers, content=body
-        )
+        # Delta rejects a signature older than ~5s. Under load the request can sit
+        # between signing and reaching the exchange (13-21s late, observed
+        # 2026-07-30), and the order was then dropped as a permanent 4xx even
+        # though nothing was wrong with it. Re-sign and resend once — this is a
+        # pure timing failure, and an order that never reaches the exchange is the
+        # worst outcome for keeping the follower matched to the master.
+        for attempt in (0, 1):
+            headers = self._get_headers("POST", path, body)
+            resp = await self._client.post(
+                f"{self.rest_url}{path}", headers=headers, content=body
+            )
+            if attempt == 0 and resp.status_code == 401 and "expired_signature" in resp.text:
+                logger.warning(
+                    "Order signature expired in flight (%s %s %s) — re-signing and retrying",
+                    symbol, side, size,
+                )
+                continue
+            break
         resp.raise_for_status()
         return resp.json()
 

@@ -81,6 +81,29 @@ class FakeRedis:
         items = sorted(self.z.get(key, {}).items(), key=lambda kv: kv[1], reverse=True)
         return [m for m, _ in items[start:stop + 1]]
 
+    def pipeline(self, transaction=False):
+        """Mimics redis.asyncio pipelining: queue sync calls, flush on execute()."""
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    def __init__(self, r):
+        self.r = r
+        self.ops = []
+
+    def __getattr__(self, name):
+        def queue(*a, **k):
+            self.ops.append((name, a, k))
+            return self
+        return queue
+
+    async def execute(self):
+        out = []
+        for name, a, k in self.ops:
+            out.append(await getattr(self.r, name)(*a, **k))
+        self.ops.clear()
+        return out
+
 
 # ------------------------------------------------------------- fake supabase
 MASTER = {"id": "m1", "name": "Master", "is_master": True, "api_key": "k",
@@ -117,9 +140,14 @@ class FakeClient:
         self._orders = list(orders)
         self.placed = []
         self.cancelled = []
+        self.order_reads = 0
+        self.orders_fail = False
 
     async def get_positions(self): return self._pos
     async def get_open_orders(self, state=None):
+        self.order_reads += 1
+        if self.orders_fail:
+            raise RuntimeError("simulated exchange read failure")
         return self._orders if state == "open" else []
     async def place_order(self, **kw): self.placed.append(kw); return {"id": "new1"}
     async def cancel_order(self, oid, product_id=None):
@@ -403,7 +431,35 @@ async def main():
     ok &= check("settle ignores 1 lot on a 30-lot leg (no churn against the trim)",
                 client.placed == [], f"placed={client.placed}")
 
-    # ---- 12. The ledger itself.
+    # ---- 12. Liveness cache. This is the hottest call in the engine (every repeat
+    #          of a master resting order asked the exchange twice PER FOLLOWER), and
+    #          that REST volume delayed order placement past Delta's ~5s signature
+    #          window - orders were rejected with expired_signature 13-21s late.
+    #          The cache must be ASYMMETRIC: a hit may only ever answer "live".
+    #          A stale "not live" would place a DUPLICATE order.
+    eng, client, _ = build(-30, -1464, orders=[{"product_symbol": SYM, "id": "555"}])
+    ok &= check("first liveness check reads the exchange",
+                await eng._order_is_live(client, "555", "f1") is True and client.order_reads > 0,
+                f"reads={client.order_reads}")
+    before = client.order_reads
+    ok &= check("repeat check for a LIVE order is served from cache (no REST call)",
+                await eng._order_is_live(client, "555", "f1") is True
+                and client.order_reads == before, f"reads={client.order_reads}")
+
+    # An id NOT in the cached set must be re-verified fresh, never answered "gone"
+    # from cache - that is the direction that causes duplicate orders.
+    before = client.order_reads
+    ok &= check("unknown id is re-checked fresh, not answered from cache",
+                await eng._order_is_live(client, "999", "f1") is False
+                and client.order_reads > before, f"reads={client.order_reads}")
+
+    # A read failure must answer "live" so we never double-place on a hiccup.
+    eng, client, _ = build(-30, -1464, orders=[{"product_symbol": SYM, "id": "555"}])
+    client.orders_fail = True
+    ok &= check("exchange read failure answers LIVE (never risk a duplicate)",
+                await eng._order_is_live(client, "555", "f1") is True)
+
+    # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
                                      size=3000, kind="entry", owner_id="u1")
