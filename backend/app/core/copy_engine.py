@@ -352,10 +352,15 @@ class CopyEngine:
                     # proportional close rather than skipping the exit entirely.
                     follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
                 else:
-                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=False, min_one=False)
+                    # round_up=True (min_one=False): one definition of the follower's
+                    # target across every path — live close, mirrored close,
+                    # escalation, reconciler trim/top-up and the post-cancel settle.
+                    # Mixing ceil and floor made two of them close a lot each off the
+                    # same 1-lot difference.
+                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
                     current = await self._position_size(client, symbol)
                     follower_qty = int(current) - int(target)
-                    if follower_qty < 1:
+                    if follower_qty < _size_deadband(target):
                         logger.info(
                             f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
                             f"target {int(target)} (master left {master_remaining:.0f})"
@@ -693,10 +698,22 @@ class CopyEngine:
         current = await self._position_size(client, symbol)
         if master_remaining is None:
             return None, current
+        # round_up=True to match the trim, the top-up and the post-cancel settle.
+        # This used to floor while they ceil, so on a ratio of ~0.0098 a 3050-lot
+        # master leg gave target 29 here and 30 there — the trim closed down to 30
+        # and this path then closed one MORE, twice-reducing the follower off a
+        # single 1-lot difference (observed live 2026-07-30 on P-BTC-60000,
+        # P-BTC-60500 and C-BTC-67500). min_one=False so a fully-exited master can
+        # still take the follower to 0.
         target = self.risk_engine.calculate_follower_quantity(
-            master_remaining, ref_price, follower, round_up=False, min_one=False
+            master_remaining, ref_price, follower, round_up=True, min_one=False
         )
-        return max(0, int(current) - int(target)), current
+        close_qty = max(0, int(current) - int(target))
+        # Same deadband as every other resize path, so ratio noise can't trigger a
+        # forced close the reconciler would just undo.
+        if close_qty < _size_deadband(target):
+            close_qty = 0
+        return close_qty, current
 
     async def _master_position_size(self, master_row: dict, symbol: str, fresh: bool = False):
         """Live absolute master position size for a symbol (cached ~3s so a burst
@@ -1613,11 +1630,14 @@ class CopyEngine:
                 follower_held = int(abs(signed))
                 master_now = await self._master_position_size(master_row, symbol, fresh=True) or 0.0
                 intended_remaining = max(0.0, float(master_now) - float(master_qty))
+                # round_up=True (min_one=False) so every path in the engine agrees on
+                # the follower's target size — flooring here closed one lot more than
+                # the reconciler thinks correct, and the two then fought each other.
                 target = self.risk_engine.calculate_follower_quantity(
-                    intended_remaining, ref_price, follower, round_up=False, min_one=False
+                    intended_remaining, ref_price, follower, round_up=True, min_one=False
                 )
                 qty = min(follower_held - int(target), follower_held)
-                if qty < 1:
+                if qty < _size_deadband(target):
                     logger.info(
                         f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest "
                         f"(holds {follower_held}, target {int(target)} for master remaining {intended_remaining:.0f})"
