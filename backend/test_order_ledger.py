@@ -190,6 +190,13 @@ def build(follower_size, master_size, orders=(), last_master_fill_age=600.0,
     return eng, client, event
 
 
+def _order_lookup(orders):
+    """Stub for CopyEngine._safe_get_order backed by a dict of {id: order}."""
+    async def _get(_client, order_id):
+        return orders.get(str(order_id), {})
+    return _get
+
+
 async def passes(eng, event, n=2):
     for _ in range(n):
         await eng._reconcile_positions(event)
@@ -478,6 +485,43 @@ async def main():
                 f"clients={list(eng._master_clients)}")
     ok &= check("a missing master row yields no client rather than raising",
                 eng._get_master_client(None) is None)
+
+    # ---- 12c. THE PLACE/CANCEL LOOP (live incident 2026-07-31, P-BTC-62800).
+    #           The 30s order reconcile re-mirrored the master's resting reduce-only
+    #           limit; escalation decided 5s later that no close was needed and
+    #           CANCELLED it; the reconciler re-placed it 30s later; repeat forever.
+    #           Root cause: the 5s clock started when WE placed, not when the MASTER
+    #           filled. While the master's own order is still resting, escalation
+    #           must do nothing at all - no market, and above all no cancel.
+    eng, client, _ = build(-30, -3000)
+    eng._safe_get_order = _order_lookup({
+        "F1": {"id": "F1", "size": 30, "state": "open", "unfilled_size": 30},
+        "M1": {"id": "M1", "size": 3000, "state": "open", "unfilled_size": 3000},
+    })
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F1", 42, SYM, "buy", 30, True, MASTER,
+        limit_price=1.2, master_order_id="M1",
+    )
+    ok &= check("master order still resting -> follower's mirror is NOT cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+    ok &= check("master order still resting -> follower is NOT forced to market",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 12d. Once the master HAS filled, the same unfilled mirror must be forced
+    #           through - this is the C-BTC-67200 case (master exited, follower's
+    #           mirror never filled, follower left holding).
+    eng, client, _ = build(-30, 0)
+    eng._safe_get_order = _order_lookup({
+        "F1": {"id": "F1", "size": 30, "state": "open", "unfilled_size": 30},
+    })
+    async def _close_qty(_c, _f, _s, _m, ref_price=0.0): return 30, 30
+    eng._follower_close_qty = _close_qty
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F1", 42, SYM, "buy", 30, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("after master fill, unfilled mirror IS forced to market",
+                len(client.placed) == 1 and client.placed[0]["order_type"] == "market_order"
+                and client.placed[0]["reduce_only"] is True, f"placed={client.placed}")
 
     # ---- 13. The ledger itself.
     r = FakeRedis()

@@ -861,10 +861,79 @@ class CopyEngine:
             await self._mirror_cancel(master_order_id, event)
         elif action == "exit":
             await self._sync_followers_to_master_exit(event)
+        elif action == "master_filled":
+            await self._escalate_after_master_fill(event, master_order_id)
         elif action == "sync_protection":
             await self._sync_protection(event)
         elif action == "reconcile_positions":
             await self._reconcile_positions(event)
+
+    async def _escalate_after_master_fill(self, event: dict, master_order_id: str) -> None:
+        """The master's resting limit just FILLED. Give each follower's mirrored
+        limit ESCALATE_WAIT_SEC to fill at the same price, then force the remainder
+        to market.
+
+        This is the correct trigger for the desk rule "limit, 5s, then market".
+        The clock starts when the MASTER is filled, not when we place: a master can
+        rest a limit for hours, and marketing the follower during that wait would
+        put it in or out ahead of the master. Placement-time escalation now defers
+        to this (see _escalate_unfilled_limit).
+
+        Without it, a master limit that fills while the follower's mirror sits
+        behind it in the queue leaves the follower silently un-copied — how
+        C-BTC-67200 ended up holding a position the master had exited."""
+        symbol = event.get("symbol")
+        try:
+            mapping = await self.redis.hgetall(f"ordermap:{master_order_id}")
+        except Exception as e:
+            logger.warning(f"master_filled: could not read order map for {master_order_id}: {e}")
+            return
+        if not mapping:
+            return  # nothing mirrored for this order (or already cleaned up)
+
+        master_row = None
+        try:
+            mq = self.db.table("accounts").select("*").eq("is_master", True)
+            if event.get("owner_id"):
+                mq = mq.eq("owner_id", event["owner_id"])
+            m = mq.execute()
+            master_row = m.data[0] if m.data else None
+        except Exception:
+            pass
+
+        for follower_id, follower_order_id in mapping.items():
+            try:
+                acc = self.db.table("accounts").select("*").eq("id", follower_id).execute()
+                if not acc.data:
+                    continue
+                follower = acc.data[0]
+                client = await self._get_follower_client(follower)
+                if not client:
+                    continue
+                # Size the escalation from the FOLLOWER's own order, never the
+                # master's — the master's 3000 lots are the follower's 30, and
+                # marketing the master's size would blow the follower up.
+                fo = await self._safe_get_order(client, follower_order_id)
+                if not fo or self._order_done(fo):
+                    continue  # already filled or gone — nothing to force
+                fqty = int(float(fo.get("size") or 0))
+                if fqty < 1:
+                    continue
+                logger.info(
+                    f"Master fill on {symbol}: giving {follower.get('name')}'s mirror "
+                    f"{follower_order_id} ({fqty} lots) {ESCALATE_WAIT_SEC}s to fill "
+                    f"before forcing market"
+                )
+                # master_order_id deliberately omitted — we already KNOW it filled,
+                # so the "is the master still resting?" guard must not re-check it.
+                asyncio.create_task(self._escalate_unfilled_limit(
+                    follower, client, follower_order_id, fo.get("product_id") or event.get("product_id"),
+                    symbol, fo.get("side") or event.get("side"), fqty,
+                    bool(fo.get("reduce_only")), master_row,
+                    event.get("limit_price"),
+                ))
+            except Exception as e:
+                logger.warning(f"master_filled: escalation setup failed for {follower_id}: {e}")
 
     async def _reconcile_positions(self, event: dict) -> None:
         """Every 10s: make each follower's OPEN POSITIONS match the master's,
@@ -1763,6 +1832,7 @@ class CopyEngine:
                         asyncio.create_task(self._escalate_unfilled_limit(
                             follower, client, follower_order_id, product_id, symbol,
                             side, int(qty), reduce_only, master_row, limit_price,
+                            master_order_id=master_order_id,
                         ))
             except Exception as e:
                 resp_obj = getattr(e, "response", None)
@@ -1818,7 +1888,7 @@ class CopyEngine:
 
     async def _escalate_unfilled_limit(self, follower, client, order_id, product_id,
                                        symbol, side, qty, reduce_only, master_row,
-                                       limit_price=None) -> None:
+                                       limit_price=None, master_order_id=None) -> None:
         """The follower's mirrored order rests as a GTC limit at the master's
         price. If it hasn't filled within ESCALATE_WAIT_SEC, MARKET it so the
         follower still gets in/out (team rule: "GTC daalo, 5s me fill na ho to
@@ -1828,6 +1898,32 @@ class CopyEngine:
             await asyncio.sleep(ESCALATE_WAIT_SEC)
             if self._order_done(await self._safe_get_order(client, order_id)):
                 return
+
+            # THE MASTER'S OWN ORDER MUST HAVE FILLED FIRST. The 5s window is
+            # measured from the master getting filled, not from us placing — the
+            # master may rest a limit for hours, and forcing the follower in or out
+            # while the master is still waiting is not copying, it is front-running
+            # our own master.
+            #
+            # Skipping this check caused a place/cancel loop on live accounts
+            # (2026-07-31, P-BTC-62800): the 30s order reconcile re-mirrored the
+            # master's resting reduce-only limit, this escalation decided 5s later
+            # that no close was needed and CANCELLED it, the reconciler re-placed
+            # it 30s later, forever. Leaving the order resting breaks that loop —
+            # the reconciler's idempotency check then sees it still live and does
+            # nothing. When the master's order does fill, the fill event triggers
+            # _escalate_after_master_fill instead.
+            if master_order_id and master_row:
+                mo = await self._safe_get_order(
+                    self._get_master_client(master_row), master_order_id
+                )
+                if mo and not self._order_done(mo):
+                    logger.debug(
+                        "Escalation: master order %s on %s still resting — leaving "
+                        "%s's mirror to wait with it", master_order_id, symbol,
+                        follower.get("name"),
+                    )
+                    return
 
             # ---- Point 3 exceptions: leave the GTC limit RESTING (no market, no
             # cancel) and let it wait, when: ----

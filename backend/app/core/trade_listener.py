@@ -256,9 +256,17 @@ class TradeListener:
                     # sell-then-buyback round-trips with bad fills in fast moves.
                     logger.info("Master stop filled (%s) — leaving followers to their own jittered SL/TP (no forced close)", order.get("product_symbol"))
                 else:
-                    # Plain limit fill: its mirrored follower limit fills on its
-                    # own, so nothing to copy here.
-                    logger.info("Skipping fill copy for resting %s (mirrored separately)", order_type)
+                    # Plain limit fill. The follower has its own mirrored limit at
+                    # the same price, so we do NOT copy the fill (that would double
+                    # up). But this is the moment the 5s clock starts: the master is
+                    # now filled, so if the follower's mirror hasn't filled shortly
+                    # after, it must be forced through at market or the follower is
+                    # left behind (which is exactly how C-BTC-67200 diverged).
+                    logger.info(
+                        "Master limit filled (%s) — starting follower fill window",
+                        order.get("product_symbol"),
+                    )
+                    await self._push_order_event(order, "master_filled")
                 return
 
             # ---- 2. Cancellation ----
