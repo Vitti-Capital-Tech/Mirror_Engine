@@ -523,6 +523,36 @@ async def main():
                 len(client.placed) == 1 and client.placed[0]["order_type"] == "market_order"
                 and client.placed[0]["reduce_only"] is True, f"placed={client.placed}")
 
+    # ---- 12e. TRIGGERED vs MANUALLY CANCELLED protection. Follower stops are
+    #           jittered to a different price, so the master's stop firing says
+    #           NOTHING about whether the follower's has fired. Cancelling the
+    #           follower's copy on a trigger would leave it unprotected.
+    async def _cancel_probe():
+        eng, client, _ = build(-30, -3000)
+        await eng.redis.hset("ordermap:S1", "f1", "FS1")
+        return eng, client
+
+    base = {"action": "cancel", "master_order_id": "S1", "symbol": SYM,
+            "product_id": 42, "side": "buy", "stop_order_type": "stop_loss_order",
+            "stop_price": 5.0, "owner_id": "u1"}
+
+    eng, client = await _cancel_probe()
+    await eng._mirror_cancel("S1", dict(base, reason="stop_trigger"))
+    ok &= check("master stop TRIGGERED -> follower's stop is NOT cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    eng, client = await _cancel_probe()
+    await eng._mirror_cancel("S1", dict(base, reason=None))
+    ok &= check("unknown reason -> follower's stop is NOT cancelled (fail safe)",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    eng, client = await _cancel_probe()
+    async def _msz(_row, _sym, fresh=False): return 3000.0
+    eng._master_position_size = _msz
+    await eng._mirror_cancel("S1", dict(base, reason="stop_cancel"))
+    ok &= check("master stop MANUALLY cancelled -> follower's stop IS cancelled",
+                client.cancelled == ["FS1"], f"cancelled={client.cancelled}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",

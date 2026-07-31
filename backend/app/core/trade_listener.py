@@ -345,6 +345,14 @@ class TradeListener:
             "is_bracket": bool(order.get("bracket_order")) or str((order.get("meta_data") or {}).get("order_source") or "").startswith("positions_TP_SL"),
             # stop_update / action 'update' => the master EDITED an existing SL/TP.
             "is_update": order.get("reason") == "stop_update" or order.get("action") == "update",
+            # Raw reason — the ONLY reliable way to tell a deliberately cancelled
+            # stop ("stop_cancel") from one that vanished because it fired
+            # ("stop_trigger"). Because follower stops are jittered to a slightly
+            # different price, a triggered master stop does NOT mean the follower's
+            # has fired, so the two cases must be handled oppositely: propagate a
+            # manual cancel, but never strip protection just because the master's
+            # leg went away. See _mirror_cancel.
+            "reason": order.get("reason"),
             "owner_id": (self.master_account or {}).get("owner_id"),
             "ts": time.time(),  # detection time, for latency measurement
         }

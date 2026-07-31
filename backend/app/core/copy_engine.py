@@ -2130,6 +2130,29 @@ class CopyEngine:
             except Exception:
                 master_row = None
         if is_protective and symbol and event:
+            # Did the master CANCEL this stop, or did it FIRE?
+            #
+            # Delta tells us directly: reason="stop_cancel" for a deliberate cancel,
+            # "stop_trigger"/fill when it fires. That distinction is critical here
+            # because follower stops are JITTERED to a slightly different price —
+            # the master's stop firing says nothing about whether the follower's
+            # has fired, so:
+            #   • deliberate cancel -> the follower's copy is now orphaned, cancel it
+            #   • anything else     -> LEAVE the follower's stop alone and let its
+            #     own trigger do the work (stripping it would leave the position
+            #     unprotected, the same failure as C-BTC-67500 having no SL).
+            #
+            # Previously this was inferred from the master's POSITION alone, which
+            # misreads a TP firing on a PARTIAL close: the master is still holding,
+            # so it looked like a manual cancel and the follower's protection was
+            # stripped while its own (jittered) stop had not yet triggered.
+            if (event.get("reason") or "") != "stop_cancel":
+                logger.info(
+                    f"Protective order on {symbol} vanished (reason "
+                    f"{event.get('reason') or 'unknown'}) — not a deliberate cancel, "
+                    f"leaving follower stops in place to trigger on their own."
+                )
+                return
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
                 # Master EXITED this symbol (its SL/TP hit / it closed). By strategy
