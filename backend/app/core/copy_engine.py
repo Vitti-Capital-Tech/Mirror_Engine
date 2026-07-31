@@ -1285,10 +1285,13 @@ class CopyEngine:
                                 f"{drift:.1f}% from master entry {mentry} (mark {mark}, master last "
                                 f"fill {age_txt}, tolerance {SYNC_PRICE_TOLERANCE_PCT:.0f}%)"
                             )
+                            # ONE message per episode, not one per 15s pass. Cleared
+                            # below when the leg is finally recovered, so a fresh
+                            # occurrence later still alerts.
                             asyncio.create_task(tg.notify_fail(
                                 fol.get("name"), sym, "recover", int(target),
                                 f"price drifted {drift:.0f}% from master entry — follower left flat",
-                                key=f"drift:{fid}:{sym}", window=3600,
+                                key=f"drift:{fid}:{sym}", window=tg.STATE_ALERT_WINDOW,
                             ))
                             self._recon_open_ts[key] = now
                             continue
@@ -1306,6 +1309,10 @@ class CopyEngine:
                         )
                         logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
                         asyncio.create_task(tg.notify_open(fol.get("name"), sym, side, int(target), price or None))
+                        # Episode over — let a future drift/failure on this leg
+                        # alert again instead of being silently suppressed.
+                        asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
+                        asyncio.create_task(tg.clear_alert(f"recon:{fid}:{sym}"))
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
                         logger.warning(f"reconcile open failed for {fol.get('name')} {sym}: {e} {body}")

@@ -16,6 +16,17 @@ _ICON = {"critical": "🚨", "error": "❗", "warning": "⚠️", "info": "ℹ�
 _last = {"text": None, "ts": 0.0}
 _DEDUPE_WINDOW = 10.0
 
+# Window for collapsing IDENTICAL trade events (same account/symbol/side/lots).
+# Short: two real trades of the same size within this window are rare, retries
+# reporting the same fill twice are not.
+DUP_EVENT_WINDOW = 45.0
+
+# Default suppression for a PERSISTENT condition (a leg that can't be recovered,
+# an order that keeps failing). Long, because these are re-evaluated every 15s and
+# the state can hold for hours — you want one message, not one per pass. Paired
+# with clear_alert() so the next genuine occurrence still gets through.
+STATE_ALERT_WINDOW = 6 * 3600.0
+
 
 def telegram_enabled() -> bool:
     return bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
@@ -51,6 +62,24 @@ async def send_message(text: str) -> bool:
 # per window (not every 30s). key -> last-sent ts.
 _seen: dict = {}
 
+# Backed by Redis so the suppression SURVIVES A RESTART. This dict alone lives in
+# the worker process, and the backend reloads on every deploy — so a persistent
+# condition (e.g. a leg that can't be recovered) re-alerted after every single
+# reload, which is what made the drift notifications feel like spam.
+_redis = None
+
+
+def _r():
+    global _redis
+    if _redis is None:
+        try:
+            import redis.asyncio as aioredis
+            _redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        except Exception as e:
+            logger.warning("Telegram dedupe: Redis unavailable, in-memory only: %s", e)
+            _redis = False
+    return _redis or None
+
 
 def _dedupe(key: str, window: float) -> bool:
     """True if we should SEND (this key hasn't been sent within `window`)."""
@@ -60,6 +89,34 @@ def _dedupe(key: str, window: float) -> bool:
         return False
     _seen[key] = now
     return True
+
+
+async def _should_send(key: str, window: float) -> bool:
+    """Redis-backed `_dedupe`. SET NX EX is atomic, so concurrent reconcile passes
+    can't both slip an alert through, and the window outlives a reload."""
+    r = _r()
+    if r is not None:
+        try:
+            return bool(await r.set(f"tgalert:{key}", "1", nx=True, ex=int(max(1, window))))
+        except Exception:
+            pass
+    return _dedupe(key, window)
+
+
+async def clear_alert(key: str) -> None:
+    """Forget a suppressed condition so its NEXT occurrence alerts again.
+
+    Call this when the underlying problem resolves (leg recovered, order finally
+    mirrored). Without it an alert is merely rate-limited; with it, alerts become
+    edge-triggered — one message when a problem starts, and a fresh one if it
+    ever comes back — which is what you actually want to read."""
+    _seen.pop(key, None)
+    r = _r()
+    if r is not None:
+        try:
+            await r.delete(f"tgalert:{key}")
+        except Exception:
+            pass
 
 
 def _num(v) -> str:
@@ -75,6 +132,11 @@ async def notify_open(account: str, symbol: str, side: str, lots, price=None) ->
     """Follower opened / added to a position."""
     if not telegram_enabled():
         return
+    # Collapse identical repeats within a short window. A genuine second open of
+    # the same size seconds later is almost always a retry or churn reporting the
+    # same fill twice, not two real trades.
+    if not await _should_send(f"open:{account}:{symbol}:{side}:{_num(lots)}", DUP_EVENT_WINDOW):
+        return
     d = str(side).lower()
     icon = "🟢" if d in ("buy", "long") else "🔴"
     direction = "LONG" if d in ("buy", "long") else "SHORT"
@@ -88,6 +150,8 @@ async def notify_close(account: str, symbol: str, lots, price=None) -> None:
     """Follower closed / reduced a position."""
     if not telegram_enabled():
         return
+    if not await _should_send(f"close:{account}:{symbol}:{_num(lots)}", DUP_EVENT_WINDOW):
+        return
     text = (f"✅ <b>Position Closed</b> · {account}\n"
             f"<code>{symbol}</code>\n"
             f"{_num(lots)} lot(s)" + (f" @ {_num(price)}" if price is not None else ""))
@@ -100,7 +164,7 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
     failure only alerts once per `window`."""
     if not telegram_enabled():
         return
-    if key and not _dedupe(key, window):
+    if key and not await _should_send(key, window):
         return
     lot_str = f" {_num(lots)} lot(s)" if lots not in (None, "", 0) else ""
     text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
@@ -110,13 +174,20 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
 
 
 async def send_alert(alert: dict) -> None:
-    """Format an alert row and push it to Telegram."""
+    """Format an alert row and push it to Telegram.
+
+    Deduped on (type, account, message) so a condition re-detected on every sweep
+    — a position mismatch, restored protection — reads as one notification rather
+    than a stream of identical ones."""
     if not telegram_enabled():
         return
     level = (alert.get("level") or "info").lower()
     icon = _ICON.get(level, "•")
     atype = (alert.get("type") or "alert").replace("_", " ").title()
     msg = alert.get("message") or ""
+    akey = f"alert:{alert.get('type')}:{alert.get('account_id') or ''}:{msg}"
+    if not await _should_send(akey, alert.get("window") or STATE_ALERT_WINDOW):
+        return
     text = f"{icon} <b>{atype}</b> [{level.upper()}]\n{msg}"
 
     now = time.time()
