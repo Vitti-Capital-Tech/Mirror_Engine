@@ -76,12 +76,17 @@ The lifecycle of a copy trade execution consists of three phases:
 1. The **Copy Engine** (running parallel worker threads) pops the event from Redis.
 2. It queries active followers in Supabase and routes them to the **Risk Engine**.
 3. The **Risk Engine** validates follower margin balances and computes customized order sizes using the follower's allocation mode:
-   * **Auto Balance Ratio** — `master_size × (follower_balance ÷ master_balance)`, floored on opens, ceiled on closes.
+   * **Auto Balance Ratio** — `ceil(master_size × (follower_balance ÷ master_balance))`. The same rounding defines the follower's target size on every path (open, close, escalation, reconcile) so no two can disagree about what "in sync" means.
    * **Multiplier** — a fixed scale of the master size.
    * An optional per-account **allocated balance** overrides the real balance for this ratio (useful for testing across very different balances).
 
 ### Phase 2b: Order Mirroring (non-fill events)
-Pending **limit** and **stop / SL / TP (bracket)** orders the master places, edits or cancels are routed through a separate `order_events` queue. The Copy Engine mirrors them onto followers — placing limit orders, attaching brackets via Delta's bracket endpoint (with the master's Mark/Index trigger), editing in place on price/trigger changes, and cancelling (with a self-heal lookup if the id map is stale). A master→follower order-id map is kept in Redis. Each follower's SL/TP trigger is jittered by ±(10–50) so they don't all fire simultaneously.
+Pending **limit** and **stop / SL / TP (bracket)** orders the master places, edits or cancels are routed through a separate `order_events` queue. The Copy Engine mirrors them onto followers — placing limit orders, attaching brackets via Delta's bracket endpoint (with the master's Mark/Index trigger), editing in place on price/trigger changes, and cancelling (with a self-heal lookup if the id map is stale). A master→follower order-id map is kept in Redis. Each follower's SL/TP trigger is jittered by ±(0–20) so they don't all fire simultaneously.
+
+A mirrored limit **rests for as long as the master's rests**; only when the master's own order fills does the follower's mirror get 5s to fill before the remainder is forced to market. Because the follower's stop is jittered to a different price, a *cancel* of the master's protection is propagated only when Delta reports `reason=stop_cancel` (a deliberate cancel) — a triggered stop leaves the follower's own protection alone.
+
+### Phase 2c: Reconciliation (state, not events)
+Live copying can fail for reasons the copy path cannot control — a margin rejection, a late request, a WebSocket gap, a limit that never fills. Rather than enumerating those, the engine periodically compares **state**: every 15s it opens a missing leg, closes an orphan or wrong-side leg, trims an over-exposed one and tops up an under-exposed one; every 30s it re-mirrors resting limits and syncs protection **in both directions** (cancelling an orphaned follower stop *and* placing one the follower is missing). Every action requires two consecutive confirming passes and clears a size deadband, so ratio noise can't trigger a trade. Separately, an **order-ID ledger** records each master order and each follower's outcome, so a mismatch can be attributed to a specific master order id — distinguishing "never placed" from "placed and never filled".
 
 ### Phase 3: Parallel Execution & Logging ($<150\text{ms}$)
 1. The **Order Executor** converts the allocation into direct REST market orders on Delta Exchange.

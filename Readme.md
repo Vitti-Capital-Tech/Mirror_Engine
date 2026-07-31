@@ -25,17 +25,69 @@ Each user may have **one master** at a time; any follower can be promoted to mas
 | Master action | Follower behaviour |
 |---------------|--------------------|
 | **Opens a position** (market fill) | Opens the same position, size scaled by ratio (floored). **All-or-nothing (FOK)** — full size or skip |
-| **Closes a position** (full or partial) | **Rebalances** the follower to `floor(master_remaining × ratio)` and closes only the excess (reduce-only). A small master trim never wipes a small follower |
+| **Closes a position** (full or partial) | **Rebalances** the follower to `ceil(master_remaining × ratio)` and closes only the excess (reduce-only). A small master trim never wipes a small follower |
 | **Places a limit order** | Mirrors a ratio-sized limit order |
 | **Places a stop / SL / TP (bracket) order** | Mirrors via Delta's bracket endpoint with the correct trigger reference (Mark/Index) |
 | **Edits an order or SL/TP price/trigger** | Edits the follower's existing order in place |
 | **Cancels an order** | Cancels the follower's mirrored order (with self-heal lookup if the id map is stale) |
 
-**SL/TP jitter:** each follower's stop/target trigger price is offset by **±(10–50)**, computed **deterministically** from the follower + price — so two legs of a pair that share the same master SL/TP price land on the *same* follower price, while different followers still get different offsets (they don't all trigger at once).
+**SL/TP jitter:** each follower's stop/target trigger price is offset by **±(0–20)**, computed **deterministically** from the follower + price — so two legs of a pair that share the same master SL/TP price land on the *same* follower price, while different followers still get different offsets (they don't all trigger at once).
 
-**Unfilled-limit escalation:** the master trades with limit orders, so a mirrored follower limit that doesn't fill would leave the follower missing the position. If a plain limit order hasn't executed within a wait+retry window (5s × 2), the engine **cancels it and places a full-or-nothing market order** so the follower gets in — for entries and exits. Entries only escalate if the master actually holds the position (its own limit filled). SL/TP brackets are excluded (they're meant to rest until triggered).
+**Unfilled-limit escalation — the 5s clock starts at the *master's* fill.** The master trades with limit orders, so a mirrored follower limit that never fills would leave the follower behind. The rule is: mirror the master's limit at the same price and **let it rest for as long as the master's rests**; the moment the **master's own order fills**, give the follower's mirror `ESCALATE_WAIT_SEC` (5s) to fill, then force the remainder to market.
 
-**Protective-cancel safety:** when a stop/SL/TP cancel arrives, the engine checks the **master's** position: if the master still holds it, the cancel is genuine (user removed/edited the stop) and is propagated; if the master is flat, the leg was cancelled by an SL/TP *hit* (OCO) and the follower's own bracket is kept so it closes independently.
+Timing this from *placement* instead is wrong in both directions: it forces the follower in or out while the master is still patiently waiting, and — because a mirrored reduce-only order looked like it had "nothing to close" — it cancelled the order, which the 30s reconcile then re-placed, producing an endless place/cancel loop. While the master's order is still resting the escalation does **nothing at all** (no market, no cancel). SL/TP brackets are excluded entirely; they're meant to rest until triggered.
+
+**Protective-cancel safety — trigger vs. manual cancel.** Follower stops are jittered to a slightly different price, so the master's stop firing tells you *nothing* about whether the follower's has fired. The two cases are therefore handled oppositely, using Delta's own `reason` field:
+
+* `reason=stop_cancel` → the master **deliberately cancelled** the stop → the follower's copy is orphaned, so cancel it too.
+* anything else (`stop_trigger`, a fill, or an unreadable reason) → **leave the follower's stop in place** and let its own trigger do the work.
+
+Deliberately biased toward keeping protection: stripping a live stop leaves a naked position, whereas an orphaned stop is harmless and gets cleaned up by the protection sweep. (Inferring this from the master's *position* instead misreads a TP firing on a **partial** close — the master is still holding, so it looks like a manual cancel and the follower's protection is stripped while its own stop hasn't triggered yet.)
+
+---
+
+## Reconciliation — the safety net
+
+Live copying can fail for reasons the copy path cannot control: an order rejected for margin, a request that arrives too late, a WebSocket gap, a limit that simply never fills. Rather than trying to enumerate those, the engine periodically compares **state** and repairs the difference. It doesn't care *why* the follower is wrong.
+
+**Position reconcile (every 15s)** — for every symbol, one of:
+
+| Situation | Action |
+|---|---|
+| Master holds, follower flat | **Open** it (subject to the price guard below) |
+| Follower holds, master flat | **Close** it (orphan) |
+| Opposite sides | **Close** it (desync) |
+| Right side, **too big** | **Trim** the excess (a close the follower never completed) |
+| Right side, **too small** | **Top up** the shortfall (a partly-missed entry) |
+
+**Order reconcile (every 30s)** — re-mirrors the master's resting plain limit orders, and syncs protection **both ways**: cancels a follower SL/TP the master no longer has, *and places one the follower is missing*. The latter matters because brackets are excluded from the ordinary re-mirror, so before this existed a stop that failed to mirror once was never restored — leaving a position unprotected indefinitely.
+
+Every corrective action is guarded so noise can't trigger a trade:
+
+* **Two-pass confirmation** — a difference must persist across consecutive passes before anything is placed.
+* **Size deadband** (`RECON_SIZE_TOLERANCE_PCT`, default 5%) — the target is derived from a *live* balance ratio, so it drifts continuously. Acting on a 1-lot difference on a 30-lot leg produces a trim/top-up churn loop that pays spread both ways.
+* **Settle window** (`TRIM_SETTLE_SEC`, 45s) — never resize while the master is still actively trading that symbol.
+* **One definition of "target"** — the live close, mirrored close, escalation, trim, top-up and post-cancel settle all compute `ceil(master_size × ratio)`. Mixing `ceil` and `floor` between paths makes two of them each close a lot off the same 1-lot difference.
+
+**Price guard on recovery** (`SYNC_PRICE_TOLERANCE_PCT`, default 15%) — a leg the master entered long ago is only recovered if the current mark is still within this much of the master's entry; otherwise it alerts instead of silently doing nothing. Judging on *age* alone means a missed entry is never recovered and the follower diverges permanently.
+
+> **Caveat for options:** entry-vs-mark drift measures the master's *P&L*, not whether copying still makes sense. Near expiry, premium decay pushes drift above 90% regardless, so the guard blocks nearly every recovery. Raise `SYNC_PRICE_TOLERANCE_PCT` (or set it very high) if matching the master's positions matters more than matching its entry prices.
+
+## Order-ID ledger
+
+Position-based reconciliation can tell you *that* a follower is out of sync, never *why* — and crucially it cannot distinguish **"the order was never placed"** from **"the order was placed and never filled"**, which need completely different fixes.
+
+The ledger records, keyed on the **master order id**, the master's order plus one leg per follower: mirrored (with the follower's own order id), deliberately skipped (with the reason), failed, or cancelled. Kept in Redis for 7 days.
+
+```bash
+# Full copy trail for one master order
+curl -H "Authorization: Bearer $TOKEN" "$API/api/trades/ledger/order/1442271322"
+
+# Which orders on this symbol did a follower never receive?
+curl -H "Authorization: Bearer $TOKEN" "$API/api/trades/ledger/symbol/P-BTC-63000-310726?missing_only=true"
+```
+
+Both are read-only and owner-scoped. A "skipped" leg is an accounted-for decision (e.g. already at target) and is *not* reported as missing; only an absent or failed leg is.
 
 ---
 
@@ -43,7 +95,7 @@ Each user may have **one master** at a time; any follower can be promoted to mas
 
 Set per follower (editable any time via the ✏️ edit action):
 
-* **Auto Balance Ratio** *(recommended)* — follower size = master size × (follower balance ÷ master balance). Quantities are **floored** on opens (never over-expose) and **ceiled** on closes (combined with reduce-only, never leaves a residual).
+* **Auto Balance Ratio** *(recommended)* — follower size = master size × (follower balance ÷ master balance), **ceiled**, so a small master trade whose share is a fraction still copies as ≥1 lot. The same `ceil` defines the follower's target size on *every* path (open, close, escalation, reconcile), so no two paths can disagree about what "in sync" means. `reduce_only` caps closes so they can never over-close.
 * **Multiplier** — follower copies a fixed scale of the master size (e.g. 2×).
 
 ### Allocated Balance (testing aid)
@@ -79,15 +131,19 @@ Each account can carry an optional **Allocated Balance** that overrides its real
 ## Execution & reliability
 
 * **Low-latency pipeline** — the master WebSocket reader drains the socket instantly into a queue and a worker processes **fills first** (ahead of the master's resting-order churn), and copy events are handled **concurrently, ordered per symbol**. Under a high-frequency master this keeps copy latency ~1s instead of stacking up to ~8s.
-* **All-or-nothing fills** — follower entries and exits use **Fill-Or-Kill** (full size or nothing, no partials). If the book can't supply the full size, it waits **5s** and retries (×2), then skips.
-* **Cached master state** — master position lookups are cached briefly so a burst of cancels doesn't hammer the REST API.
+* **Limit, then market** — a follower copy first rests a limit at the master's price; any unfilled remainder is then sent as a market order so the copy completes. (Delta rejects `fok`, so it is not used.)
+* **Cached master state** — master position lookups are cached ~3s, and a **single reusable API client per master**: the hot helpers used to construct and close a client per call, paying a full TLS handshake every time.
+* **Cached order liveness** — "is this mirrored order still resting?" is the hottest call in the engine (the master re-sends the same resting order on every update, and each repeat asked the exchange twice *per follower*). Cached 3s, but **asymmetrically**: a cache hit may only ever answer *"still live"* — anything not in the cached set is re-verified fresh, because a stale *"gone"* would place a duplicate order. A failed read also answers "live", for the same reason.
+* **Signature retry** — Delta rejects a request signature older than ~5s. Under load a signed order could reach the exchange 13–21s late and be refused as `expired_signature`; it is now re-signed and resent once rather than dropped as a permanent 4xx.
 
 ## Alerts & notifications
 
-Alert types raised: **position mismatch** (follower size ≠ master × ratio — raised on *both* master and follower, with a 30-min cooldown to prevent re-alert spam), **high slippage** (> 0.03%), and **liquidity unavailable** (a follower order couldn't fill the full size).
+Alert types raised: **position mismatch** (follower size ≠ master × ratio — raised on *both* master and follower, once per episode, re-arming when it resolves), **high slippage** (> 0.03%), **liquidity unavailable**, and **protection restored** (a follower was holding with no SL/TP).
 
 * **Dashboard** — Alert Feed with level filters + a notification bell.
-* **Telegram** — every alert is also pushed to a Telegram group via the Bot API (configure `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; resolutions are skipped and duplicates deduped). Leave unset to disable.
+* **Telegram** — alerts are pushed to a Telegram group via the Bot API (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; leave unset to disable).
+
+**Alerts are edge-triggered, not repeated.** Suppression state lives in **Redis**, so it survives a restart — otherwise every deploy re-alerts every ongoing condition from scratch. A persistent condition (a leg that can't be recovered, an order that keeps failing) sends **one** message and is then silent for `STATE_ALERT_WINDOW` (6h); when the underlying problem resolves, the flag is cleared so a genuine recurrence alerts again. Identical trade events (same account/symbol/side/size) collapse within 45s so a retry can't report the same fill twice.
 
 ## Accounts, Auth & Multi-tenancy
 
@@ -123,7 +179,9 @@ Admins are resolved from the `profiles.role` column; the first admin is set by h
 
 ### Backend (`backend/app`)
 * [core/trade_listener.py](backend/app/core/trade_listener.py) — master WebSocket handler + **`ListenerManager`** (one listener per user's master).
-* [core/copy_engine.py](backend/app/core/copy_engine.py) — consumes Redis events; mirrors positions, closes, limit & bracket orders; cancel/edit sync; SL/TP jitter; owner-scoped followers.
+* [core/copy_engine.py](backend/app/core/copy_engine.py) — consumes Redis events; mirrors positions, closes, limit & bracket orders; cancel/edit sync; SL/TP jitter; the 15s position reconciler (open / close / trim / top-up) and protection sync; owner-scoped followers.
+* [core/order_ledger.py](backend/app/core/order_ledger.py) — Redis order-ID ledger: every master order and each follower's outcome, so "which master order never reached this follower?" is answerable.
+* [test_order_ledger.py](backend/test_order_ledger.py) — self-contained regression suite (no network/Redis/Supabase) replaying real incidents: missed partial exit, stuck exit order, place/cancel loop, trigger-vs-cancel, deadband, liveness cache. Run with `python test_order_ledger.py`.
 * [core/risk_engine.py](backend/app/core/risk_engine.py) — balance-ratio / multiplier sizing (floor on open, ceil on close), margin checks.
 * [core/order_executor.py](backend/app/core/order_executor.py) — async follower execution; FOK all-or-nothing entries + retries; reduce-only closes.
 * [core/auth.py](backend/app/core/auth.py) — token verification, `require_admin`, owner scoping, email-OTP 2FA helpers.
@@ -185,6 +243,16 @@ ADMIN_MAGIC_CODE=...        ADMIN_EMAIL=admin@yourdomain   ADMIN_PASSWORD=...
 # Telegram alert notifications (optional; leave blank to disable)
 TELEGRAM_BOT_TOKEN=...      TELEGRAM_CHAT_ID=...
 ```
+
+#### Copy/reconcile tuning (all optional — defaults shown)
+```
+FRESH_ENTRY_SEC=180             # a queued fill event older than this is not copied
+SYNC_PRICE_TOLERANCE_PCT=15     # recover a stale leg only if price is within this % of the master's entry
+RECON_SIZE_TOLERANCE_PCT=5      # deadband before resizing (below this, ratio noise)
+TRIM_SETTLE_SEC=45              # don't resize within this long of the master's last fill
+STALE_ORPHAN_SEC=360            # a follower leg behind a stop, with the master long gone, is an orphan
+```
+> On **options**, `SYNC_PRICE_TOLERANCE_PCT=15` blocks nearly every recovery — premium decay pushes drift past 90% near expiry. Raise it if matching positions matters more than matching entry prices.
 
 ### Database migrations (run once in Supabase SQL editor)
 1. `backend/database/migrations/001_multitenant_auth.sql` — profiles, OTP table, `owner_id` columns, `allocated_balance`.

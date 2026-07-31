@@ -164,6 +164,7 @@ $$D_{pct} = \left| \frac{Size_{follower} - ExpectedSize}{ExpectedSize} \right| \
 *   [connection_manager.py](file:///d:/Work/Projects/trades_copy/backend/app/core/connection_manager.py): Client WebSocket session pool manager running singleton exports to stream real-time updates to connected browsers.
 *   [trade_listener.py](file:///d:/Work/Projects/trades_copy/backend/app/core/trade_listener.py): Real-time trade filter service that listens to the Delta Exchange Master WS stream, parses raw fill payloads, and serializes copyable events to the Redis queue.
 *   [position_monitor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/position_monitor.py): Periodic task that audits open position sync status and flags desynced profiles when size drift surpasses 5%.
+*   [order_ledger.py](file:///d:/Work/Projects/trades_copy/backend/app/core/order_ledger.py): Redis order-ID ledger recording every master order and each follower's outcome; distinguishes "never placed" from "placed and never filled".
 *   [slippage_tracker.py](file:///d:/Work/Projects/trades_copy/backend/app/core/slippage_tracker.py): Tracks trade copy metrics, calculates exact slippage margins, and posts warnings if the execution price variance is greater than 0.03%.
 
 ---
@@ -201,14 +202,31 @@ $$D_{pct} = \left| \frac{Size_{follower} - ExpectedSize}{ExpectedSize} \right| \
 * `[WSLAG]` / `[LATENCY]` log lines instrument WS staleness and end-to-end copy time.
 
 ### Fill logic (`order_executor.execute`)
-* Entries **and** exits are **Fill-Or-Kill** (full size or nothing). On shortfall: wait `FILL_RETRY_DELAY` (5s) and retry up to `MAX_FILL_RETRIES` (2), then skip. No partial fills.
+* A follower copy first rests a limit at the master's price; any unfilled remainder is then sent as a **market** order so the copy completes. Delta rejects `fok`, so it is not used.
 
 ### Unfilled-limit escalation (`copy_engine._escalate_unfilled_limit`)
-* After mirroring a plain limit order, a background task waits `ESCALATE_WAIT_SEC` (5s) ×2; if still unfilled it cancels the limit and places a full-or-nothing market order. Entries only escalate if the master still holds the position; SL/TP brackets are excluded.
+* The `ESCALATE_WAIT_SEC` (5s) window is measured from the **master's fill**, not from our placement. `trade_listener.on_order_fill` emits a `master_filled` event on a plain limit fill; `_escalate_after_master_fill` then gives each follower's mirror 5s to fill and markets the remainder, **sized from the follower's own order** (the master's 3000 lots are the follower's 30).
+* While the master's own order is still resting, `_escalate_unfilled_limit` returns immediately — **no market and no cancel**. Timing from placement instead both front-ran the master and, because a mirrored reduce-only order reported "nothing to close", cancelled it; the 30s order reconcile then re-placed it, producing an endless place/cancel loop.
+* SL/TP brackets are excluded (they rest until triggered).
 
-### Proportional close (`copy_engine.process_fill`, exit branch)
-* On a close, the follower is rebalanced to `floor(master_remaining × ratio)` and only the excess is closed (reduce-only) — a small master trim can't wipe a small follower. `_master_position_size` is cached ~3s.
+### Protective cancel: trigger vs. manual (`copy_engine._mirror_cancel`)
+* Follower stops are jittered, so the master's stop firing implies nothing about the follower's. Discriminated on Delta's `reason`: only `stop_cancel` propagates the cancel; `stop_trigger`, a fill, or an unknown reason leaves the follower's stop in place. Biased toward keeping protection — an orphan stop is harmless and the protection sweep clears it; a stripped stop leaves a naked position.
+
+### Target sizing (one definition everywhere)
+* Every path — live close (`process_fill`), mirrored close (`_mirror_place`), escalation (`_follower_close_qty`), reconciler trim/top-up, post-cancel settle — computes the follower target as `ceil(master_size × ratio)` with `min_one=False` so a fully-exited master can still take the follower to 0. Mixing `ceil` and `floor` between paths made two of them each close a lot off the same 1-lot difference.
+* Resizing requires `|held − target| ≥ max(1 lot, RECON_SIZE_TOLERANCE_PCT%)`. The target moves with a live balance ratio, so a 1-lot difference on a 30-lot leg is noise; acting on it churns trim→top-up→trim.
+
+### Reconciliation (`copy_engine._reconcile_positions`, `_sync_protection`)
+* **Positions, every 15s** — open a leg the follower is missing, close an orphan or wrong-side leg, **trim** an over-exposed one, **top up** an under-exposed one. Two-pass confirmation on every action; `TRIM_SETTLE_SEC` (45s) since the master's last fill before resizing.
+* **Recovery price guard** — a stale leg is recovered only if the mark is within `SYNC_PRICE_TOLERANCE_PCT` of the master's entry, otherwise it alerts. Gating on *age* alone (the previous behaviour) meant a missed entry was refused forever and the follower diverged permanently.
+* **Protection, every 30s** — cancels a follower SL/TP the master no longer has **and places one the follower is missing**. Brackets are excluded from the ordinary re-mirror, so without this a stop that failed to mirror once was never restored. Two-sweep confirmation plus a read-success check so a partial order read can't double-place a stop.
+* A master SL/TP is `reduce_only` but is **not** a close-now order: `_mirror_place` routes protective orders to their own branch, sized to cover the held position. Running them through the close-rebalance branch asks "how much must this follower close right now?" — always zero for a correctly-sized follower — which silently dropped the protection.
+
+### Order-ID ledger (`core/order_ledger.py`)
+* Redis, 7-day TTL. `oledger:{master_order_id}` holds the master order plus one leg per follower (`placed` / `filled` / `skipped` + reason / `failed` / `cancelled`); `oledger:sym:{owner}:{symbol}` indexes by symbol. Writes are pipelined into one round trip and are best-effort — a ledger failure can never block a copy.
+* Answers what a position-only view cannot: **"never placed"** vs **"placed and never filled"**. Exposed read-only at `/api/trades/ledger/order/{id}` and `/api/trades/ledger/symbol/{symbol}?missing_only=true`, owner-scoped.
 
 ### Alerts
-* `position_monitor.check_sync_and_alert` raises mismatch on **both** follower and master, `owner_id`-stamped, with a `MISMATCH_COOLDOWN_MIN` (30m) time-window suppression to stop resolve/re-create spam.
-* `socket_manager.emit_alert` also forwards non-resolved alerts to Telegram via `services/telegram_client.py` (deduped; inert unless `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` set).
+* `position_monitor.check_sync_and_alert` raises mismatch on **both** follower and master, `owner_id`-stamped, once per episode (gated on an unresolved alert row) and re-arming when it resolves.
+* `socket_manager.emit_alert` forwards non-resolved alerts to Telegram (`services/telegram_client.py`; inert unless `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` set).
+* Suppression is **Redis-backed** (`SET NX EX`) so it survives a reload — in-process state alone meant every deploy re-alerted every ongoing condition. Persistent conditions send once per `STATE_ALERT_WINDOW` (6h) and are cleared via `clear_alert()` when resolved, making alerts edge-triggered; identical trade events collapse within `DUP_EVENT_WINDOW` (45s).
