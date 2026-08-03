@@ -162,6 +162,14 @@ class CopyEngine:
         self._master_size_prev: dict = {}
         self._master_reducing_until: dict = {}
         self._REDUCING_COOLDOWN = float(os.getenv("REDUCING_COOLDOWN_SEC", "900"))
+        # {symbol: largest master size seen while the position has been open}.
+        # A time window is the wrong tool for "is the master unwinding?" — it
+        # expired 45s before a top-up bought back into an unwind that was still in
+        # progress (2026-08-03 04:42 on P-BTC-62600-030826, master 480 -> 280).
+        # While the master sits BELOW its peak it is net-reduced on that leg, so we
+        # never add, no matter how long the last sell was ago. Reset when the
+        # position closes or makes a new high.
+        self._master_size_peak: dict = {}
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
         # so a partial order read can never cause a duplicate stop.
@@ -1063,12 +1071,17 @@ class CopyEngine:
             if _prev is not None and _cur < _prev:
                 self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
             self._master_size_prev[_sym] = _cur
-        # A symbol the master has fully exited is also "reducing" until it re-enters.
+            # Peak high-water mark for the life of this position.
+            if _cur > self._master_size_peak.get(_sym, 0.0):
+                self._master_size_peak[_sym] = _cur
+        # A symbol the master has fully exited is also "reducing" until it re-enters,
+        # and its peak resets so a fresh position starts clean.
         for _sym in list(self._master_size_prev):
             if _sym not in master_map:
                 if self._master_size_prev.get(_sym):
                     self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
                 self._master_size_prev[_sym] = 0.0
+                self._master_size_peak.pop(_sym, None)
 
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
@@ -1206,6 +1219,19 @@ class CopyEngine:
                         if excess <= -1:
                             short_by = -excess
                             # NEVER add while the master is unwinding this symbol.
+                            # Peak check first: it has no expiry, so it holds for as
+                            # long as the master stays below its high-water mark. The
+                            # time window alone let a top-up through 45s after it
+                            # expired, mid-unwind (2026-08-03, P-BTC-62600-030826).
+                            peak = self._master_size_peak.get(sym, 0.0)
+                            if peak and abs(msz) < peak:
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
+                                    f"({held} vs {int(target)}) but master is BELOW its peak "
+                                    f"({abs(msz):.0f} of {peak:.0f}) — net-reduced on this leg, "
+                                    f"not adding. Live copy still mirrors any real re-entry."
+                                )
+                                continue
                             reducing_until = self._master_reducing_until.get(sym, 0)
                             if now < reducing_until:
                                 logger.info(

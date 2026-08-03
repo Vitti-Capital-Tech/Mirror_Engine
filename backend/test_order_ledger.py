@@ -740,6 +740,36 @@ async def main():
     ok &= check("target is unchanged when free margin swings (equity-based ratio)",
                 stable == busy and stable > 0, f"{stable} vs {busy}")
 
+    # ---- 12l. PEAK guard. The time-based reducing window expired 45s before a
+    #           top-up bought back into an unwind still in progress (2026-08-03
+    #           04:42, P-BTC-62600-030826: master 480 -> 280, follower bought 1 @67
+    #           having just sold 1 @76). A clock is the wrong test — while the
+    #           master sits below its high-water mark it is net-reduced on that leg,
+    #           however long ago the last sell was.
+    eng, client, event = build(3, 280, mark=1.2, entry=1.2)
+    eng._master_size_peak[SYM] = 480.0      # master has been unwinding 480 -> 280
+    eng._master_size_prev[SYM] = 280.0      # steady since last pass
+    eng._master_reducing_until[SYM] = 0     # time window already EXPIRED
+    await passes(eng, event)
+    ok &= check("below peak -> no top-up even after the time window expired",
+                client.placed == [], f"placed={client.placed}")
+
+    # A genuinely new/growing position (at its peak) may still be topped up.
+    eng, client, event = build(3, 480, mark=1.2, entry=1.2)
+    eng._master_size_peak[SYM] = 480.0      # at the high-water mark
+    eng._master_size_prev[SYM] = 480.0
+    await passes(eng, event)
+    ok &= check("at peak -> shortfall IS still topped up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # Peak must reset when the master closes the leg, so the next position is clean.
+    eng, client, event = build(0, 0)
+    eng._master_size_peak[SYM] = 480.0
+    eng._master_size_prev[SYM] = 480.0
+    await eng._reconcile_positions(event)
+    ok &= check("peak resets once the master is flat",
+                SYM not in eng._master_size_peak, f"peak={eng._master_size_peak}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
