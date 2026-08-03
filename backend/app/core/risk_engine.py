@@ -98,8 +98,26 @@ class RiskEngine:
         round_up=False: floor — used ONLY for a rebalance TARGET (how much the
         follower should still hold), which must be able to reach 0.
         """
-        allocation_mode: str = account.get("allocation_mode") or "multiplier"
-        allocation_value: float = account.get("allocation_value") or 1.0
+        # An UNCONFIGURED account must not be sized by guesswork. Defaulting a
+        # missing mode to "multiplier" and a missing value to 1.0 silently means
+        # "copy the master lot-for-lot" — the same catastrophic outcome as the
+        # auto_ratio 1:1 fallback removed below (a 610-lot target on a 70 USD
+        # account). Refuse instead; the reconciler retries once it is configured.
+        allocation_mode = account.get("allocation_mode")
+        raw_value = account.get("allocation_value")
+        if not allocation_mode:
+            logger.error(
+                "No allocation_mode set for account %s — refusing to size (would "
+                "otherwise default to copying the master 1:1)", account.get("id"),
+            )
+            return 0
+        if allocation_mode != "auto_ratio" and raw_value is None:
+            logger.error(
+                "No allocation_value set for account %s (mode=%s) — refusing to size",
+                account.get("id"), allocation_mode,
+            )
+            return 0
+        allocation_value: float = float(raw_value) if raw_value is not None else 0.0
         available_margin: float = account.get("available_margin") or 0.0
         leverage_limit: int = account.get("leverage_limit", 50) or 50
 
@@ -153,7 +171,13 @@ class RiskEngine:
                 return 0
 
         else:
-            qty = master_quantity  # fallback: mirror exactly
+            # An unrecognised mode (typo, new mode not handled here) previously
+            # mirrored the master EXACTLY — the same 1:1 hazard by another route.
+            logger.error(
+                "Unknown allocation_mode %r for account %s — refusing to size",
+                allocation_mode, account.get("id"),
+            )
+            return 0
 
         import math
         # Opens floor (never over-expose); closes ceil (never leave a residual,

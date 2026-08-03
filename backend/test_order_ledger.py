@@ -618,6 +618,28 @@ async def main():
         FOLLOWER.clear(); FOLLOWER.update(FOLLOWER_SAVE)
         MASTER.clear(); MASTER.update(MASTER_SAVE)
 
+    # ---- 12h. EVERY route to "copy the master 1:1" must be closed, not just the
+    #           auto_ratio one. A 1:1 size on a small follower is the single most
+    #           dangerous number this function can return.
+    for label, acct in (
+        ("unreadable master balance", dict(FOLLOWER, allocation_mode="auto_ratio",
+                                           master_balance=0.0, allocated_balance=70.0)),
+        ("no allocation_mode",        {"id": "x", "allocation_mode": None,
+                                       "allocation_value": None}),
+        ("no allocation_value",       {"id": "x", "allocation_mode": "multiplier",
+                                       "allocation_value": None}),
+        ("unknown allocation_mode",   {"id": "x", "allocation_mode": "typo_mode",
+                                       "allocation_value": 0.01}),
+    ):
+        got = _re.calculate_follower_quantity(610, 1.2, acct, round_up=True)
+        ok &= check(f"{label} -> refuses to size (never 1:1)", got == 0, f"got {got}")
+
+    # A properly configured account must still size normally.
+    good = {"id": "x", "allocation_mode": "multiplier", "allocation_value": 0.01}
+    ok &= check("configured multiplier still sizes normally",
+                _re.calculate_follower_quantity(610, 1.2, good, round_up=True) == 7,
+                f"got {_re.calculate_follower_quantity(610, 1.2, good, round_up=True)}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
