@@ -159,16 +159,17 @@ class CopyEngine:
         # {symbol: abs master size seen last pass} and {symbol: ts until which the
         # master counts as REDUCING on that symbol. While a master is unwinding, a
         # follower must never be adding — see the top-up branch.
-        self._master_size_prev: dict = {}
-        self._master_reducing_until: dict = {}
-        self._REDUCING_COOLDOWN = float(os.getenv("REDUCING_COOLDOWN_SEC", "900"))
-        # {symbol: largest master size seen while the position has been open}.
-        # A time window is the wrong tool for "is the master unwinding?" — it
-        # expired 45s before a top-up bought back into an unwind that was still in
-        # progress (2026-08-03 04:42 on P-BTC-62600-030826, master 480 -> 280).
-        # While the master sits BELOW its peak it is net-reduced on that leg, so we
-        # never add, no matter how long the last sell was ago. Reset when the
-        # position closes or makes a new high.
+        # {symbol: largest master size held on this leg} — mirrored from Redis so it
+        # survives a reload (see ledger.bump_peak). While the master sits BELOW its
+        # peak it is net-reduced on that leg and a follower must not be topped up
+        # into it, however long ago the last sell was.
+        #
+        # This replaced a 15-minute "master recently reduced" timer, which was both
+        # unsafe and over-eager: it expired 45s before a top-up bought back into an
+        # unwind still in progress (2026-08-03 04:42, P-BTC-62600-030826, master
+        # 480 -> 280), and it also blocked legitimate top-ups for 15 minutes after
+        # any small wobble even when the master was back at full size. The peak has
+        # no expiry to run out and no false positives at full size.
         self._master_size_peak: dict = {}
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
@@ -1066,22 +1067,14 @@ class CopyEngine:
         # which top-ups are suppressed. Trims are unaffected: reducing on a
         # snapshot is safe, adding is not.
         for _sym, _p in master_map.items():
-            _cur = abs(float(_p[0] or 0))
-            _prev = self._master_size_prev.get(_sym)
-            if _prev is not None and _cur < _prev:
-                self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
-            self._master_size_prev[_sym] = _cur
-            # Peak high-water mark for the life of this position.
-            if _cur > self._master_size_peak.get(_sym, 0.0):
-                self._master_size_peak[_sym] = _cur
-        # A symbol the master has fully exited is also "reducing" until it re-enters,
-        # and its peak resets so a fresh position starts clean.
-        for _sym in list(self._master_size_prev):
+            self._master_size_peak[_sym] = await ledger.bump_peak(
+                self.redis, owner_id, _sym, _p[0]
+            )
+        # A leg the master has fully exited starts from a clean peak next time.
+        for _sym in list(self._master_size_peak):
             if _sym not in master_map:
-                if self._master_size_prev.get(_sym):
-                    self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
-                self._master_size_prev[_sym] = 0.0
                 self._master_size_peak.pop(_sym, None)
+                await ledger.clear_peak(self.redis, owner_id, _sym)
 
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
@@ -1230,14 +1223,6 @@ class CopyEngine:
                                     f"({held} vs {int(target)}) but master is BELOW its peak "
                                     f"({abs(msz):.0f} of {peak:.0f}) — net-reduced on this leg, "
                                     f"not adding. Live copy still mirrors any real re-entry."
-                                )
-                                continue
-                            reducing_until = self._master_reducing_until.get(sym, 0)
-                            if now < reducing_until:
-                                logger.info(
-                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
-                                    f"({held} vs {int(target)}) but master is REDUCING — "
-                                    f"not topping up for another {reducing_until - now:.0f}s"
                                 )
                                 continue
                             ok, drift = self._price_drift_ok(mark, mentry)

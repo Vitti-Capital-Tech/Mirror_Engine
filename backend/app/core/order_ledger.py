@@ -308,6 +308,55 @@ async def clear_hands_off(redis, owner_id, follower_id, symbol) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Master position high-water marks
+# ---------------------------------------------------------------------------
+# "Is the master unwinding this leg?" is a property of the position, not of
+# elapsed time: while the master sits below the largest size it has held on a
+# symbol, it is net-reduced there and a follower must not be topped up into it.
+#
+# Kept in Redis because the answer has to survive a reload. Held in process
+# memory, a deploy makes a master mid-unwind at 280 look like a fresh position
+# at its peak, and top-ups become possible again — the same "state lost exactly
+# when it matters" failure as the alert dedupe.
+
+PEAK_TTL = 7 * 24 * 3600
+
+
+def _peak_key(owner_id, symbol) -> str:
+    return f"mpeak:{owner_id or '_'}:{symbol}"
+
+
+async def bump_peak(redis, owner_id, symbol, size) -> float:
+    """Record the master's current size and return the running peak."""
+    if not redis or not symbol:
+        return float(size or 0)
+    key = _peak_key(owner_id, symbol)
+    cur = abs(float(size or 0))
+    try:
+        prev = await redis.get(key)
+        prev = float(prev) if prev else 0.0
+        if cur > prev:
+            await redis.set(key, str(cur), ex=PEAK_TTL)
+            return cur
+        # Refresh the TTL so a long-held position doesn't silently forget its peak.
+        await redis.expire(key, PEAK_TTL)
+        return prev
+    except Exception as e:
+        logger.debug(f"ledger: bump_peak failed for {symbol}: {e}")
+        return cur
+
+
+async def clear_peak(redis, owner_id, symbol) -> None:
+    """Master closed the leg — the next position starts from a clean peak."""
+    if not redis or not symbol:
+        return
+    try:
+        await redis.delete(_peak_key(owner_id, symbol))
+    except Exception:
+        pass
+
+
 async def missing_for_follower(
     redis, owner_id, symbol, follower_id, *, kind=None, since=None, limit: int = 50
 ) -> list:

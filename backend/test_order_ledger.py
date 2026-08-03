@@ -583,14 +583,14 @@ async def main():
     #           none of them asked which DIRECTION the master was going.
     eng, client, event = build(5, 560, mark=1.2, entry=1.2)
     # Master seen larger on the previous pass => it is reducing.
-    eng._master_size_prev[SYM] = 610.0
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
     await passes(eng, event)
     ok &= check("master REDUCING -> no top-up (never add into an unwind)",
                 client.placed == [], f"placed={client.placed}")
 
     # Same shortfall, but the master is holding steady -> top-up is correct.
     eng, client, event = build(5, 560, mark=1.2, entry=1.2)
-    eng._master_size_prev[SYM] = 560.0
+    await ledger.bump_peak(eng.redis, "u1", SYM, 560)
     await passes(eng, event)
     ok &= check("master steady -> shortfall IS topped up",
                 len(client.placed) == 1 and client.placed[0]["reduce_only"] is False,
@@ -598,7 +598,7 @@ async def main():
 
     # Reducing must NOT block a trim — shedding risk on a snapshot is safe.
     eng, client, event = build(30, 560, mark=1.2, entry=1.2)
-    eng._master_size_prev[SYM] = 610.0
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
     await passes(eng, event)
     ok &= check("master REDUCING still allows a TRIM (reducing risk is safe)",
                 len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
@@ -627,7 +627,7 @@ async def main():
     # ...and the reconciler must not read that 0 as "the follower should be flat".
     # Reproduce the live condition: the MASTER's balance reads as 0.
     eng, client, event = build(6, 610, mark=1.2, entry=1.2)
-    eng._master_size_prev[SYM] = 610.0          # steady, so a top-up would be allowed
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)   # at peak -> top-up allowed
     FOLLOWER_SAVE, MASTER_SAVE = dict(FOLLOWER), dict(MASTER)
     try:
         FOLLOWER.update({"allocation_mode": "auto_ratio", "allocation_value": 1.0,
@@ -747,28 +747,46 @@ async def main():
     #           master sits below its high-water mark it is net-reduced on that leg,
     #           however long ago the last sell was.
     eng, client, event = build(3, 280, mark=1.2, entry=1.2)
-    eng._master_size_peak[SYM] = 480.0      # master has been unwinding 480 -> 280
-    eng._master_size_prev[SYM] = 280.0      # steady since last pass
-    eng._master_reducing_until[SYM] = 0     # time window already EXPIRED
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)   # unwinding 480 -> 280
     await passes(eng, event)
     ok &= check("below peak -> no top-up even after the time window expired",
                 client.placed == [], f"placed={client.placed}")
 
     # A genuinely new/growing position (at its peak) may still be topped up.
     eng, client, event = build(3, 480, mark=1.2, entry=1.2)
-    eng._master_size_peak[SYM] = 480.0      # at the high-water mark
-    eng._master_size_prev[SYM] = 480.0
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)   # at the high-water mark
     await passes(eng, event)
     ok &= check("at peak -> shortfall IS still topped up", len(client.placed) == 1,
                 f"placed={client.placed}")
 
     # Peak must reset when the master closes the leg, so the next position is clean.
     eng, client, event = build(0, 0)
-    eng._master_size_peak[SYM] = 480.0
-    eng._master_size_prev[SYM] = 480.0
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)
     await eng._reconcile_positions(event)
     ok &= check("peak resets once the master is flat",
                 SYM not in eng._master_size_peak, f"peak={eng._master_size_peak}")
+
+    # ---- 12m. The peak must SURVIVE A RESTART. Held in process memory, a deploy
+    #           makes a master mid-unwind at 280 look like a fresh position at its
+    #           peak and top-ups become possible again — and this backend reloads
+    #           several times a day. Same "state lost exactly when it matters"
+    #           failure as the alert dedupe re-firing on every deploy.
+    shared = FakeRedis()
+    await ledger.bump_peak(shared, "u1", SYM, 480)      # before the "restart"
+
+    from app.core.copy_engine import CopyEngine
+    client5 = FakeClient([{"product_symbol": SYM, "size": 3}])
+    eng5 = CopyEngine(FakeDB(), shared, FakeSocket(), FakeConnMgr(client5))
+    async def _fresh5(_m): return {SYM: time.time() - 600}
+    eng5._master_recent_fill_ts = _fresh5
+    async def _cls5(_m, _s): return "unknown"
+    eng5._classify_master_exit = _cls5
+    ev5 = {"owner_id": "u1", "positions": [{"symbol": SYM, "size": 280, "mark": 1.2,
+                                            "entry": 1.2}]}
+    await eng5._reconcile_positions(ev5)
+    await eng5._reconcile_positions(ev5)
+    ok &= check("peak survives a restart -> still no top-up mid-unwind",
+                client5.placed == [], f"placed={client5.placed}")
 
     # ---- 13. The ledger itself.
     r = FakeRedis()
