@@ -726,6 +726,20 @@ async def main():
                 len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
                 f"placed={client.placed}")
 
+    # ---- 12k. Ratio must be built on EQUITY, not free margin. available_margin
+    #           swings as positions lock margin up, so the same unchanged position
+    #           was "expected 22" and later "expected 30" — a 30% move that fired
+    #           four false Position Mismatch alerts on 2026-08-03.
+    acct = {"id": "x", "allocation_mode": "auto_ratio", "allocation_value": 1.0,
+            "balance": 70.0, "available_margin": 49.8, "master_balance": 7241.0}
+    stable = _re.calculate_follower_quantity(3100, 1.2, acct, round_up=True)
+    # Simulate margin being consumed by new positions: equity unchanged, free
+    # margin down 40%. The target must not move.
+    acct_busy = dict(acct, available_margin=29.0)
+    busy = _re.calculate_follower_quantity(3100, 1.2, acct_busy, round_up=True)
+    ok &= check("target is unchanged when free margin swings (equity-based ratio)",
+                stable == busy and stable > 0, f"{stable} vs {busy}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",

@@ -138,11 +138,19 @@ class RiskEngine:
             # An explicit allocated_balance overrides the real balance for the
             # ratio — lets you size copies as if the accounts were comparable
             # (e.g. allocate 60 on a 4000-balance master to test 1-lot copies).
+            # EQUITY, not free margin. available_margin shrinks as positions lock
+            # margin up and grows as they close, so a ratio built on it swings with
+            # the book — observed 2026-08-03: the same unchanged positions were
+            # "expected 22" at one moment and "expected 30" half an hour later, a
+            # 30% move, which fired four false Position Mismatch alerts and would
+            # have the reconciler resizing correct positions back and forth.
+            # Total balance is stable, so the follower's share of the master stays
+            # put unless someone actually deposits or withdraws.
             master_balance = float(account.get("master_balance") or 0.0)
             follower_balance = float(
                 account.get("allocated_balance")
-                or account.get("available_margin")
                 or account.get("balance")
+                or account.get("available_margin")
                 or 0.0
             )
             

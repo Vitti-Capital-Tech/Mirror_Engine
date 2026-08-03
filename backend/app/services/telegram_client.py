@@ -167,9 +167,19 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
     if key and not await _should_send(key, window):
         return
     lot_str = f" {_num(lots)} lot(s)" if lots not in (None, "", 0) else ""
-    text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
-            f"<code>{symbol}</code>\n"
-            f"{str(side).title()}{lot_str} — {reason}")
+    # A deliberate decision not to act is NOT a failure. Labelling a price-guard
+    # skip "Mirror Failed" reads like something broke and trains you to ignore the
+    # alert that matters — an order the exchange actually rejected.
+    skipped = str(side).lower() in ("topup", "recover") or "drift" in (reason or "").lower()
+    if skipped:
+        text = (f"ℹ️ <b>Copy Skipped</b> · {account}\n"
+                f"<code>{symbol}</code>\n"
+                f"{lot_str.strip() or 'leg'} — {reason}\n"
+                f"<i>Deliberate: nothing failed, the follower was left as-is.</i>")
+    else:
+        text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
+                f"<code>{symbol}</code>\n"
+                f"{str(side).title()}{lot_str} — {reason}")
     await send_message(text)
 
 

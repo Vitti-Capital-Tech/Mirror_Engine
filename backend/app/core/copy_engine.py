@@ -285,7 +285,7 @@ class CopyEngine:
                 mq = mq.eq("owner_id", owner_id)
             master_acc = mq.execute()
             if master_acc.data:
-                master_balance = float(master_acc.data[0].get("allocated_balance") or master_acc.data[0].get("available_margin") or master_acc.data[0].get("balance") or 0.0)
+                master_balance = float(master_acc.data[0].get("allocated_balance") or master_acc.data[0].get("balance") or master_acc.data[0].get("available_margin") or 0.0)
         except Exception as e:
             logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
 
@@ -1039,7 +1039,7 @@ class CopyEngine:
             m = mq.execute()
             if m.data:
                 master_row = m.data[0]
-                master_balance = float(master_row.get("allocated_balance") or master_row.get("available_margin") or master_row.get("balance") or 0.0)
+                master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
         except Exception:
             pass
 
@@ -1668,7 +1668,7 @@ class CopyEngine:
             m = mq.execute()
             if m.data:
                 master_row = m.data[0]
-                master_balance = float(master_row.get("allocated_balance") or master_row.get("available_margin") or master_row.get("balance") or 0.0)
+                master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
         except Exception:
             pass
 
