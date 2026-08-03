@@ -915,6 +915,15 @@ class CopyEngine:
             f"hands-off: {symbol} marked for {len(followers)} follower(s) — {reason}; "
             f"their own stops will close these legs, reconciler will not touch them"
         )
+        # Surface it: while a leg is hands-off the reconciler deliberately will not
+        # act on it, so a mismatch there is expected rather than a fault. Deduped
+        # per symbol+reason, and it clears when the episode ends.
+        asyncio.create_task(tg.send_alert({
+            "level": "info", "type": "hands_off",
+            "message": (f"{symbol}: {reason}. Follower positions left to their own "
+                        f"SL/TP — reconciler will not touch this leg until it closes "
+                        f"or the master re-enters."),
+        }))
 
     async def _escalate_after_master_fill(self, event: dict, master_order_id: str) -> None:
         """The master's resting limit just FILLED. Give each follower's mirrored
@@ -2302,19 +2311,24 @@ class CopyEngine:
             # misreads a TP firing on a PARTIAL close: the master is still holding,
             # so it looked like a manual cancel and the follower's protection was
             # stripped while its own (jittered) stop had not yet triggered.
-            if (event.get("reason") or "") != "stop_cancel":
+            _reason = (event.get("reason") or "")
+            if _reason != "stop_cancel":
                 logger.info(
                     f"Protective order on {symbol} vanished (reason "
-                    f"{event.get('reason') or 'unknown'}) — not a deliberate cancel, "
+                    f"{_reason or 'unknown'}) — not a deliberate cancel, "
                     f"leaving follower stops in place to trigger on their own."
                 )
-                # The master's protection fired, so the master is (or is about to
-                # be) flat while the follower still holds. Mark the leg hands-off
-                # so the reconciler doesn't read that as an orphan and close it.
-                await self._mark_hands_off(
-                    event, master_order_id,
-                    f"master protection ended ({event.get('reason') or 'trigger'})",
-                )
+                # Hands-off requires POSITIVE evidence that the stop FIRED, not
+                # merely "this wasn't a deliberate cancel". An unknown reason must
+                # NOT freeze the leg: hands-off blocks reconciliation for up to a
+                # day, and that would stop the follower being closed when the master
+                # exits gradually via partial exits and ends up flat — a case that
+                # must still be followed. Keeping the follower's stop is safe on an
+                # unknown reason; disabling the safety net on one is not.
+                if _reason == "stop_trigger":
+                    await self._mark_hands_off(
+                        event, master_order_id, "master SL/TP triggered",
+                    )
                 return
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:

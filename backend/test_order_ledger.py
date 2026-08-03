@@ -695,6 +695,37 @@ async def main():
     ok &= check("hands-off is released once the follower is flat",
                 await ledger.is_hands_off(eng4.redis, "u1", "f1", SYM) is None)
 
+    # ---- 12j. Hands-off needs POSITIVE evidence the stop FIRED. "Not a deliberate
+    #           cancel" is not enough: an unknown reason would freeze the leg out of
+    #           reconciliation for a day, which would stop the follower being closed
+    #           when the master exits gradually via partial exits and ends up flat.
+    hoff_base = {"action": "cancel", "master_order_id": "S7", "symbol": SYM,
+                 "product_id": 42, "side": "buy",
+                 "stop_order_type": "stop_loss_order", "stop_price": 5.0,
+                 "owner_id": "u1"}
+
+    eng, client, _ = build(-30, -3000)
+    await eng._mirror_cancel("S7", dict(hoff_base, reason="stop_trigger"))
+    ok &= check("reason=stop_trigger -> leg IS marked hands-off",
+                await ledger.is_hands_off(eng.redis, "u1", "f1", SYM) is not None)
+
+    eng, client, _ = build(-30, -3000)
+    await eng._mirror_cancel("S7", dict(hoff_base, reason=None))
+    ok &= check("unknown reason -> NOT marked hands-off (reconciler stays free)",
+                await ledger.is_hands_off(eng.redis, "u1", "f1", SYM) is None)
+    ok &= check("unknown reason -> follower's stop still not cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    # A master that exits gradually (partial exits, no trigger) must still leave the
+    # follower flat — hands-off must not be blocking that path.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await eng._mirror_cancel("S7", dict(hoff_base, reason=None))   # unknown, no mark
+    await passes(eng, event)
+    ok &= check("master flat via partial exits -> follower IS closed",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
+                f"placed={client.placed}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
