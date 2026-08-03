@@ -779,6 +779,14 @@ class CopyEngine:
         target = self.risk_engine.calculate_follower_quantity(
             master_remaining, ref_price, follower, round_up=True, min_one=False
         )
+        # Master still holds but the ratio gave 0 => sizing unavailable, not "close
+        # everything". Return None so the caller treats it as undeterminable.
+        if master_remaining and int(target) < 1:
+            logger.warning(
+                "Close sizing unavailable for %s on %s (master holds %s) — not forcing a close",
+                follower.get("name"), symbol, master_remaining,
+            )
+            return None, current
         close_qty = max(0, int(current) - int(target))
         # Same deadband as every other resize path, so ratio noise can't trigger a
         # forced close the reconciler would just undo.
@@ -1110,6 +1118,16 @@ class CopyEngine:
                         target = self.risk_engine.calculate_follower_quantity(
                             abs(msz), float(mark) if mark else 0.0, fol, round_up=True
                         )
+                        # A zero target while the master still HOLDS means the ratio
+                        # could not be computed (balance read as 0) — NOT that the
+                        # follower should be flat. Trimming on it would close the
+                        # entire position. Never act on an unavailable ratio.
+                        if int(target) < 1:
+                            logger.warning(
+                                f"reconcile: sizing unavailable for {fol.get('name')} on {sym} "
+                                f"(master {msz:+.0f}, holds {held}) — leaving it alone this pass"
+                            )
+                            continue
                         excess = held - int(target)
                         # Deadband: the target moves with a live balance ratio, so a
                         # 1-lot difference on a 30-lot leg is noise, not a miss.
@@ -1629,6 +1647,19 @@ class CopyEngine:
             # Floor so the mirrored order quantity matches the follower's position
             # (which was also floored on open). reduce_only caps it anyway.
             qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
+            if qty < 1:
+                # Sizing unavailable (e.g. the master's balance read as 0, so the
+                # ratio can't be computed). Skip rather than guess — the reconciler
+                # picks this leg up once balances read again.
+                logger.warning(
+                    f"Skipping mirror to {follower.get('name')} on {symbol}: "
+                    f"sizing unavailable for master qty {master_qty}"
+                )
+                await ledger.record_follower_leg(
+                    self.redis, master_order_id, follower["id"], status="skipped",
+                    reason="sizing unavailable (balance ratio could not be computed)",
+                )
+                continue
             place_stop_price = stop_price  # per-follower (jittered for protection)
             client = await self._get_follower_client(follower)
             if not client:
@@ -2113,6 +2144,12 @@ class CopyEngine:
             target = self.risk_engine.calculate_follower_quantity(
                 abs(float(master_now)), ref_price or 0.0, follower, round_up=True
             )
+            if master_now and int(target) < 1:
+                logger.warning(
+                    f"Exit settle for {name} on {symbol}: sizing unavailable "
+                    f"(master {master_now}) — not closing on an unknown ratio"
+                )
+                return
             held = int(abs(signed))
             close_qty = held - int(target)
             # Same deadband as the reconciler, so the two can't disagree about what

@@ -582,6 +582,42 @@ async def main():
                 len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
                 f"placed={client.placed}")
 
+    # ---- 12g. UNAVAILABLE RATIO must never mean "copy 1:1" or "close everything".
+    #           Live 2026-08-02: the master's balance read as 0.0 five times in a
+    #           day; auto_ratio fell back to copying the master VERBATIM and the
+    #           reconciler computed a target of 610 lots for a 70 USD account. It
+    #           only failed to execute because the two-pass confirmation broke
+    #           first. Sizing must now refuse rather than guess.
+    from app.core.risk_engine import RiskEngine as _RE
+    _re = _RE()
+    broke = dict(FOLLOWER, allocation_mode="auto_ratio", allocation_value=1.0,
+                 master_balance=0.0, allocated_balance=70.0)
+    ok &= check("unreadable master balance sizes to 0, never 1:1",
+                _re.calculate_follower_quantity(610, 1.2, broke, round_up=True) == 0,
+                f"got {_re.calculate_follower_quantity(610, 1.2, broke, round_up=True)}")
+
+    okf = dict(FOLLOWER, allocation_mode="auto_ratio", allocation_value=1.0,
+               master_balance=7000.0, allocated_balance=70.0)
+    ok &= check("a readable ratio still sizes normally",
+                _re.calculate_follower_quantity(610, 1.2, okf, round_up=True) == 7,
+                f"got {_re.calculate_follower_quantity(610, 1.2, okf, round_up=True)}")
+
+    # ...and the reconciler must not read that 0 as "the follower should be flat".
+    # Reproduce the live condition: the MASTER's balance reads as 0.
+    eng, client, event = build(6, 610, mark=1.2, entry=1.2)
+    eng._master_size_prev[SYM] = 610.0          # steady, so a top-up would be allowed
+    FOLLOWER_SAVE, MASTER_SAVE = dict(FOLLOWER), dict(MASTER)
+    try:
+        FOLLOWER.update({"allocation_mode": "auto_ratio", "allocation_value": 1.0,
+                         "allocated_balance": 70.0})
+        MASTER["allocated_balance"] = 0         # <- the live failure
+        await passes(eng, event)
+        ok &= check("unavailable ratio -> reconciler leaves the position untouched",
+                    client.placed == [], f"placed={client.placed}")
+    finally:
+        FOLLOWER.clear(); FOLLOWER.update(FOLLOWER_SAVE)
+        MASTER.clear(); MASTER.update(MASTER_SAVE)
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",

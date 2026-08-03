@@ -133,9 +133,24 @@ class RiskEngine:
                 qty = master_quantity * ratio
                 logger.info(f"Auto Balance Ratio: follower_bal={follower_balance}, master_bal={master_balance}, ratio={ratio:.6f}, calculated_qty={qty:.4f}")
             else:
-                # Fallback to 1:1 if balances are missing
-                logger.warning(f"Auto Ratio fallback to 1:1. Follower Balance: {follower_balance}, Master Balance: {master_balance}")
-                qty = master_quantity
+                # NEVER fall back to 1:1 here. auto_ratio exists precisely because
+                # the follower is far smaller than the master, so copying the
+                # master's size verbatim is the single most dangerous thing this
+                # function can return. Observed live 2026-08-02: the master's
+                # balance read as 0.0 five times in a day, and the reconciler
+                # computed a target of 610 lots for a 70 USD account. It only
+                # failed to execute because the two-pass confirmation happened to
+                # break first — luck, not safety.
+                #
+                # Return 0 so callers skip. A missed copy is recoverable (the
+                # reconciler retries once balances read again); a 100x oversized
+                # order is not.
+                logger.error(
+                    "Auto Ratio UNAVAILABLE — skipping sizing (follower_balance=%s, "
+                    "master_balance=%s). Refusing to fall back to 1:1.",
+                    follower_balance, master_balance,
+                )
+                return 0
 
         else:
             qty = master_quantity  # fallback: mirror exactly
