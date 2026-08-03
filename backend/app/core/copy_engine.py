@@ -915,15 +915,10 @@ class CopyEngine:
             f"hands-off: {symbol} marked for {len(followers)} follower(s) — {reason}; "
             f"their own stops will close these legs, reconciler will not touch them"
         )
-        # Surface it: while a leg is hands-off the reconciler deliberately will not
-        # act on it, so a mismatch there is expected rather than a fault. Deduped
-        # per symbol+reason, and it clears when the episode ends.
-        asyncio.create_task(tg.send_alert({
-            "level": "info", "type": "hands_off",
-            "message": (f"{symbol}: {reason}. Follower positions left to their own "
-                        f"SL/TP — reconciler will not touch this leg until it closes "
-                        f"or the master re-enters."),
-        }))
+        # Deliberately NOT sent to Telegram. This is routine, expected behaviour on
+        # every master SL/TP trigger, so alerting on it would be constant noise and
+        # would bury the notifications that need acting on. The log line above is
+        # the record. (Prathav, 2026-08-03)
 
     async def _escalate_after_master_fill(self, event: dict, master_order_id: str) -> None:
         """The master's resting limit just FILLED. Give each follower's mirrored
