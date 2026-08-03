@@ -553,6 +553,35 @@ async def main():
     ok &= check("master stop MANUALLY cancelled -> follower's stop IS cancelled",
                 client.cancelled == ["FS1"], f"cancelled={client.cancelled}")
 
+    # ---- 12f. NEVER ADD WHILE THE MASTER IS UNWINDING (live incident
+    #           2026-08-02, P-BTC-63000-030826). The master was 2 minutes into a
+    #           multi-hour exit but still showed +560, so the top-up bought a lot
+    #           back 79s after the master had sold — and the whole position was
+    #           closed as an orphan two hours later. Every individual guard passed;
+    #           none of them asked which DIRECTION the master was going.
+    eng, client, event = build(5, 560, mark=1.2, entry=1.2)
+    # Master seen larger on the previous pass => it is reducing.
+    eng._master_size_prev[SYM] = 610.0
+    await passes(eng, event)
+    ok &= check("master REDUCING -> no top-up (never add into an unwind)",
+                client.placed == [], f"placed={client.placed}")
+
+    # Same shortfall, but the master is holding steady -> top-up is correct.
+    eng, client, event = build(5, 560, mark=1.2, entry=1.2)
+    eng._master_size_prev[SYM] = 560.0
+    await passes(eng, event)
+    ok &= check("master steady -> shortfall IS topped up",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is False,
+                f"placed={client.placed}")
+
+    # Reducing must NOT block a trim — shedding risk on a snapshot is safe.
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2)
+    eng._master_size_prev[SYM] = 610.0
+    await passes(eng, event)
+    ok &= check("master REDUCING still allows a TRIM (reducing risk is safe)",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
+                f"placed={client.placed}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",

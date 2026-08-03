@@ -156,6 +156,12 @@ class CopyEngine:
         # share — a partially-missed entry). Adds exposure, so it gets the same
         # two-pass confirmation, the open debounce, and a price-drift guard.
         self._recon_topup_prev: set = set()
+        # {symbol: abs master size seen last pass} and {symbol: ts until which the
+        # master counts as REDUCING on that symbol. While a master is unwinding, a
+        # follower must never be adding — see the top-up branch.
+        self._master_size_prev: dict = {}
+        self._master_reducing_until: dict = {}
+        self._REDUCING_COOLDOWN = float(os.getenv("REDUCING_COOLDOWN_SEC", "900"))
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
         # so a partial order read can never cause a duplicate stop.
@@ -996,6 +1002,28 @@ class CopyEngine:
             return
 
         now = time.time()
+
+        # Which way is the master going on each symbol? A snapshot alone is not
+        # enough to justify ADDING exposure: on 2026-08-02 the master was two
+        # minutes into a multi-hour unwind of P-BTC-63000-030826 but still showed
+        # +560, so the top-up bought a lot back 79s after the master had sold —
+        # and the whole position was closed as an orphan two hours later. Any
+        # observed decrease marks the symbol as REDUCING for a cooldown, during
+        # which top-ups are suppressed. Trims are unaffected: reducing on a
+        # snapshot is safe, adding is not.
+        for _sym, _p in master_map.items():
+            _cur = abs(float(_p[0] or 0))
+            _prev = self._master_size_prev.get(_sym)
+            if _prev is not None and _cur < _prev:
+                self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
+            self._master_size_prev[_sym] = _cur
+        # A symbol the master has fully exited is also "reducing" until it re-enters.
+        for _sym in list(self._master_size_prev):
+            if _sym not in master_map:
+                if self._master_size_prev.get(_sym):
+                    self._master_reducing_until[_sym] = now + self._REDUCING_COOLDOWN
+                self._master_size_prev[_sym] = 0.0
+
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
         current_trim: set = set()   # (follower_id, sym, excess) over-exposed THIS pass
@@ -1106,6 +1134,15 @@ class CopyEngine:
                         # is ADDING exposure at today's price.
                         if excess <= -1:
                             short_by = -excess
+                            # NEVER add while the master is unwinding this symbol.
+                            reducing_until = self._master_reducing_until.get(sym, 0)
+                            if now < reducing_until:
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
+                                    f"({held} vs {int(target)}) but master is REDUCING — "
+                                    f"not topping up for another {reducing_until - now:.0f}s"
+                                )
+                                continue
                             ok, drift = self._price_drift_ok(mark, mentry)
                             if not ok:
                                 logger.info(
