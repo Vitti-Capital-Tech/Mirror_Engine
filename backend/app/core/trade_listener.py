@@ -249,12 +249,18 @@ class TradeListener:
                     # Plain market fill -> copy as a market order (entry/close).
                     await self._push_fill_event(order)
                 elif is_stop:
-                    # A master SL/TP just FILLED. By strategy decision we do NOT
-                    # force-close followers here — each follower has its own
-                    # mirrored (jittered) SL/TP that closes its position at ~the
-                    # same level. Forcing a market close caused wasteful
+                    # A master SL/TP just FILLED. We do NOT force-close followers —
+                    # each has its own mirrored (jittered) SL/TP that closes at ~the
+                    # same level, and forcing a market close caused wasteful
                     # sell-then-buyback round-trips with bad fills in fast moves.
-                    logger.info("Master stop filled (%s) — leaving followers to their own jittered SL/TP (no forced close)", order.get("product_symbol"))
+                    #
+                    # Logging that is not enough: the master is now FLAT while the
+                    # follower still holds, which to the position reconciler looks
+                    # exactly like an orphan to close. Publish the fact so the engine
+                    # can mark the leg HANDS-OFF and leave the follower's own stop to
+                    # do its job.
+                    logger.info("Master stop filled (%s) — marking followers hands-off (their own jittered SL/TP will close it)", order.get("product_symbol"))
+                    await self._push_order_event(order, "master_stop_filled")
                 else:
                     # Plain limit fill. The follower has its own mirrored limit at
                     # the same price, so we do NOT copy the fill (that would double

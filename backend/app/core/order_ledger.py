@@ -220,6 +220,94 @@ async def recent(redis, owner_id, symbol, limit: int = 50) -> list:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Hands-off marks
+# ---------------------------------------------------------------------------
+# A leg can be in a state where the correct action is DO NOTHING, and the
+# reconciler cannot infer it from positions alone. The clearest case: the
+# master's SL/TP triggered, so the master is flat while the follower still
+# holds. Position-wise that is indistinguishable from an orphan the reconciler
+# should close — but closing it is wrong, because the follower has its own
+# JITTERED stop sitting at a slightly different price which must be allowed to
+# fire on its own.
+#
+# So the decision is recorded explicitly at the moment we have the evidence (a
+# `stop_trigger` event, or a master stop fill), and the reconciler consults it
+# instead of guessing. Kept in Redis so it survives a reload — an in-process
+# flag would be lost on every deploy, which is when it matters most.
+
+HANDS_OFF_TTL = 24 * 3600
+
+
+def _hoff_key(owner_id, follower_id, symbol) -> str:
+    return f"handsoff:{owner_id or '_'}:{follower_id}:{symbol}"
+
+
+def _hoff_idx(owner_id, follower_id) -> str:
+    return f"handsoff:idx:{owner_id or '_'}:{follower_id}"
+
+
+async def mark_hands_off(redis, owner_id, follower_id, symbol, reason,
+                         master_order_id=None, ttl: int = HANDS_OFF_TTL) -> None:
+    """Record that this follower's leg on `symbol` must be left alone."""
+    if not redis or not follower_id or not symbol:
+        return
+    try:
+        pipe = redis.pipeline(transaction=False)
+        pipe.set(
+            _hoff_key(owner_id, follower_id, symbol),
+            json.dumps({"reason": str(reason), "ts": time.time(),
+                        "master_order_id": str(master_order_id or "")}),
+            ex=int(ttl),
+        )
+        # Index so the reconciler can enumerate marks and release the ones whose
+        # episode is over — otherwise a leg stays excluded for the whole TTL.
+        pipe.sadd(_hoff_idx(owner_id, follower_id), symbol)
+        pipe.expire(_hoff_idx(owner_id, follower_id), int(ttl))
+        await pipe.execute()
+    except Exception as e:
+        logger.debug(f"ledger: mark_hands_off failed for {symbol}: {e}")
+
+
+async def list_hands_off(redis, owner_id, follower_id) -> list:
+    """Symbols currently marked hands-off for this follower."""
+    if not redis or not follower_id:
+        return []
+    try:
+        return list(await redis.smembers(_hoff_idx(owner_id, follower_id)) or [])
+    except Exception:
+        return []
+
+
+async def is_hands_off(redis, owner_id, follower_id, symbol):
+    """The recorded hands-off mark for this leg, or None."""
+    if not redis or not follower_id or not symbol:
+        return None
+    try:
+        raw = await redis.get(_hoff_key(owner_id, follower_id, symbol))
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"reason": "unknown"}
+
+
+async def clear_hands_off(redis, owner_id, follower_id, symbol) -> None:
+    """Release the leg — the episode is over (follower flat, or master re-entered)."""
+    if not redis or not follower_id or not symbol:
+        return
+    try:
+        pipe = redis.pipeline(transaction=False)
+        pipe.delete(_hoff_key(owner_id, follower_id, symbol))
+        pipe.srem(_hoff_idx(owner_id, follower_id), symbol)
+        await pipe.execute()
+    except Exception:
+        pass
+
+
 async def missing_for_follower(
     redis, owner_id, symbol, follower_id, *, kind=None, since=None, limit: int = 50
 ) -> list:

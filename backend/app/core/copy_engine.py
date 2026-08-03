@@ -875,12 +875,46 @@ class CopyEngine:
             await self._mirror_cancel(master_order_id, event)
         elif action == "exit":
             await self._sync_followers_to_master_exit(event)
+        elif action == "master_stop_filled":
+            await self._mark_hands_off(event, master_order_id, "master SL/TP triggered")
         elif action == "master_filled":
             await self._escalate_after_master_fill(event, master_order_id)
         elif action == "sync_protection":
             await self._sync_protection(event)
         elif action == "reconcile_positions":
             await self._reconcile_positions(event)
+
+    async def _mark_hands_off(self, event: dict, master_order_id: str, reason: str) -> None:
+        """Flag every active follower's leg on this symbol as DO-NOTHING.
+
+        Raised when the master's SL/TP triggers. From that instant the master is
+        flat while the follower still holds — which is indistinguishable, from
+        positions alone, from an orphan the reconciler should close. It must NOT
+        be closed: the follower has its own jittered stop at a slightly different
+        price, and that is what should close the position.
+
+        The mark is cleared once the episode is genuinely over — the follower goes
+        flat (its stop fired) or the master re-enters the symbol."""
+        symbol = event.get("symbol")
+        if not symbol:
+            return
+        try:
+            fq = self.db.table("accounts").select("id").eq("is_master", False).eq("status", "active")
+            if event.get("owner_id"):
+                fq = fq.eq("owner_id", event["owner_id"])
+            followers = fq.execute().data or []
+        except Exception as e:
+            logger.warning(f"hands-off: could not load followers for {symbol}: {e}")
+            return
+        for f in followers:
+            await ledger.mark_hands_off(
+                self.redis, event.get("owner_id"), f["id"], symbol, reason,
+                master_order_id=master_order_id,
+            )
+        logger.info(
+            f"hands-off: {symbol} marked for {len(followers)} follower(s) — {reason}; "
+            f"their own stops will close these legs, reconciler will not touch them"
+        )
 
     async def _escalate_after_master_fill(self, event: dict, master_order_id: str) -> None:
         """The master's resting limit just FILLED. Give each follower's mirrored
@@ -1067,6 +1101,21 @@ class CopyEngine:
                     except Exception:
                         pass
 
+                # Release any hands-off mark whose episode is over: the follower has
+                # gone flat (its own stop fired, as intended) or the master has
+                # re-entered the symbol. Without this the leg would be excluded from
+                # reconciliation for the full TTL.
+                for sym, _p in master_map.items():
+                    if _p[0]:
+                        await ledger.clear_hands_off(self.redis, fol.get("owner_id"), fid, sym)
+                for sym in await ledger.list_hands_off(self.redis, fol.get("owner_id"), fid):
+                    if sym not in fpos:
+                        logger.info(
+                            f"hands-off cleared for {fol.get('name')} {sym} — follower is "
+                            f"flat (its own stop did the job)"
+                        )
+                        await ledger.clear_hands_off(self.redis, fol.get("owner_id"), fid, sym)
+
                 # 1) CLOSE / TRIM — follower holds a leg the master is flat on, is
                 #    on the OPPOSITE side, or is on the right side at the wrong SIZE.
                 for sym, fsz in list(fpos.items()):
@@ -1249,6 +1298,19 @@ class CopyEngine:
                     # exited via SL/TP, leave it — the follower's own jittered stop
                     # is at ~the same price and closes it on its own (no churn). If
                     # we can't tell, leave it and retry next pass (never guess).
+                    # HANDS-OFF: the master's SL/TP triggered on this symbol, so it
+                    # is flat while the follower still holds. That is NOT an orphan —
+                    # the follower's own jittered stop is what should close it. Never
+                    # force it, regardless of how long it takes or how the master's
+                    # exit classifies.
+                    if msz == 0:
+                        hoff = await ledger.is_hands_off(self.redis, fol.get("owner_id"), fid, sym)
+                        if hoff:
+                            logger.info(
+                                f"reconcile: leaving {fol.get('name')} {sym} {fsz:+.0f} alone — "
+                                f"hands-off ({hoff.get('reason')}); its own stop closes this leg"
+                            )
+                            continue
                     if msz == 0 and sym in resting:
                         reason = await self._classify_master_exit(master_row, sym)
                         if reason != "manual":
@@ -2131,6 +2193,19 @@ class CopyEngine:
         remains the backstop for a master that never cancels at all."""
         name = follower.get("name") or "Follower"
         try:
+            # Hands-off: the master's SL/TP triggered on this symbol. Its leftover
+            # resting orders then get cancelled, which used to land here and force a
+            # close — observed live 2026-08-03 closing 29 lots of P-BTC-62000-030826
+            # right after the master's TP fired, instead of letting the follower's
+            # own stop do it.
+            hoff = await ledger.is_hands_off(self.redis, follower.get("owner_id"),
+                                             follower.get("id"), symbol)
+            if hoff:
+                logger.info(
+                    f"Exit settle skipped for {name} on {symbol} — hands-off "
+                    f"({hoff.get('reason')}); its own stop closes this leg"
+                )
+                return
             signed = float(await self._position_size_signed(client, symbol))
             if signed == 0:
                 return  # follower already flat — nothing owed
@@ -2232,6 +2307,13 @@ class CopyEngine:
                     f"Protective order on {symbol} vanished (reason "
                     f"{event.get('reason') or 'unknown'}) — not a deliberate cancel, "
                     f"leaving follower stops in place to trigger on their own."
+                )
+                # The master's protection fired, so the master is (or is about to
+                # be) flat while the follower still holds. Mark the leg hands-off
+                # so the reconciler doesn't read that as an orphan and close it.
+                await self._mark_hands_off(
+                    event, master_order_id,
+                    f"master protection ended ({event.get('reason') or 'trigger'})",
                 )
                 return
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)

@@ -46,6 +46,8 @@ class FakeRedis:
     def __init__(self):
         self.h = {}   # key -> {field: value}
         self.z = {}   # key -> {member: score}
+        self.kv = {}  # key -> string
+        self.s = {}   # key -> set
 
     async def hset(self, key, field=None, value=None, mapping=None):
         d = self.h.setdefault(key, {})
@@ -65,6 +67,8 @@ class FakeRedis:
 
     async def delete(self, key):
         self.h.pop(key, None)
+        self.kv.pop(key, None)
+        self.s.pop(key, None)
 
     async def expire(self, key, ttl):
         pass
@@ -76,6 +80,24 @@ class FakeRedis:
         z = self.z.get(key, {})
         for m in [m for m, s in z.items() if lo <= s <= hi]:
             z.pop(m)
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return None
+        self.kv[key] = str(value)
+        return True
+
+    async def get(self, key):
+        return self.kv.get(key)
+
+    async def sadd(self, key, *vals):
+        self.s.setdefault(key, set()).update(str(v) for v in vals)
+
+    async def srem(self, key, *vals):
+        self.s.get(key, set()).difference_update(str(v) for v in vals)
+
+    async def smembers(self, key):
+        return set(self.s.get(key, set()))
 
     async def zrevrange(self, key, start, stop):
         items = sorted(self.z.get(key, {}).items(), key=lambda kv: kv[1], reverse=True)
@@ -639,6 +661,39 @@ async def main():
     ok &= check("configured multiplier still sizes normally",
                 _re.calculate_follower_quantity(610, 1.2, good, round_up=True) == 7,
                 f"got {_re.calculate_follower_quantity(610, 1.2, good, round_up=True)}")
+
+    # ---- 12i. HANDS-OFF. When the master's SL/TP triggers, the master goes flat
+    #           while the follower still holds — indistinguishable from an orphan
+    #           by position alone, but it must NOT be closed: the follower's own
+    #           jittered stop is what should close it. Live 2026-08-03 the settle
+    #           closed 29 lots of P-BTC-62000-030826 seconds after the master's TP
+    #           fired, and the reconciler then closed the remaining 1.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await eng._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await passes(eng, event)
+    ok &= check("master TP triggered -> reconciler does NOT close the follower",
+                client.placed == [], f"placed={client.placed}")
+
+    eng2, client2, _ = build(-30, 0)
+    await eng2._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await eng2._settle_exit_after_cancel(FOLLOWER, client2, SYM, MASTER, ref_price=1.2)
+    ok &= check("master TP triggered -> exit settle does NOT force a close",
+                client2.placed == [], f"placed={client2.placed}")
+
+    # Without the mark, the same stale orphan IS still closed (regression guard).
+    eng3, client3, event3 = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await passes(eng3, event3)
+    ok &= check("no hands-off mark -> a genuine stale orphan is still closed",
+                len(client3.placed) == 1, f"placed={client3.placed}")
+
+    # The mark is released once the follower goes flat (its own stop fired).
+    eng4, client4, event4 = build(0, 0)
+    await eng4._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await eng4._reconcile_positions(event4)
+    ok &= check("hands-off is released once the follower is flat",
+                await ledger.is_hands_off(eng4.redis, "u1", "f1", SYM) is None)
 
     # ---- 13. The ledger itself.
     r = FakeRedis()
