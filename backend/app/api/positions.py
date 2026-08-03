@@ -291,20 +291,51 @@ async def _sync_accounts(accounts: list) -> list:
                     # We will sum them or fetch the main margin asset (USDT).
                     balances_list = wallet.get("result", wallet) if isinstance(wallet, dict) else wallet
                     if isinstance(balances_list, list):
-                        # Find USDT or first available balance
-                        usdt_bal = next((b for b in balances_list if b.get("asset") == "USDT"), None)
-                        if not usdt_bal and len(balances_list) > 0:
-                            usdt_bal = balances_list[0]
-                        
-                        if usdt_bal:
-                            balance_val = float(usdt_bal.get("balance") or 0.0)
-                            avail_margin = float(usdt_bal.get("available_margin") or balance_val)
-                            # Update account table in Supabase
-                            db.table("accounts").update({
-                                "balance": balance_val,
-                                "available_margin": avail_margin
-                            }).eq("id", acc["id"]).execute()
-                            logger.info(f"Updated live balance for {acc['name']}: bal={balance_val}, margin={avail_margin}")
+                        # Delta India returns one row per asset, keyed `asset_symbol`
+                        # (NOT `asset`) and carrying `available_balance` (NOT
+                        # `available_margin`). The old lookup matched
+                        # `asset == "USDT"`, which never matches, and then fell back
+                        # to balances_list[0] — i.e. it depended on the settlement
+                        # asset happening to be first in the list. Everything else
+                        # (REF_USD, INR, BTC, …) has a zero balance, so any change in
+                        # ordering wrote balance=0 over a good value.
+                        #
+                        # That zero is dangerous well beyond the dashboard: the
+                        # auto_ratio sizing divides by the master's balance, and a 0
+                        # there used to fall back to copying the master 1:1 (a 610-lot
+                        # target on a 70 USD account, observed 2026-08-02).
+                        settle = next(
+                            (b for b in balances_list
+                             if (b.get("asset_symbol") or b.get("asset")) in ("USD", "USDT")),
+                            None,
+                        )
+                        if settle:
+                            balance_val = float(settle.get("balance") or 0.0)
+                            avail_margin = float(
+                                settle.get("available_balance")
+                                or settle.get("available_margin")
+                                or balance_val
+                            )
+                            # Never overwrite a known-good balance with 0. A zero here
+                            # is far more likely to be a bad read than a real wipeout,
+                            # and the cost of believing it is mis-sizing every copy.
+                            prev = float(acc.get("balance") or 0.0)
+                            if balance_val <= 0 and prev > 0:
+                                logger.warning(
+                                    f"Ignoring zero balance read for {acc['name']} "
+                                    f"(stored {prev}) — keeping the previous value"
+                                )
+                            else:
+                                db.table("accounts").update({
+                                    "balance": balance_val,
+                                    "available_margin": avail_margin,
+                                }).eq("id", acc["id"]).execute()
+                                logger.info(f"Updated live balance for {acc['name']}: bal={balance_val}, margin={avail_margin}")
+                        else:
+                            logger.warning(
+                                f"No USD/USDT settlement balance for {acc['name']} in "
+                                f"{[b.get('asset_symbol') for b in balances_list]} — balance left unchanged"
+                            )
                 except Exception as bal_err:
                     logger.warning(f"Failed to fetch wallet balance for {acc['name']}: {bal_err}")
 
