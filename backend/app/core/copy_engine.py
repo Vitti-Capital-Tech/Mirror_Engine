@@ -89,6 +89,13 @@ SYNC_PRICE_TOLERANCE_PCT = float(os.getenv("SYNC_PRICE_TOLERANCE_PCT", "15"))
 # comfortably; ratio noise never does.
 RECON_SIZE_TOLERANCE_PCT = float(os.getenv("RECON_SIZE_TOLERANCE_PCT", "5"))
 
+# An order event older than this is re-checked against the exchange before being
+# mirrored: by the time a delayed event is processed the master's order may already
+# have filled or been cancelled, and mirroring a resting order for one that is no
+# longer resting duplicates the leg. Deliberately above normal processing latency
+# (sub-second, p95 ~8s) so the hot path never pays the extra call.
+STALE_EVENT_RECHECK_SEC = float(os.getenv("STALE_EVENT_RECHECK_SEC", "10"))
+
 
 def _size_deadband(target: float) -> float:
     """Minimum |held - target| worth acting on: at least 1 lot, and at least
@@ -1664,6 +1671,7 @@ class CopyEngine:
         if ts:
             logger.info(f"[LATENCY] {symbol} order-mirror: {(time.time() - ts):.2f}s from master order detection to mirror start")
 
+
         # Active followers (scoped to the master's owner)
         try:
             fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
@@ -1689,6 +1697,24 @@ class CopyEngine:
                 master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
         except Exception:
             pass
+
+        # A STALE event describes a world that may no longer exist. It was valid when
+        # detected (only open/pending orders are pushed), but if it sat in the queue
+        # the master's order may since have filled or been cancelled — and mirroring
+        # a RESTING order for an order that is no longer resting is never right.
+        # A 14s-stale event re-mirrored master order 1451124876 after both it and the
+        # follower's mirror had filled, double-exiting the leg (2026-08-04,
+        # P-BTC-63200-040826). Only pay the extra REST call when the event is
+        # genuinely old, so the normal sub-second path is untouched.
+        if ts and (time.time() - float(ts)) > STALE_EVENT_RECHECK_SEC and master_row:
+            mo = await self._safe_get_order(self._get_master_client(master_row), master_order_id)
+            if mo and self._order_done(mo):
+                logger.info(
+                    f"Skipping stale mirror of {master_order_id} on {symbol}: master's "
+                    f"order is no longer resting (event was "
+                    f"{time.time() - float(ts):.1f}s old)"
+                )
+                return
 
         is_bracket = bool(event.get("is_bracket"))
         is_update = bool(event.get("is_update"))
@@ -1768,7 +1794,23 @@ class CopyEngine:
                 if mapped:
                     if await self._order_is_live(client, mapped, follower["id"]):
                         continue
-                    # stale mapping — mirrored order is gone; clear and re-place
+                    # Not resting any more — but WHY matters. A mirror that FILLED
+                    # has done its job and must never be re-placed; only one that was
+                    # cancelled without filling leaves work outstanding.
+                    #
+                    # Treating both the same double-exited a leg: a 14s-stale event
+                    # for master order 1451124876 was processed after the mirror had
+                    # already filled, the liveness check reported "gone", and a second
+                    # 1-lot sell went out (2026-08-04, P-BTC-63200-040826 — the master
+                    # exited once, the follower twice, booking the same P&L twice).
+                    prev = await self._safe_get_order(client, mapped)
+                    if self._filled_size(prev) > 0 or self._order_done(prev):
+                        logger.info(
+                            f"Skipping re-mirror of {master_order_id} to {follower['name']}: "
+                            f"mirror {mapped} already filled — nothing outstanding"
+                        )
+                        continue
+                    # cancelled without filling — clear and re-place
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
 
             # Bracket SL/TP attached to a position -> use the bracket endpoint.

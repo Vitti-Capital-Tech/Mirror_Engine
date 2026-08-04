@@ -821,6 +821,40 @@ async def main():
                 len(client.placed) == 1 and client.placed[0]["size"] == 2,
                 f"placed={client.placed}")
 
+    # ---- 12o. A FILLED mirror must never be re-placed. Live 2026-08-04 on
+    #           P-BTC-63200-040826 the master exited ONCE but the follower exited
+    #           TWICE (booking the same 0.04 P&L twice): a 14s-stale event re-ran
+    #           the mirror after the follower's copy had already filled, and the
+    #           "is it still resting?" check reported "gone" and re-placed it.
+    dup_event = {
+        "action": "place", "master_order_id": "1451124876", "symbol": SYM,
+        "product_id": 42, "side": "sell", "size": 100, "order_type": "limit_order",
+        "limit_price": 110.0, "reduce_only": False, "is_bracket": False,
+        "is_update": False, "owner_id": "u1",
+    }
+
+    eng, client, _ = build(1, 100)
+    await eng.redis.hset("ordermap:1451124876", "f1", "FILLEDMIRROR")
+    eng._safe_get_order = _order_lookup({
+        # already filled: state closed, nothing unfilled
+        "FILLEDMIRROR": {"id": "FILLEDMIRROR", "size": 1, "state": "closed",
+                         "unfilled_size": 0},
+    })
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("filled mirror is NOT re-placed (no double exit)",
+                client.placed == [], f"placed={client.placed}")
+
+    # A mirror cancelled WITHOUT filling still leaves work outstanding -> re-place.
+    eng, client, _ = build(1, 100)
+    await eng.redis.hset("ordermap:1451124876", "f1", "DEADMIRROR")
+    eng._safe_get_order = _order_lookup({
+        "DEADMIRROR": {"id": "DEADMIRROR", "size": 1, "state": "cancelled",
+                       "unfilled_size": 1},
+    })
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("mirror cancelled unfilled IS re-placed", len(client.placed) == 1,
+                f"placed={client.placed}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
