@@ -961,6 +961,17 @@ class CopyEngine:
             master_row = m.data[0] if m.data else None
         except Exception:
             pass
+        # The follower rows below are read FRESH from the DB, so they carry no
+        # master_balance — and auto_ratio divides by it. Without this the ratio was
+        # unreadable in the escalation path, _follower_close_qty returned None, and
+        # the size cap silently vanished (2026-08-04, P-BTC-63000-040826: marketed
+        # 7 then 9 lots against a target of 2, flattening the follower).
+        master_balance = 0.0
+        if master_row:
+            master_balance = float(
+                master_row.get("allocated_balance") or master_row.get("balance")
+                or master_row.get("available_margin") or 0.0
+            )
 
         for follower_id, follower_order_id in mapping.items():
             try:
@@ -968,6 +979,7 @@ class CopyEngine:
                 if not acc.data:
                     continue
                 follower = acc.data[0]
+                follower["master_balance"] = master_balance
                 client = await self._get_follower_client(follower)
                 if not client:
                     continue
@@ -2095,7 +2107,16 @@ class CopyEngine:
                 # Only force-close if the follower is STILL over its rebalance
                 # target (guards against the master cancelling/re-quoting the close).
                 cq, cur = await self._follower_close_qty(client, follower, symbol, master_row)
-                if cq is not None and cq < 1:
+                if cq is None:
+                    # Sizing unavailable (ratio unreadable). Leave the limit resting
+                    # rather than marketing an amount we cannot justify — see the
+                    # cap below for what happened when this fell through.
+                    logger.warning(
+                        f"Escalation: close sizing unavailable for {follower['name']} "
+                        f"{symbol} — leaving the limit resting, not forcing anything"
+                    )
+                    return
+                if cq < 1:
                     logger.info(f"Escalation: no close needed for {follower['name']} {symbol}; cancelling stale limit.")
                     await self._safe_cancel(client, order_id, product_id)
                     return
@@ -2119,8 +2140,19 @@ class CopyEngine:
             market_qty = int(qty) - self._filled_size(od)
             if reduce_only:
                 cq, _cur = await self._follower_close_qty(client, follower, symbol, master_row)
-                if cq is not None:
-                    market_qty = min(market_qty, cq)
+                # `cq is None` means the ratio could not be computed. Treating that
+                # as "no cap" markets the follower's ENTIRE order: on 2026-08-04
+                # P-BTC-63000-040826 this sold 7 then 9 lots when the target was 2,
+                # flattening the follower — which the reconciler then bought back,
+                # leaving the position briefly unprotected too. Refuse instead; the
+                # reconciler squares the position up once the ratio reads again.
+                if cq is None:
+                    logger.warning(
+                        f"Escalation: close sizing unavailable for {follower['name']} "
+                        f"{symbol} — refusing to market {market_qty} on an unknown ratio"
+                    )
+                    return
+                market_qty = min(market_qty, cq)
             if market_qty < 1:
                 return
             # The GTC limit didn't fill at the master's price within the window —
@@ -2358,10 +2390,22 @@ class CopyEngine:
             except Exception:
                 targets = {}
 
+        # auto_ratio divides by the master's balance, and these follower rows come
+        # straight from the DB without it — so the settle below saw an unreadable
+        # ratio every time and silently refused to act. Same omission as
+        # _escalate_after_master_fill.
+        cancel_master_balance = 0.0
+        if master_row:
+            cancel_master_balance = float(
+                master_row.get("allocated_balance") or master_row.get("balance")
+                or master_row.get("available_margin") or 0.0
+            )
+
         for follower_id, follower_order_id in targets.items():
             acc_res = self.db.table("accounts").select("*").eq("id", follower_id).execute()
             if not acc_res.data:
                 continue
+            acc_res.data[0]["master_balance"] = cancel_master_balance
             client = await self._get_follower_client(acc_res.data[0])
             if not client:
                 continue

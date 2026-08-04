@@ -788,6 +788,39 @@ async def main():
     ok &= check("peak survives a restart -> still no top-up mid-unwind",
                 client5.placed == [], f"placed={client5.placed}")
 
+    # ---- 12n. Escalation must NEVER market on an unknown ratio. `cq is None` from
+    #           _follower_close_qty means "sizing unavailable"; treating it as "no
+    #           cap" markets the follower's ENTIRE order. Live 2026-08-04 on
+    #           P-BTC-63000-040826 that sold 7 then 9 lots against a target of 2,
+    #           flattening the follower, which the reconciler then bought back and
+    #           which left the leg briefly unprotected.
+    eng, client, _ = build(-9, -173)
+    eng._safe_get_order = _order_lookup({
+        "F9": {"id": "F9", "size": 9, "state": "open", "unfilled_size": 9},
+    })
+    async def _no_size(_c, _f, _s, _m, ref_price=0.0):
+        return None, 9          # sizing unavailable
+    eng._follower_close_qty = _no_size
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F9", 42, SYM, "buy", 9, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("unknown close sizing -> escalation markets NOTHING",
+                client.placed == [], f"placed={client.placed}")
+
+    # With sizing available it still caps to what the follower actually owes.
+    eng, client, _ = build(-9, -173)
+    eng._safe_get_order = _order_lookup({
+        "F9": {"id": "F9", "size": 9, "state": "open", "unfilled_size": 9},
+    })
+    async def _cap2(_c, _f, _s, _m, ref_price=0.0): return 2, 9
+    eng._follower_close_qty = _cap2
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F9", 42, SYM, "buy", 9, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("known sizing -> escalation markets only the 2 lots owed",
+                len(client.placed) == 1 and client.placed[0]["size"] == 2,
+                f"placed={client.placed}")
+
     # ---- 13. The ledger itself.
     r = FakeRedis()
     await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
