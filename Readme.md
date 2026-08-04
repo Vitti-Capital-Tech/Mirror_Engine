@@ -31,6 +31,11 @@ Each user may have **one master** at a time; any follower can be promoted to mas
 | **Edits an order or SL/TP price/trigger** | Edits the follower's existing order in place |
 | **Cancels an order** | Cancels the follower's mirrored order (with self-heal lookup if the id map is stale) |
 
+**Duplicate protection.** The master re-sends the same resting order on every WS update and every reconcile pass, so the engine is idempotent per (master order, follower). Two distinctions matter, and getting either wrong duplicates a trade:
+
+* A mirror that **filled** has done its job and is never re-placed. Only one **cancelled without filling** leaves work outstanding. Treating "filled" as "gone" made the follower exit twice for one master exit, booking the same P&L twice.
+* An event older than `STALE_EVENT_RECHECK_SEC` (10s) is re-checked against the exchange before mirroring. A delayed event describes a world that may have moved on — mirroring a *resting* order for one that has since filled is never right.
+
 **SL/TP jitter:** each follower's stop/target trigger price is offset by **±(0–20)**, computed **deterministically** from the follower + price — so two legs of a pair that share the same master SL/TP price land on the *same* follower price, while different followers still get different offsets (they don't all trigger at once).
 
 **Unfilled-limit escalation — the 5s clock starts at the *master's* fill.** The master trades with limit orders, so a mirrored follower limit that never fills would leave the follower behind. The rule is: mirror the master's limit at the same price and **let it rest for as long as the master's rests**; the moment the **master's own order fills**, give the follower's mirror `ESCALATE_WAIT_SEC` (5s) to fill, then force the remainder to market.
@@ -69,6 +74,16 @@ Every corrective action is guarded so noise can't trigger a trade:
 * **Settle window** (`TRIM_SETTLE_SEC`, 45s) — never resize while the master is still actively trading that symbol.
 * **One definition of "target"** — the live close, mirrored close, escalation, trim, top-up and post-cancel settle all compute `ceil(master_size × ratio)`. Mixing `ceil` and `floor` between paths makes two of them each close a lot off the same 1-lot difference.
 
+### Two states the reconciler must respect
+
+Position sizes alone don't carry enough information to decide what to do. Two situations look identical to a size comparison but demand opposite actions, so each is **recorded when the evidence appears** rather than re-inferred every pass:
+
+**Hands-off — the master's SL/TP triggered.** The master goes flat while the follower still holds, which by position alone is indistinguishable from an orphan to close. Closing it is wrong: the follower has its own *jittered* stop a few points away, and that is what should close the leg. The mark is raised only on **positive proof the stop fired** (`reason=stop_trigger`, or a stop fill) — an unknown reason must not raise it, because the mark suspends reconciliation on that leg and would block the follower being closed when the master exits gradually instead. Released when the follower goes flat or the master re-enters. Kept in Redis so a reload can't lose it.
+
+**Below peak — the master is unwinding.** While the master holds less than the largest size it has held on a symbol, it is net-reduced there and the follower is **never topped up** into it. This replaced a 15-minute "recently reduced" timer that was both unsafe (it expired 45s before a top-up bought back into an unwind still in progress) and over-eager (it blocked legitimate top-ups for 15 minutes after any wobble, even with the master back at full size). A high-water mark has no clock to run out and no false positive at full size. Also in Redis — held in memory, a deploy made a master mid-unwind look like a fresh position at its peak.
+
+Note the asymmetry throughout: **reducing** the follower on stale information is self-correcting, **adding** to it is not. Trims are allowed while the master unwinds; top-ups are not.
+
 **Price guard on recovery** (`SYNC_PRICE_TOLERANCE_PCT`, default 15%) — a leg the master entered long ago is only recovered if the current mark is still within this much of the master's entry; otherwise it alerts instead of silently doing nothing. Judging on *age* alone means a missed entry is never recovered and the follower diverges permanently.
 
 > **Caveat for options:** entry-vs-mark drift measures the master's *P&L*, not whether copying still makes sense. Near expiry, premium decay pushes drift above 90% regardless, so the guard blocks nearly every recovery. Raise `SYNC_PRICE_TOLERANCE_PCT` (or set it very high) if matching the master's positions matters more than matching its entry prices.
@@ -96,6 +111,21 @@ Both are read-only and owner-scoped. A "skipped" leg is an accounted-for decisio
 Set per follower (editable any time via the ✏️ edit action):
 
 * **Auto Balance Ratio** *(recommended)* — follower size = master size × (follower balance ÷ master balance), **ceiled**, so a small master trade whose share is a fraction still copies as ≥1 lot. The same `ceil` defines the follower's target size on *every* path (open, close, escalation, reconcile), so no two paths can disagree about what "in sync" means. `reduce_only` caps closes so they can never over-close.
+
+  **The ratio is built on equity (total balance), never free margin.** Available margin shrinks as positions lock margin up and grows as they close, so a ratio built on it moves with the book rather than with account size — the same unchanged positions read as "expected 22" one moment and "expected 30" half an hour later, firing false mismatch alerts and giving the reconciler a moving target. Equity only changes on a real deposit or withdrawal.
+
+### Sizing is fail-closed
+
+If the follower's size cannot be computed, sizing returns **0 and every caller skips** — it never falls back to a guess. This matters more than it sounds: the natural "sensible default" here is to copy the master lot-for-lot, and on a follower far smaller than the master that is the single most dangerous number the system can produce (a 610-lot target on a 70 USD account was computed live before this was closed). Every route to it is shut:
+
+| Condition | Result |
+|---|---|
+| Master or follower balance unreadable | refuse |
+| `allocation_mode` not set | refuse |
+| `allocation_value` not set | refuse |
+| Unrecognised `allocation_mode` | refuse |
+
+A missed copy is recoverable — the reconciler retries once the inputs read again. A 100× oversized order is not. The same principle applies to *closes*: a target of 0 while the master still holds means "sizing unavailable", **not** "the follower should be flat", so nothing is closed on an unreadable ratio.
 * **Multiplier** — follower copies a fixed scale of the master size (e.g. 2×).
 
 ### Allocated Balance (testing aid)
@@ -251,6 +281,7 @@ SYNC_PRICE_TOLERANCE_PCT=15     # recover a stale leg only if price is within th
 RECON_SIZE_TOLERANCE_PCT=5      # deadband before resizing (below this, ratio noise)
 TRIM_SETTLE_SEC=45              # don't resize within this long of the master's last fill
 STALE_ORPHAN_SEC=360            # a follower leg behind a stop, with the master long gone, is an orphan
+STALE_EVENT_RECHECK_SEC=10      # re-verify a delayed order event against the exchange before mirroring
 ```
 > On **options**, `SYNC_PRICE_TOLERANCE_PCT=15` blocks nearly every recovery — premium decay pushes drift past 90% near expiry. Raise it if matching positions matters more than matching entry prices.
 
