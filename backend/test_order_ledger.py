@@ -844,6 +844,15 @@ async def main():
     ok &= check("filled mirror is NOT re-placed (no double exit)",
                 client.placed == [], f"placed={client.placed}")
 
+    # ...and the verdict is remembered, so repeated events don't re-ask the
+    # exchange. Same-symbol events are serialised, so an extra REST call per event
+    # lengthens the queue behind it (a 20s tail spike on a busy leg came from that).
+    reads_before = client.order_reads
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("repeat event costs no exchange call (cached verdict)",
+                client.placed == [] and client.order_reads == reads_before,
+                f"placed={client.placed} reads={client.order_reads} was={reads_before}")
+
     # A mirror cancelled WITHOUT filling still leaves work outstanding -> re-place.
     eng, client, _ = build(1, 100)
     await eng.redis.hset("ordermap:1451124876", "f1", "DEADMIRROR")

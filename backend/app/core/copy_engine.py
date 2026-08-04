@@ -1792,6 +1792,15 @@ class CopyEngine:
             if not is_update:
                 mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
                 if mapped:
+                    # Cheapest check first: if we already concluded this mirror is
+                    # done, skip without touching the exchange at all. The master
+                    # re-sends the same order on every WS update and reconcile pass,
+                    # and same-symbol events are serialised — so a REST call here
+                    # lengthens the queue for every event behind it (a 20s tail spike
+                    # on P-BTC-62800-040826, 2026-08-04, came from exactly that).
+                    done_key = f"mirrordone:{master_order_id}:{follower['id']}"
+                    if await self.redis.get(done_key):
+                        continue
                     if await self._order_is_live(client, mapped, follower["id"]):
                         continue
                     # Not resting any more — but WHY matters. A mirror that FILLED
@@ -1809,6 +1818,7 @@ class CopyEngine:
                             f"Skipping re-mirror of {master_order_id} to {follower['name']}: "
                             f"mirror {mapped} already filled — nothing outstanding"
                         )
+                        await self.redis.set(done_key, "1", ex=7 * 24 * 3600)
                         continue
                     # cancelled without filling — clear and re-place
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
