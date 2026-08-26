@@ -2098,7 +2098,23 @@ class CopyEngine:
                 # it by largest remainder — the parts then sum to exactly the cover,
                 # which no amount of per-rung rounding can guarantee.
                 follower_held = int(abs(signed))
-                master_now = await self._master_position_size(master_row, symbol, fresh=True) or 0.0
+                master_now = await self._master_position_size(master_row, symbol, fresh=True)
+                if master_now is None:
+                    # `or 0.0` here would be silently destructive: coverage_target
+                    # reads a 0 master position as "no basis to proportion" and
+                    # returns 0, so EVERY rung of the ladder would be skipped and the
+                    # follower left with no exit cover at all — the exact outcome this
+                    # branch exists to prevent. Leave it to the reconciler, matching
+                    # what _escalate_unfilled_limit does with the same unknown.
+                    logger.warning(
+                        f"Reduce-only close for {follower['name']} on {symbol}: master position "
+                        f"unreadable — deferring to the reconciler rather than sizing on a guess"
+                    )
+                    await ledger.record_follower_leg(
+                        self.redis, master_order_id, follower["id"], status="failed",
+                        reason="master position unreadable — deferred to reconciler",
+                    )
+                    continue
                 rungs = await self._master_resting_exits(master_row, symbol)
                 if rungs is None:
                     # Order book unreadable. Fall back to the old per-order rebalance
