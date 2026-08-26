@@ -12,6 +12,7 @@ from app.core.trade_listener import listener_manager
 from app.core.copy_engine import CopyEngine
 from app.core.position_monitor import position_monitor
 from app.core.connection_manager import connection_manager
+from app.core import order_history as oh
 from app.api import accounts, trades, positions, alerts, dashboard, auth, admin
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -61,7 +62,13 @@ async def lifespan(app: FastAPI):
             try:
                 await connection_manager.connect_account(
                     follower,
-                    on_position=position_monitor.make_position_callback(follower["id"], follower["name"])
+                    on_position=position_monitor.make_position_callback(follower["id"], follower["name"]),
+                    # Followers used to connect with on_position ONLY, so a mirrored
+                    # resting order that filled was never observed — its leg read
+                    # 'placed' forever and the fill history had no entry for it.
+                    # Recording only; a follower fill must not feed back into the
+                    # mirror loop.
+                    on_fill=oh.make_follower_fill_recorder(db, follower),
                 )
                 logger.info(f"Connected WebSocket for follower: {follower['name']}")
             except Exception as e:

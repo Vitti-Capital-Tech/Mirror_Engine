@@ -11,6 +11,8 @@ import asyncio
 import logging
 from typing import Callable, Awaitable, Dict, Optional
 
+from app.database import db
+from app.core import order_history as oh
 from app.services.delta_client import DeltaClient
 
 logger = logging.getLogger(__name__)
@@ -41,8 +43,19 @@ class ConnectionManager:
 
         *account* is a raw dict from Supabase with keys:
             id, api_key, api_secret, environment, name, ...
+
+        A FOLLOWER with no on_fill of its own gets the history recorder by
+        default. Defaulting it here rather than at each call site is deliberate:
+        connect_account is called from four places (startup, the accounts API and
+        twice from the copy engine) and three of them passed no on_fill at all, so
+        whichever ran first decided whether that follower's fills were ever
+        observed. A follower activated through the API, or first connected by the
+        engine's REST path, silently had no fill stream — and its mirrored orders
+        then filled with nothing recording it.
         """
         account_id: str = account["id"]
+        if on_fill is None and not account.get("is_master"):
+            on_fill = oh.make_follower_fill_recorder(db, account)
         async with self._lock:
             if account_id in self._clients:
                 logger.info(

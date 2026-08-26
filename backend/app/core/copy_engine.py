@@ -11,6 +11,7 @@ from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
 from app.core import order_ledger as ledger
 from app.core import ladder
+from app.core import order_history as oh
 from app.services.delta_client import DeltaClient
 from app.services import telegram_client as tg
 
@@ -146,6 +147,11 @@ class CopyEngine:
         # mid-ladder and the allocation disagree with itself. See _master_resting_exits.
         self._master_exits_cache: dict = {}
         self._MASTER_EXITS_TTL = 3.0  # seconds
+        # {(account_id, symbol): (size, ts)} — the follower's own held size. Entry
+        # ladder sizing needs it per rung, and get_positions is a REST round-trip:
+        # uncached, a 3-rung burst paid three of them on the hot path.
+        self._follower_pos_cache: dict = {}
+        self._FOLLOWER_POS_TTL = 3.0  # seconds
         # Protective orders seen as "orphan" (master no longer has them) in the
         # PREVIOUS sync sweep. We only cancel a follower's SL/TP after it's been an
         # orphan for two consecutive sweeps, so a master bracket edit
@@ -890,10 +896,31 @@ class CopyEngine:
             logger.error(f"Master position size fetch failed for {symbol}: {e}")
             return None
 
+    async def _follower_held(self, client, account_id, symbol: str) -> int:
+        """The follower's absolute held size, cached ~3s across a ladder burst."""
+        key = (account_id, symbol)
+        hit = self._follower_pos_cache.get(key)
+        if hit and (time.time() - hit[1]) < self._FOLLOWER_POS_TTL:
+            return hit[0]
+        try:
+            held = int(abs(float(await self._position_size(client, symbol))))
+        except Exception:
+            return 0
+        self._follower_pos_cache[key] = (held, time.time())
+        return held
+
     async def _master_resting_exits(self, master_row: dict, symbol: str):
-        """The master's resting plain reduce-only limits on `symbol`, as
-        [(order_id, size)]. Cached ~3s so a laddered exit placed as a burst is
-        allocated off one consistent snapshot.
+        """The master's resting plain reduce-only limits (its EXIT ladder)."""
+        return await self._master_resting_orders(master_row, symbol, reduce_only=True)
+
+    async def _master_resting_entries(self, master_row: dict, symbol: str):
+        """The master's resting plain non-reduce-only limits (its ENTRY ladder)."""
+        return await self._master_resting_orders(master_row, symbol, reduce_only=False)
+
+    async def _master_resting_orders(self, master_row: dict, symbol: str, reduce_only: bool):
+        """The master's resting plain limits on `symbol`, as [(order_id, size)],
+        filtered to reduce-only (exits) or not (entries). Cached ~3s so a ladder
+        placed as a burst is allocated off one consistent snapshot.
 
         Returns None if the order book could NOT be read. That distinction is the
         safety property of this whole path: None means "don't know", and a caller
@@ -909,7 +936,8 @@ class CopyEngine:
         """
         if not master_row or not symbol:
             return None
-        cached = self._master_exits_cache.get(symbol)
+        ck = (symbol, bool(reduce_only))
+        cached = self._master_exits_cache.get(ck)
         if cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
             return cached[0]
         client = self._get_master_client(master_row)
@@ -927,7 +955,7 @@ class CopyEngine:
             for o in orders:
                 if (o.get("product_symbol") or o.get("symbol")) != symbol:
                     continue
-                if not o.get("reduce_only"):
+                if bool(o.get("reduce_only")) != bool(reduce_only):
                     continue
                 if o.get("stop_order_type") or o.get("stop_price") or o.get("bracket_order"):
                     continue
@@ -947,7 +975,7 @@ class CopyEngine:
             if oid not in seen:
                 seen.add(oid)
                 deduped.append((oid, size))
-        self._master_exits_cache[symbol] = (deduped, time.time())
+        self._master_exits_cache[ck] = (deduped, time.time())
         return deduped
 
     async def _master_position_signed(self, master_row: dict, symbol: str, fresh: bool = False):
@@ -1873,6 +1901,31 @@ class CopyEngine:
             ts=event.get("ts"),
         )
 
+        # Record the master's resting order in the HISTORY tables too, not just the
+        # Redis ledger. This path wrote no trades/trade_copies rows at all, which is
+        # why the Trades page showed exits and almost no entries (30 of the first 53
+        # trades had no follower leg on record) — the ledger knew, the history did
+        # not, and the history is what anyone actually looks at.
+        #
+        # Fired as a task and never awaited on the hot path: the ORDER has to reach
+        # the exchange fast, the row can land a moment later. Every write inside
+        # goes through asyncio.to_thread because the Supabase client is synchronous
+        # and would otherwise block the loop behind the per-symbol lock.
+        _hist_trade = asyncio.create_task(oh.record_order_stage(
+            self.db, master_order_id, symbol=symbol, side=side, size=master_qty,
+            price=ref_price or limit_price or stop_price or 0, kind=_kind,
+            owner_id=owner_id,
+        ))
+
+        def _hist_leg(fol: dict, **kw):
+            """Record one follower's leg of this order, off the hot path."""
+            async def _go():
+                try:
+                    await oh.record_leg(self.db, await _hist_trade, master_order_id, fol, **kw)
+                except Exception as e:
+                    logger.debug(f"history: leg not recorded for {fol.get('name')}: {e}")
+            asyncio.create_task(_go())
+
         # Is this the master's PROTECTION (SL/TP) rather than a directional order?
         # Decided once: it changes how the mirror is sized (cover the position, not
         # "close the difference") — see the branch in the follower loop below.
@@ -1883,6 +1936,53 @@ class CopyEngine:
             # Floor so the mirrored order quantity matches the follower's position
             # (which was also floored on open). reduce_only caps it anyway.
             qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
+            # An ENTRY ladder has the mirror image of the exit-ladder bug: ceiling
+            # each rung on its own OVER-buys. 30 rungs of 100 lots is 30 x ceil(1.14)
+            # = 60 follower lots against a proportional target of 34 — 76% over. It
+            # has been invisible because the position reconciler trims it back
+            # afterwards, so the cost shows up as round-trip fees and slippage
+            # rather than as lasting exposure.
+            #
+            # Size it as one ladder: where the master will BE if every resting entry
+            # fills (position + all resting entries), scaled to the follower, minus
+            # what the follower already holds — then split across the rungs.
+            if (not reduce_only) and (not is_protective_order) and (not is_update) and master_row:
+                entry_rungs = await self._master_resting_entries(master_row, symbol)
+                m_pos = await self._master_position_size(master_row, symbol)
+                if entry_rungs is not None and m_pos is not None:
+                    if not any(rid == str(master_order_id) for rid, _ in entry_rungs):
+                        entry_rungs = list(entry_rungs) + [(str(master_order_id), float(master_qty))]
+                    would_hold = float(m_pos) + sum(sz for _, sz in entry_rungs)
+                    target_total = self.risk_engine.calculate_follower_quantity(
+                        would_hold, ref_price, follower, round_up=True, min_one=False
+                    )
+                    held_now = await self._follower_held(
+                        await self._get_follower_client(follower), follower["id"], symbol)
+                    to_open = max(0, int(target_total) - held_now)
+                    alloc = ladder.allocate(entry_rungs, to_open)
+                    laddered = int(alloc.get(str(master_order_id), 0))
+                    logger.info(
+                        f"Ladder open for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
+                        f"{sum(sz for _, sz in entry_rungs):.0f} resting (master holds {m_pos:.0f}), "
+                        f"follower holds {held_now} -> target {int(target_total)}, to open {to_open}, "
+                        f"this rung {laddered} (per-rung ceil would have been {qty})"
+                    )
+                    qty = laddered
+                    if laddered < 1:
+                        # A legitimate zero — the follower is already where the
+                        # master's book would put it. Distinguish it from the
+                        # "sizing unavailable" zero below, which is a failure.
+                        logger.info(
+                            f"No open needed for {follower['name']} on {symbol}: holds "
+                            f"{held_now} of target {int(target_total)}"
+                        )
+                        await ledger.record_follower_leg(
+                            self.redis, master_order_id, follower["id"], status="skipped",
+                            reason=f"already at target {int(target_total)} (holds {held_now})",
+                        )
+                        _hist_leg(follower, status="skipped", requested=0,
+                                  reason=f"already at target {int(target_total)} (holds {held_now})")
+                        continue
             if qty < 1:
                 # Sizing unavailable (e.g. the master's balance read as 0, so the
                 # ratio can't be computed). Skip rather than guess — the reconciler
@@ -1895,6 +1995,8 @@ class CopyEngine:
                     self.redis, master_order_id, follower["id"], status="skipped",
                     reason="sizing unavailable (balance ratio could not be computed)",
                 )
+                _hist_leg(follower, status="skipped",
+                          reason="sizing unavailable (balance ratio could not be computed)")
                 continue
             place_stop_price = stop_price  # per-follower (jittered for protection)
             client = await self._get_follower_client(follower)
@@ -2048,6 +2150,8 @@ class CopyEngine:
                         self.redis, master_order_id, follower["id"], status="skipped",
                         reason="no position to protect",
                     )
+                    _hist_leg(follower, status="skipped", requested=qty,
+                              reason="no position to protect")
                     continue
                 qty = min(int(qty), held)
                 # Jitter like the bracket path, so followers don't all trigger at the
@@ -2076,6 +2180,8 @@ class CopyEngine:
                         self.redis, master_order_id, follower["id"], status="skipped",
                         reason=f"holds {signed:+.0f}, not reducible by {side}",
                     )
+                    _hist_leg(follower, status="skipped",
+                              reason=f"holds {signed:+.0f}, not reducible by {side}")
                     continue
                 # Size this rung as part of the master's WHOLE resting ladder, not
                 # on its own.
@@ -2114,6 +2220,8 @@ class CopyEngine:
                         self.redis, master_order_id, follower["id"], status="failed",
                         reason="master position unreadable — deferred to reconciler",
                     )
+                    _hist_leg(follower, status="failed",
+                              reason="master position unreadable — deferred to reconciler")
                     continue
                 rungs = await self._master_resting_exits(master_row, symbol)
                 if rungs is None:
@@ -2158,6 +2266,8 @@ class CopyEngine:
                         self.redis, master_order_id, follower["id"], status="skipped",
                         reason=f"no lots allocated to this rung (holds {follower_held})",
                     )
+                    _hist_leg(follower, status="skipped",
+                              reason=f"no lots allocated to this rung (holds {follower_held})")
                     continue
 
             # Plain limit order: if the master EDITED it, edit the follower's
@@ -2203,6 +2313,10 @@ class CopyEngine:
                         self.redis, master_order_id, follower["id"], status="placed",
                         follower_order_id=follower_order_id, qty=qty,
                     )
+                    # 'pending' until the follower's own fill stream confirms it —
+                    # see record_follower_fill. A resting order is placed, not done.
+                    _hist_leg(follower, status="pending", requested=qty,
+                              follower_order_id=follower_order_id)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
 
                     # Plain LIMIT order (not a stop/bracket): if it hasn't filled
@@ -2241,6 +2355,8 @@ class CopyEngine:
                     self.redis, master_order_id, follower["id"], status="failed",
                     qty=qty, reason=_short_reason(e, body),
                 )
+                _hist_leg(follower, status="failed", requested=qty,
+                          reason=_short_reason(e, body))
                 key = f"fail:{follower['id']}:{symbol}:{side}:place"
                 asyncio.create_task(tg.notify_fail(
                     follower.get("name"), symbol, side, int(qty), _short_reason(e, body), key=key,

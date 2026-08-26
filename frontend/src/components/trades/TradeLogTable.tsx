@@ -55,6 +55,9 @@ export function TradeLogTable({
     const base = 'inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold';
     if (s === 'filled') return <span className={`${base} bg-emerald-500/10 text-emerald-400`}>FILLED</span>;
     if (s === 'partial') return <span className={`${base} bg-amber-500/10 text-amber-400`}>PARTIAL</span>;
+    // A mirrored RESTING order: placed on the exchange, not filled yet. Without
+    // this it fell through to the red FAILED default.
+    if (s === 'pending') return <span className={`${base} bg-sky-500/10 text-sky-400`}>RESTING</span>;
     if (s === 'skipped') return <span className={`${base} bg-slate-500/10 text-slate-300`}>SKIPPED</span>;
     if (s === 'retrying') return <span className={`${base} bg-blue-500/10 text-blue-400`}>RETRYING</span>;
     return <span className={`${base} bg-red-500/10 text-red-400`}>FAILED</span>;
@@ -114,6 +117,7 @@ export function TradeLogTable({
                   // A partial executed but is out of proportion with the master, so it
                   // counts as neither filled nor failed — it gets its own amber state.
                   const partialCopiesCount = copies.filter((c: any) => c.status === 'partial').length;
+                  const restingCopiesCount = copies.filter((c: any) => c.status === 'pending').length;
 
                   return (
                     <React.Fragment key={trade.id}>
@@ -125,7 +129,26 @@ export function TradeLogTable({
                           {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                         </td>
                         <td className="py-3.5 text-text-secondary">{dateStr}</td>
-                        <td className="font-bold text-text-primary">{trade.symbol}</td>
+                        <td className="font-bold text-text-primary">
+                          <span className="inline-flex items-center gap-1.5">
+                            {trade.symbol}
+                            {String(trade.master_trade_id || '').startsWith('ord:') ? (
+                              <span
+                                title="Master rested this order — the fill is recorded separately"
+                                className="text-[9px] font-bold px-1 py-0.5 rounded bg-sky-500/10 text-sky-400"
+                              >
+                                ORDER
+                              </span>
+                            ) : (
+                              <span
+                                title="Master order filled"
+                                className="text-[9px] font-bold px-1 py-0.5 rounded bg-bg-secondary text-text-muted"
+                              >
+                                FILL
+                              </span>
+                            )}
+                          </span>
+                        </td>
                         <td>
                           <span className={`inline-flex items-center gap-0.5 ${isBuy ? 'text-emerald-400' : 'text-red-400'}`}>
                             {isBuy ? <ArrowUpRight className="w-3.5 h-3.5" /> : <ArrowDownRight className="w-3.5 h-3.5" />}
@@ -143,7 +166,7 @@ export function TradeLogTable({
                                 ? 'bg-bg-secondary text-text-muted'
                                 : filledCopiesCount === copies.length
                                   ? 'bg-emerald-500/10 text-emerald-400'
-                                  : filledCopiesCount === 0 && partialCopiesCount === 0
+                                  : filledCopiesCount === 0 && partialCopiesCount === 0 && restingCopiesCount === 0
                                     ? 'bg-red-500/10 text-red-400'
                                     : 'bg-amber-500/10 text-amber-400'
                             }`}
