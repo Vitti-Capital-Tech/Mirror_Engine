@@ -10,6 +10,7 @@ from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
 from app.core import order_ledger as ledger
+from app.core import ladder
 from app.services.delta_client import DeltaClient
 from app.services import telegram_client as tg
 
@@ -138,6 +139,13 @@ class CopyEngine:
         self._master_pos_cache: dict = {}
         self._master_signed_cache: dict = {}  # {symbol: (signed_size, ts)}
         self._MASTER_POS_TTL = 3.0  # seconds
+        # {symbol: ([(order_id, size)], ts)} — the master's resting reduce-only
+        # limits per symbol. A laddered exit arrives as a burst (the three rungs on
+        # P-BTC-76800-260826 landed inside one second), so all rungs must be
+        # allocated off ONE snapshot: a per-rung refetch would let the view shift
+        # mid-ladder and the allocation disagree with itself. See _master_resting_exits.
+        self._master_exits_cache: dict = {}
+        self._MASTER_EXITS_TTL = 3.0  # seconds
         # Protective orders seen as "orphan" (master no longer has them) in the
         # PREVIOUS sync sweep. We only cancel a follower's SL/TP after it's been an
         # orphan for two consecutive sweeps, so a master bracket edit
@@ -881,6 +889,66 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Master position size fetch failed for {symbol}: {e}")
             return None
+
+    async def _master_resting_exits(self, master_row: dict, symbol: str):
+        """The master's resting plain reduce-only limits on `symbol`, as
+        [(order_id, size)]. Cached ~3s so a laddered exit placed as a burst is
+        allocated off one consistent snapshot.
+
+        Returns None if the order book could NOT be read. That distinction is the
+        safety property of this whole path: None means "don't know", and a caller
+        must never treat it as "the master has nothing resting". Reading it as
+        empty would allocate zero cover to every rung — or, in a desired-state
+        pass, cancel every exit order the follower has. A late copy is
+        recoverable; a follower stripped of its exits in a fast move is not.
+        (Same failure shape as get_positions returning [] on error.)
+
+        Stops, take-profits and brackets are excluded: they are reduce_only too,
+        but they are RESTING COVER, not a close-now ladder, and the
+        is_protective_order branch already sizes them proportionally.
+        """
+        if not master_row or not symbol:
+            return None
+        cached = self._master_exits_cache.get(symbol)
+        if cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
+            return cached[0]
+        client = self._get_master_client(master_row)
+        if client is None:
+            return None
+        rungs, ok = [], False
+        for state in ("open", "pending"):
+            try:
+                orders = await client.get_open_orders(state=state)
+            except Exception as e:
+                logger.warning(f"Could not read master resting orders ({state}) for {symbol}: {e}")
+                continue
+            # Read succeeded — an EMPTY book is a real answer, unlike a failure.
+            ok = True
+            for o in orders:
+                if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                    continue
+                if not o.get("reduce_only"):
+                    continue
+                if o.get("stop_order_type") or o.get("stop_price") or o.get("bracket_order"):
+                    continue
+                oid = o.get("id")
+                try:
+                    size = abs(float(o.get("size") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if oid is not None and size > 0:
+                    rungs.append((str(oid), size))
+        if not ok:
+            return None  # unreadable — NOT "nothing resting"
+        # An order can surface in both states across the two pages; keep one rung
+        # per id or it would be double-weighted in the allocation.
+        seen, deduped = set(), []
+        for oid, size in rungs:
+            if oid not in seen:
+                seen.add(oid)
+                deduped.append((oid, size))
+        self._master_exits_cache[symbol] = (deduped, time.time())
+        return deduped
 
     async def _master_position_signed(self, master_row: dict, symbol: str, fresh: bool = False):
         """Live SIGNED master position for a symbol (negative=short, positive=long,
@@ -2009,33 +2077,70 @@ class CopyEngine:
                         reason=f"holds {signed:+.0f}, not reducible by {side}",
                     )
                     continue
-                # Size the close by REBALANCING to the master's position AFTER this
-                # close fills — NOT by ceil(close_chunk × ratio). Ceiling each chunk
-                # over-closes a small follower on repeated trims: a 50-lot master
-                # trim is ~0.5 follower lots but ceil'd to 1 EVERY time, so the
-                # follower sheds far more than its share (600→400 master = 33%, but
-                # 6→2 follower = 67%). Instead: follower's proportional TARGET for
-                # the master's REMAINING (current − this close), and close only the
-                # difference. A tiny trim that leaves the follower already at target
-                # closes nothing (correct), never over-shoots.
+                # Size this rung as part of the master's WHOLE resting ladder, not
+                # on its own.
+                #
+                # Sizing rungs in isolation is what dropped the follower's entire
+                # exit cover on P-BTC-76800-260826 (2026-08-26). The master laddered
+                # its full 350-lot position into 150 @ 90 / 100 @ 60 / 100 @ 40, and
+                # each rung was sized by asking "if THIS order fills, how much should
+                # the follower still hold?" — each one, alone, left the master holding
+                # 200-250, whose follower share was still the 3 lots already held:
+                #     rung 150 -> remaining 200 -> target 3, holds 3 -> close 0
+                #     rung 100 -> remaining 250 -> target 3, holds 3 -> close 0
+                #     rung 100 -> remaining 250 -> target 3, holds 3 -> close 0
+                # No rung claimed anything while together they closed the master out.
+                # This is the same flaw the is_protective_order branch above was fixed
+                # for ("nothing to rest (holds 1, target 1)" x175 with no TP resting);
+                # the plain reduce-only ladder never got that fix.
+                #
+                # A ladder is ONE intent, so the follower's lots are allocated across
+                # it by largest remainder — the parts then sum to exactly the cover,
+                # which no amount of per-rung rounding can guarantee.
                 follower_held = int(abs(signed))
                 master_now = await self._master_position_size(master_row, symbol, fresh=True) or 0.0
-                intended_remaining = max(0.0, float(master_now) - float(master_qty))
-                # round_up=True (min_one=False) so every path in the engine agrees on
-                # the follower's target size — flooring here closed one lot more than
-                # the reconciler thinks correct, and the two then fought each other.
-                target = self.risk_engine.calculate_follower_quantity(
-                    intended_remaining, ref_price, follower, round_up=True, min_one=False
-                )
-                qty = min(follower_held - int(target), follower_held)
-                if qty < _size_deadband(target):
+                rungs = await self._master_resting_exits(master_row, symbol)
+                if rungs is None:
+                    # Order book unreadable. Fall back to the old per-order rebalance
+                    # rather than guessing at a ladder we cannot see — under-covering
+                    # is recoverable by the reconciler, over-resting is not.
+                    intended_remaining = max(0.0, float(master_now) - float(master_qty))
+                    target = self.risk_engine.calculate_follower_quantity(
+                        intended_remaining, ref_price, follower, round_up=True, min_one=False
+                    )
+                    qty = min(follower_held - int(target), follower_held)
+                    logger.warning(
+                        f"Reduce-only close for {follower['name']} on {symbol}: master order book "
+                        f"unreadable, falling back to per-order sizing (qty {qty})"
+                    )
+                else:
+                    # The arriving event is authoritative that this order is resting,
+                    # even when the snapshot predates it (3s cache, or the REST listing
+                    # lagging the WS event).
+                    if not any(rid == str(master_order_id) for rid, _ in rungs):
+                        rungs = list(rungs) + [(str(master_order_id), float(master_qty))]
+                    resting_total = sum(sz for _, sz in rungs)
+                    cover = ladder.coverage_target(follower_held, resting_total, master_now)
+                    alloc = ladder.allocate(rungs, cover)
+                    qty = int(alloc.get(str(master_order_id), 0))
                     logger.info(
-                        f"Reduce-only close for {follower['name']} on {symbol}: nothing to rest "
-                        f"(holds {follower_held}, target {int(target)} for master remaining {intended_remaining:.0f})"
+                        f"Ladder close for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
+                        f"{resting_total:.0f} resting (master holds {master_now:.0f}), follower holds "
+                        f"{follower_held} -> cover {cover}, this rung {qty} "
+                        f"[ladder {len(rungs)} rungs: {alloc}]"
+                    )
+                # No deadband here. A deadband is right for a position REBALANCE (don't
+                # churn over ratio noise), but on a ladder it re-creates the starvation
+                # this replaced: every rung's fair share on a small follower is ~1 lot,
+                # so a deadband would skip them all again.
+                if int(qty) < 1:
+                    logger.info(
+                        f"Reduce-only close for {follower['name']} on {symbol}: no lots allocated "
+                        f"to this rung (holds {follower_held}, master holds {master_now:.0f})"
                     )
                     await ledger.record_follower_leg(
                         self.redis, master_order_id, follower["id"], status="skipped",
-                        reason=f"already at target {int(target)} (holds {follower_held})",
+                        reason=f"no lots allocated to this rung (holds {follower_held})",
                     )
                     continue
 
