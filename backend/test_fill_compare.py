@@ -555,6 +555,57 @@ def test_ladder_that_really_is_short():
           "3-rung ladder: filled 12 of 30 lots across 3 master order(s)")
 
 
+def test_per_rung_rounding_is_not_over_filling():
+    """Regression — live run, 2026-08-26.
+
+    The sizing path CEILS every placement, so each rung of a ladder can round up
+    by just under a lot. A 9-rung exit filled 11 against a floored target of 7
+    and was flagged 'over' — by-design rounding reported as a fault.
+    """
+    print("\naccumulated per-rung rounding is not over-filling")
+    # ratio 100/4000 = 0.025. Nine rungs of 30 lots = 270 master lots.
+    f = follower("f1", "Follower A", balance=100.0)
+    m_fills, f_fills = [], []
+    for i in range(9):
+        at = T0 + timedelta(minutes=i * 20)
+        m_fills.append(fill(str(900 + i), "C-BTC-79800", "sell", 30, 5.0, at))
+        # Each rung ceils 30*0.025 = 0.75 -> 1 lot. Nine rungs -> 9 lots, where a
+        # single ceiled total would be ceil(270*0.025) = 7.
+        f_fills.append(fill(str(500 + i), "C-BTC-79800", "sell", 1, 5.0,
+                            at + timedelta(seconds=2)))
+    out = run_compare([MASTER, f], {"m1": m_fills, "f1": f_fills}, db=FakeDB())
+
+    g = out["groups"][0]
+    check("target is ceiled, matching the sizing path", g["target_lots"], 7.0)
+    check("follower total", g["filled_lots"], 9.0)
+    check("verdict is not 'over'", g["verdict"], "matched")
+    check("no error", out["summary"]["errors"], 0)
+
+    # But a real over-fill, beyond what rounding could explain, is still caught.
+    fat = [fill("777", "C-BTC-79800", "sell", 40, 5.0, T0 + timedelta(seconds=2))]
+    out2 = run_compare([MASTER, f], {"m1": m_fills, "f1": fat}, db=FakeDB())
+    g2 = out2["groups"][0]
+    check("a genuine over-fill is still flagged", g2["verdict"], "over")
+    check_true("and the allowance is stated", "per-rung rounding" in g2["note"], g2["note"])
+    check("counted as an error", out2["summary"]["errors"], 1)
+
+
+def test_shortfall_gets_no_rounding_allowance():
+    print("\nrounding up cannot cause a shortfall, so shortfalls get no allowance")
+    f = follower("f1", "Follower A", balance=100.0)
+    m_fills = [fill(str(900 + i), "C-BTC-79800", "sell", 100, 5.0,
+                    T0 + timedelta(minutes=i * 30)) for i in range(4)]
+    # 400 master lots x 0.025 = 10 expected; the follower covered 2.
+    out = run_compare([MASTER, f], {
+        "m1": m_fills,
+        "f1": [fill("555", "C-BTC-79800", "sell", 2, 5.0, T0 + timedelta(seconds=2))],
+    }, db=FakeDB())
+    g = out["groups"][0]
+    check("still short", g["verdict"], "short")
+    check("quantified", g["note"], "filled 2 of 10 lots across 4 master order(s)")
+    check("one error", out["summary"]["errors"], 1)
+
+
 def test_group_missing_when_nothing_filled():
     print("\na symbol the follower never touched is one error, not N")
     f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
@@ -684,7 +735,8 @@ def main():
         test_resting_order_is_not_missing, test_fill_path_legs_reached_via_trades,
         test_delay_stats, test_multiple_followers,
         test_paused_followers_are_not_graded, test_laddered_exit_is_one_exit,
-        test_ladder_that_really_is_short, test_group_missing_when_nothing_filled,
+        test_ladder_that_really_is_short, test_per_rung_rounding_is_not_over_filling,
+        test_shortfall_gets_no_rounding_allowance, test_group_missing_when_nothing_filled,
         test_no_master,
         test_ratio_refuses_to_guess, test_unsized_follower_filled,
         test_ist_day_bounds, test_renderers,

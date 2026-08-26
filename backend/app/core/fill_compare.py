@@ -272,7 +272,11 @@ def expected_lots(master_lots: float, follower: dict, master: dict) -> tuple[Opt
     ratio, why = follower_ratio(follower, master)
     if ratio is None:
         return None, why
-    return max(1.0, math.floor(master_lots * ratio)), why
+    # CEIL, matching the sizing path: it ceils every placement (opens, and
+    # reduce-only closes) so a follower share of 0.5 still punches a lot rather
+    # than flooring to zero and dropping the copy. Flooring here made the target
+    # systematically one lot too low and turned correct copies into "over".
+    return max(1.0, math.ceil(master_lots * ratio)), why
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +489,17 @@ def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[
             filled = sum(g["lots"] for g in st["groups"]
                          if (g.get("symbol"), g.get("side")) == key)
 
+            # Over-fill tolerance scales with the number of rungs. The sizing path
+            # CEILS every placement (opens and reduce-only closes alike), so each
+            # rung of a ladder may legitimately round up by just under a lot, and
+            # nine rungs can legitimately land eight lots above a single ceiled
+            # total. Observed 2026-08-26: a 9-rung exit filled 11 against a target
+            # of 7, flagged "over" — accumulated by-design rounding reported as a
+            # fault, which is the same false alarm as the ladder bug wearing a
+            # different hat. Shortfalls get no such allowance: rounding up cannot
+            # cause one.
+            over_allowance = SHORT_LOT_TOLERANCE + max(0, len(mgs) - 1)
+
             if st["error"]:
                 verdict, note = "unreadable", "follower fills could not be read"
             elif filled <= 0:
@@ -501,8 +516,12 @@ def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[
                 verdict, note = "unsized", "follower traded, but no proportional target could be derived"
             elif filled + SHORT_LOT_TOLERANCE < target:
                 verdict, note = "short", f"filled {filled:g} of {target:g} lots across {len(mgs)} master order(s)"
-            elif filled > target + SHORT_LOT_TOLERANCE:
-                verdict, note = "over", f"filled {filled:g} against a target of {target:g} lots"
+            elif filled > target + over_allowance:
+                verdict, note = "over", (
+                    f"filled {filled:g} against a target of {target:g} lots"
+                    + (f" (allowing {over_allowance:g} for per-rung rounding across "
+                       f"{len(mgs)} rungs)" if len(mgs) > 1 else "")
+                )
             else:
                 verdict, note = "matched", ""
 
