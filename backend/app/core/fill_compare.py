@@ -59,12 +59,16 @@ logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # How far apart a master fill and a follower fill may be and still be treated as
-# the same mirrored event when no recorded leg links them. Generous on purpose:
-# a mirrored limit rests until it fills, and the escalation path deliberately
-# lets it rest for as long as the master's own order does, so a legitimate copy
-# can land minutes after the master's. A window that is too tight manufactures
-# "missing" rows for copies that plainly happened.
-INFER_WINDOW_SEC = 180.0
+# the same mirrored event when no recorded leg links them.
+#
+# Since reconcile_groups() decides CORRECTNESS from the totals per symbol and
+# side, this window no longer determines whether a copy counts as done — its job
+# is attribution, so a late-but-real copy still yields a delay measurement
+# instead of vanishing into a group total with no timing attached. Hence
+# generous: a mirrored limit rests as long as the master's does, and mis-pairing
+# two fills on the same symbol and side costs only a slightly-off delay figure,
+# whereas too tight a window loses the measurement entirely.
+INFER_WINDOW_SEC = 900.0
 
 # Lots of slack allowed before a fill counts as short of its target. One lot,
 # because the sizing path floors opens and ceils closes — a 1-lot disagreement is
@@ -424,10 +428,146 @@ def _classify(filled: float, target: Optional[float], leg: Optional[dict], match
 
 # A row is only as good as its worst leg, so verdicts are ranked and the row
 # takes the worst one present.
-_SEVERITY = {"matched": 0, "skipped": 1, "resting": 2, "unsized": 3,
-             "over": 4, "short": 5, "missing": 6}
+_SEVERITY = {"matched": 0, "ladder": 1, "skipped": 2, "resting": 3, "unsized": 4,
+             "over": 5, "short": 6, "missing": 7}
 
 MISMATCH_VERDICTS = {"missing", "short", "over"}
+
+# Verdicts that are neither a match nor a fault — the engine made a decision, or
+# the answer lives at the group level rather than on this row.
+NEUTRAL_VERDICTS = {"ladder", "skipped", "resting", "unsized", "unreadable"}
+
+
+def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[dict]) -> list[dict]:
+    """Reconcile master vs follower at the (symbol, side) level, per follower.
+
+    Why this exists — the per-order comparison alone is wrong for how this desk
+    actually trades. The master ladders an exit across many rungs (observed
+    2026-08-26: nine sell orders on C-BTC-79800-260826 spanning 5.7 hours), and
+    the engine deliberately mirrors a ladder as ONE ladder rather than rung by
+    rung. So most individual rungs have no follower fill of their own, and
+    grading them one-to-one reported 36 "missing" copies on a day when the
+    follower was tracking the master correctly — the exact false alarm this
+    module is supposed to prevent.
+
+    For a laddered exit "do the accounts match?" is a question about the TOTAL
+    on that symbol and side, not about each rung. So the totals are the verdict,
+    and the per-order rows become supporting detail. Non-laddered trading
+    degrades to the same thing: one master order is simply a group of one.
+
+    Aggregate lots come from the follower's fills on that (symbol, side) over the
+    whole window — including fills no single row claimed, which is precisely the
+    ladder's cover order.
+    """
+    m_by_key: dict = {}
+    for g in master_groups:
+        m_by_key.setdefault((g.get("symbol"), g.get("side")), []).append(g)
+
+    out = []
+    for st in f_state:
+        acc = st["account"]
+        for key, mgs in sorted(m_by_key.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+            symbol, side = key
+            master_lots = sum(g["lots"] for g in mgs)
+            legs = [
+                l for r in rows if (r["symbol"], r["side"]) == key
+                for l in r["legs"] if l["account_id"] == acc["id"]
+            ]
+            # Target: prefer the sum of what the engine actually asked for across
+            # the group's rungs; fall back to scaling the group's master lots.
+            recorded = [l["target_lots"] for l in legs if l.get("target_basis", "").startswith("recorded")]
+            if recorded and len(recorded) == len(legs):
+                target, basis = sum(recorded), "recorded (sum of what the engine asked for)"
+            else:
+                target, basis = expected_lots(master_lots, acc, st["master"])
+                basis = f"derived — {basis}"
+
+            filled = sum(g["lots"] for g in st["groups"]
+                         if (g.get("symbol"), g.get("side")) == key)
+
+            if st["error"]:
+                verdict, note = "unreadable", "follower fills could not be read"
+            elif filled <= 0:
+                # Nothing at all on this symbol/side. Only a real miss if the
+                # engine wasn't deliberately standing down on every rung.
+                deliberate = legs and all(
+                    l["verdict"] in ("skipped", "resting") for l in legs
+                )
+                if deliberate:
+                    verdict, note = "skipped", "engine stood down on every rung of this group"
+                else:
+                    verdict, note = "missing", f"no follower fill on {symbol} {side} at all"
+            elif target is None:
+                verdict, note = "unsized", "follower traded, but no proportional target could be derived"
+            elif filled + SHORT_LOT_TOLERANCE < target:
+                verdict, note = "short", f"filled {filled:g} of {target:g} lots across {len(mgs)} master order(s)"
+            elif filled > target + SHORT_LOT_TOLERANCE:
+                verdict, note = "over", f"filled {filled:g} against a target of {target:g} lots"
+            else:
+                verdict, note = "matched", ""
+
+            out.append({
+                "account_id": acc["id"],
+                "account_name": acc.get("name"),
+                "symbol": symbol,
+                "side": side,
+                "master_orders": len(mgs),
+                "master_lots": round(master_lots, 8),
+                "target_lots": target,
+                "target_basis": basis,
+                "filled_lots": round(filled, 8),
+                "follower_orders": sum(
+                    1 for g in st["groups"] if (g.get("symbol"), g.get("side")) == key
+                ),
+                "laddered": len(mgs) > 1,
+                "verdict": verdict,
+                "note": note,
+            })
+    return out
+
+
+def _apply_group_context(rows: list[dict], groups: list[dict]) -> None:
+    """Let the group verdict override per-rung labels inside a LADDER.
+
+    Inside a laddered group, a per-rung verdict is not just noisy — it is
+    meaningless in both directions. The follower covers the whole ladder with one
+    order, so whichever rung that order happens to pair with reads `over` (it
+    carries every rung's lots) while the rest read `missing` (they have no fill of
+    their own). Both are artefacts of pairing, not findings: the same follower
+    order produced them.
+
+    So for a laddered group every leg becomes `ladder` — neutral — and carries a
+    note describing what the GROUP found. The verdict for a ladder lives in the
+    group table, counted once, rather than being duplicated across N rungs or
+    contradicting itself between them.
+
+    A group of one master order is left completely alone: there the per-order
+    verdict is exactly the group verdict, and it is the more precise place to
+    read it.
+    """
+    by_key = {(g["account_id"], g["symbol"], g["side"]): g for g in groups}
+    for r in rows:
+        for l in r["legs"]:
+            g = by_key.get((l["account_id"], r["symbol"], r["side"]))
+            if not g or not g["laddered"]:
+                continue
+            if g["verdict"] in ("matched", "over", "skipped"):
+                l["verdict"] = "ladder"
+                l["note"] = (f"part of a {g['master_orders']}-rung ladder on "
+                             f"{r['symbol']} {r['side']} — the total reconciles "
+                             f"({_fmt(g['filled_lots'])} of {_fmt(g['target_lots'])} lots)")
+            else:
+                # The ladder as a whole is wrong. Every rung says so, identically,
+                # so a reader landing on any one of them sees the real problem
+                # instead of a per-rung artefact.
+                l["verdict"] = g["verdict"]
+                l["note"] = f"{g['master_orders']}-rung ladder: {g['note']}"
+        r["status"] = max((l["verdict"] for l in r["legs"]),
+                          key=lambda v: _SEVERITY.get(v, 4), default="matched")
+
+
+def _fmt(v) -> str:
+    return "—" if v is None else f"{float(v):g}"
 
 
 async def compare(
@@ -443,16 +583,36 @@ async def compare(
     the normal shape, and reading them in series made the page feel broken.
     """
     master = next((a for a in accounts if a.get("is_master")), None)
-    followers = [a for a in accounts if not a.get("is_master")]
+
+    # ONLY active followers are graded. The copy engine mirrors to
+    # `is_master=False AND status='active'`, so a paused account is not being
+    # copied to and its fills are its own book. Grading them anyway is what
+    # produced a 0% match rate on 2026-08-26: two paused accounts — one trading
+    # ~996 lots on strikes the master never touched — generated 36 phantom
+    # "missing" legs and buried the one active follower's real 72%.
+    followers = [a for a in accounts
+                 if not a.get("is_master") and a.get("status") == "active"]
+    excluded = [a for a in accounts
+                if not a.get("is_master") and a.get("status") != "active"]
 
     window = {
         "start": _iso(start),
         "end": _iso(end),
         "timezone": "Asia/Kolkata (IST)",
     }
+    # Named, never silently dropped: "we did not check this account" and "this
+    # account is fine" must not look the same. Their fills are deliberately NOT
+    # fetched — it would spend the exchange's rate limit on accounts nobody is
+    # copying to.
+    excluded_out = [{
+        "id": a["id"], "name": a.get("name"), "status": a.get("status"),
+        "reason": f"status is {a.get('status')!r} — the engine does not copy to it",
+    } for a in excluded]
+
     if not master:
         return {
             "window": window, "master": None, "followers": [], "rows": [],
+            "groups": [], "excluded_followers": excluded_out,
             "unmatched_follower_fills": [], "summary": _empty_summary(),
             "warnings": ["No master account configured — nothing to compare against."],
         }
@@ -484,6 +644,7 @@ async def compare(
         ratio, ratio_why = follower_ratio(f, master)
         f_state.append({
             "account": f,
+            "master": master,
             "groups": r["groups"],
             "by_order": {g["order_id"]: g for g in r["groups"]},
             "taken": set(),
@@ -566,14 +727,23 @@ async def compare(
             "legs": row_legs,
         })
 
-    # Follower fills no master order claimed. Not automatically wrong — a mirror
-    # of a master order from just before the window opens here, and the desk does
-    # place the occasional manual order — but it is unexplained by definition, so
-    # it gets listed rather than counted as agreement.
+    # Group-level reconciliation, then let it soften the per-rung verdicts.
+    groups = reconcile_groups(rows, f_state, master_groups)
+    _apply_group_context(rows, groups)
+
+    # Follower fills that belong to no master (symbol, side) AT ALL.
+    #
+    # The bar used to be "no row claimed this fill", which flagged every ladder
+    # cover order the master's rungs didn't individually pair with — 44 of them
+    # on 2026-08-26. A fill on a symbol/side the master traded is accounted for
+    # by the group reconciliation above, so only a symbol/side the master never
+    # touched is genuinely unexplained. That is the real signal: a follower
+    # trading its own book.
+    master_keys = {(g.get("symbol"), g.get("side")) for g in master_groups}
     unmatched = []
     for st in f_state:
         for g in st["groups"]:
-            if g["order_id"] in st["taken"]:
+            if (g.get("symbol"), g.get("side")) in master_keys:
                 continue
             leg = legs["by_follower"].get(g["order_id"])
             unmatched.append({
@@ -588,7 +758,8 @@ async def compare(
                 "master_order_id": (leg or {}).get("master_order_id"),
                 "explanation": (
                     "mirrors a master order outside this window"
-                    if leg else "no copy record — placed outside the engine?"
+                    if leg else "master never traded this symbol/side today — "
+                                "follower's own trade?"
                 ),
             })
     unmatched.sort(key=lambda u: u["first_fill_at"] or "")
@@ -619,8 +790,10 @@ async def compare(
             "unreadable": bool(st["error"]),
         } for st in f_state],
         "rows": rows,
+        "groups": groups,
+        "excluded_followers": excluded_out,
         "unmatched_follower_fills": unmatched,
-        "summary": summarise(rows, unmatched, f_state),
+        "summary": summarise(rows, groups, unmatched, f_state),
         "warnings": warnings,
     }
 
@@ -629,25 +802,38 @@ def _empty_summary() -> dict:
     return {
         "master_orders": 0, "matched_rows": 0, "mismatched_rows": 0,
         "legs": 0, "by_verdict": {}, "errors": 0,
+        "groups": 0, "groups_matched": 0, "groups_by_verdict": {},
         "avg_delay_ms": None, "median_delay_ms": None, "max_delay_ms": None,
         "p95_delay_ms": None, "delay_samples": 0,
         "match_rate_pct": 100.0, "per_follower": [], "unmatched_follower_fills": 0,
     }
 
 
-def summarise(rows: list[dict], unmatched: list[dict], f_state: list[dict]) -> dict:
+def summarise(rows: list[dict], groups: list[dict], unmatched: list[dict],
+              f_state: list[dict]) -> dict:
     """Headline figures: match rate, delay distribution, error count.
 
-    Delay is reported as median and p95 alongside the mean. The mean alone is a
-    poor summary here — one mirrored limit that rested for four minutes before
-    filling drags it into uselessness while the typical copy landed in under a
-    second — and the daily report is read as "is this normal?", which is a
-    question about the typical case and the tail, not the average.
+    **Match rate and error count are GROUP-level** — per (follower, symbol,
+    side), not per master order. That is the unit at which "do the accounts
+    match?" has a truthful answer once the master ladders an exit across many
+    rungs and the engine mirrors it as one ladder: counting rungs reported 0% on
+    a day the active follower was tracking correctly. For non-laddered trading a
+    group is a single order, so the two coincide.
+
+    Delay stays per-leg, reported as median and p95 alongside the mean. The mean
+    alone is a poor summary here — one mirrored limit that rested for four
+    minutes before filling drags it into uselessness while the typical copy
+    landed in under a second — and the report is read as "is this normal?", which
+    is a question about the typical case and the tail, not the average.
     """
     all_legs = [l for r in rows for l in r["legs"]]
     by_verdict: dict[str, int] = {}
     for l in all_legs:
         by_verdict[l["verdict"]] = by_verdict.get(l["verdict"], 0) + 1
+
+    groups_by_verdict: dict[str, int] = {}
+    for g in groups:
+        groups_by_verdict[g["verdict"]] = groups_by_verdict.get(g["verdict"], 0) + 1
 
     delays = sorted(l["delay_ms"] for l in all_legs if l.get("delay_ms") is not None)
 
@@ -657,56 +843,64 @@ def summarise(rows: list[dict], unmatched: list[dict], f_state: list[dict]) -> d
         idx = min(len(delays) - 1, max(0, int(round((len(delays) - 1) * p))))
         return delays[idx]
 
-    mismatched = sum(1 for r in rows if r["status"] in MISMATCH_VERDICTS)
-    # "Errors" is the number the desk asks for each morning, so it counts only
-    # things that need a human: a leg that is short, missing or oversized. A
-    # deliberate skip, a resting order and an unreadable account are surfaced on
-    # their own so they can't be mistaken for silent agreement.
-    errors = sum(by_verdict.get(v, 0) for v in MISMATCH_VERDICTS)
+    def rate(items) -> Optional[float]:
+        """Match rate over gradable items only. A deliberate skip, a resting
+        order and an unreadable account are excluded rather than counted either
+        way — scoring them would make the headline a statement nobody
+        established."""
+        graded = [i for i in items
+                  if i["verdict"] in MISMATCH_VERDICTS or i["verdict"] == "matched"]
+        if not graded:
+            return None
+        return round(sum(1 for i in graded if i["verdict"] == "matched") / len(graded) * 100, 2)
+
+    # "Errors" is the number the desk asks for each morning: how many
+    # (follower, symbol, side) groups do not reconcile. A skip, a resting order
+    # and a ladder rung with no fill of its own are not faults.
+    errors = sum(groups_by_verdict.get(v, 0) for v in MISMATCH_VERDICTS)
 
     per_follower = []
     for st in f_state:
         fid = st["account"]["id"]
         mine = [l for l in all_legs if l["account_id"] == fid]
+        my_groups = [g for g in groups if g["account_id"] == fid]
         f_delays = sorted(l["delay_ms"] for l in mine if l.get("delay_ms") is not None)
         counts: dict[str, int] = {}
-        for l in mine:
-            counts[l["verdict"]] = counts.get(l["verdict"], 0) + 1
-        graded = [l for l in mine if l["verdict"] in MISMATCH_VERDICTS or l["verdict"] == "matched"]
+        for g in my_groups:
+            counts[g["verdict"]] = counts.get(g["verdict"], 0) + 1
         per_follower.append({
             "account_id": fid,
             "account_name": st["account"].get("name"),
             "ratio": st["ratio"],
             "legs": len(mine),
+            "groups": len(my_groups),
             "by_verdict": counts,
             "errors": sum(counts.get(v, 0) for v in MISMATCH_VERDICTS),
-            "match_rate_pct": (
-                round(counts.get("matched", 0) / len(graded) * 100, 2) if graded else None
-            ),
+            "match_rate_pct": rate(my_groups),
             "avg_delay_ms": round(sum(f_delays) / len(f_delays), 1) if f_delays else None,
             "median_delay_ms": f_delays[len(f_delays) // 2] if f_delays else None,
             "max_delay_ms": max(f_delays) if f_delays else None,
-            "filled_lots": round(sum(l["filled_lots"] or 0 for l in mine), 8),
+            "filled_lots": round(sum(g["filled_lots"] for g in my_groups), 8),
             "unreadable": bool(st["error"]),
         })
 
-    graded_rows = [r for r in rows if r["status"] in MISMATCH_VERDICTS or r["status"] == "matched"]
+    group_rate = rate(groups)
     return {
         "master_orders": len(rows),
         "matched_rows": sum(1 for r in rows if r["status"] == "matched"),
-        "mismatched_rows": mismatched,
+        "mismatched_rows": sum(1 for r in rows if r["status"] in MISMATCH_VERDICTS),
         "legs": len(all_legs),
         "by_verdict": by_verdict,
+        "groups": len(groups),
+        "groups_matched": groups_by_verdict.get("matched", 0),
+        "groups_by_verdict": groups_by_verdict,
         "errors": errors,
         "avg_delay_ms": round(sum(delays) / len(delays), 1) if delays else None,
         "median_delay_ms": pct(0.5),
         "p95_delay_ms": pct(0.95),
         "max_delay_ms": delays[-1] if delays else None,
         "delay_samples": len(delays),
-        "match_rate_pct": (
-            round(sum(1 for r in graded_rows if r["status"] == "matched") / len(graded_rows) * 100, 2)
-            if graded_rows else 100.0
-        ),
+        "match_rate_pct": 100.0 if group_rate is None else group_rate,
         "per_follower": per_follower,
         "unmatched_follower_fills": len(unmatched),
     }

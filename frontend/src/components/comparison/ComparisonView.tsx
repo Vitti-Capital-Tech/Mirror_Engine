@@ -30,6 +30,10 @@ const VERDICT: Record<string, { label: string; cls: string; help: string }> = {
     label: 'MATCHED', cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
     help: 'Follower filled at least its proportional target.',
   },
+  ladder: {
+    label: 'LADDER', cls: 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20',
+    help: 'One rung of a laddered exit. The master splits the exit across many orders and the engine mirrors it as one — so the verdict is the group total, not this rung.',
+  },
   short: {
     label: 'SHORT', cls: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
     help: 'Follower filled less than its proportional target.',
@@ -264,9 +268,9 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               </p>
               <p className="text-[11px] text-text-muted mt-1 leading-relaxed">
                 {s.master_orders} master order{s.master_orders === 1 ? '' : 's'} compared
-                against {(data.followers || []).length} follower
+                against {(data.followers || []).length} active follower
                 {(data.followers || []).length === 1 ? '' : 's'} · fills read straight from
-                the exchange, then matched per order
+                the exchange, then reconciled per symbol and side
                 {s.unmatched_follower_fills > 0 && (
                   <> · <span className="text-amber-400 font-semibold">
                     {s.unmatched_follower_fills} follower fill
@@ -283,10 +287,10 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               sub={`${lots(data.master?.lots)} lots filled`} />
             <Stat label="Match rate" value={`${s.match_rate_pct}%`}
               tone={s.match_rate_pct >= 100 ? 'good' : s.match_rate_pct >= 95 ? 'warn' : 'bad'}
-              sub={`${s.matched_rows} of ${s.master_orders} orders clean`} />
+              sub={`${s.groups_matched} of ${s.groups} symbol/side groups reconcile`} />
             <Stat label="Errors" value={s.errors}
               tone={s.errors === 0 ? 'good' : 'bad'}
-              sub={`missing ${s.by_verdict?.missing || 0} · short ${s.by_verdict?.short || 0} · over ${s.by_verdict?.over || 0}`} />
+              sub={`missing ${s.groups_by_verdict?.missing || 0} · short ${s.groups_by_verdict?.short || 0} · over ${s.groups_by_verdict?.over || 0}`} />
             <Stat label="Median delay" value={ms(s.median_delay_ms)}
               sub={`${s.delay_samples} sample${s.delay_samples === 1 ? '' : 's'}`} />
             <Stat label="Avg delay" value={ms(s.avg_delay_ms)}
@@ -294,6 +298,82 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
             <Stat label="Max delay" value={ms(s.max_delay_ms)}
               tone={s.max_delay_ms !== null && s.max_delay_ms > 30_000 ? 'warn' : 'neutral'}
               sub="follower fill − master fill" />
+          </div>
+
+          {/* ------------------------------------- not graded (not copied to) */}
+          {(data.excluded_followers || []).length > 0 && (
+            <div className="flex items-start gap-2 bg-slate-500/[0.08] border border-slate-500/25 text-text-secondary text-xs rounded-lg px-4 py-3">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-slate-400" />
+              <span>
+                <strong>Not graded:</strong>{' '}
+                {data.excluded_followers.map((e: any) => `${e.name} (${e.status})`).join(', ')}
+                {' — '}the engine doesn&apos;t copy to these, so any trading on them is their own
+                book, not a mirror. Including them would put fills the master never made into
+                the match rate.
+              </span>
+            </div>
+          )}
+
+          {/* --------------------------------------------- reconciliation */}
+          <div className="card-premium p-5">
+            <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.12em] mb-1">
+              Symbol / side reconciliation
+            </h3>
+            <p className="text-[11px] text-text-muted mb-3 leading-relaxed">
+              <strong className="text-text-secondary">This is the verdict.</strong> Totals per
+              follower per symbol and side, so a laddered exit is judged as one exit rather than
+              rung by rung — the master splits an exit across many orders and the engine mirrors
+              it as a single ladder.
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">
+                    <th className="py-2.5">Follower</th>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th className="text-center">Verdict</th>
+                    <th className="text-right">Master lots</th>
+                    <th className="text-right">Rungs</th>
+                    <th className="text-right">Target</th>
+                    <th className="text-right">Filled</th>
+                    <th className="pl-4">Note</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.04] font-medium">
+                  {(data.groups || []).length === 0 && (
+                    <tr><td colSpan={9} className="py-8 text-center text-text-muted">
+                      Nothing to reconcile on this day.
+                    </td></tr>
+                  )}
+                  {(data.groups || []).map((g: any) => (
+                    <tr key={`${g.account_id}-${g.symbol}-${g.side}`} className="hover:bg-bg-panel/40">
+                      <td className="py-2.5 font-semibold text-text-primary">{g.account_name}</td>
+                      <td className="font-mono text-text-primary">{g.symbol}</td>
+                      <td className={`font-bold ${g.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {(g.side || '').toUpperCase()}
+                      </td>
+                      <td className="text-center"><VerdictBadge v={g.verdict} /></td>
+                      <td className="text-right font-mono text-text-primary">{lots(g.master_lots)}</td>
+                      <td className="text-right font-mono text-text-secondary">
+                        {g.master_orders}
+                        {g.laddered && (
+                          <span className="ml-1 text-[9px] font-bold text-indigo-300"
+                            title="Laddered — the master split this across several orders">
+                            LDR
+                          </span>
+                        )}
+                      </td>
+                      <td className="text-right font-mono text-text-secondary" title={g.target_basis || ''}>
+                        {lots(g.target_lots)}
+                      </td>
+                      <td className="text-right font-mono text-text-primary">{lots(g.filled_lots)}</td>
+                      <td className="pl-4 text-text-muted">{g.note || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           {/* --------------------------------------------- per follower */}
@@ -307,7 +387,7 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                   <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">
                     <th className="py-2.5">Follower</th>
                     <th className="text-right">Ratio</th>
-                    <th className="text-right">Legs</th>
+                    <th className="text-right" title="Symbol/side groups compared">Groups</th>
                     <th className="text-right">Matched</th>
                     <th className="text-right">Errors</th>
                     <th className="text-right">Lots</th>
@@ -332,7 +412,7 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                       <td className="text-right font-mono text-text-secondary">
                         {f.ratio === null ? '—' : f.ratio.toFixed(4)}
                       </td>
-                      <td className="text-right font-mono text-text-secondary">{f.legs}</td>
+                      <td className="text-right font-mono text-text-secondary">{f.groups}</td>
                       <td className={`text-right font-mono font-bold ${
                         f.match_rate_pct === null ? 'text-text-muted'
                           : f.match_rate_pct >= 100 ? 'text-emerald-400' : 'text-rose-400'
@@ -368,7 +448,10 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
           <div className="card-premium p-5">
             <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
               <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.12em]">
-                Order comparison
+                Order detail
+                <span className="ml-2 normal-case font-medium text-text-muted/70 tracking-normal">
+                  supporting rows — the verdict is the table above
+                </span>
               </h3>
               <div className="flex items-center gap-1 bg-bg-panel border border-bg-border rounded-lg p-0.5">
                 {([
@@ -536,10 +619,12 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                 Unexplained follower fills ({data.unmatched_follower_fills.length})
               </h3>
               <p className="text-[11px] text-text-muted mb-3 leading-relaxed">
-                Follower executions that no master order in this window accounts for. Often a
-                mirror of a master order placed just before the window opened — but a manual
-                trade on a follower account looks exactly the same here, which is why they are
-                listed rather than counted as agreement.
+                Follower executions on a symbol and side the master never traded today. Not
+                automatically wrong — a mirror of an order placed just before the window opened
+                lands here — but a follower trading its own book looks exactly the same, which is
+                why these are listed rather than counted as agreement. Fills on a symbol the
+                master <em>did</em> trade are accounted for by the reconciliation above, ladder
+                cover orders included.
               </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs border-collapse">
@@ -596,7 +681,11 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               rest a limit at the same price, so that is normal, not an error.
               Sizes are compared against each follower's <strong className="text-text-secondary">proportional
               target</strong>, never the master's raw lots: a follower at 1/40th of the master is
-              correct when it fills 1 lot against 40.
+              correct when it fills 1 lot against 40. The
+              <strong className="text-text-secondary"> match rate and error count are group-level</strong> —
+              per symbol and side, not per order — because a laddered exit is one decision spread
+              across many rungs, and counting rungs turns a correctly-tracking follower into a
+              page of false misses. Only accounts the engine actually copies to are graded.
             </p>
           </div>
         </>

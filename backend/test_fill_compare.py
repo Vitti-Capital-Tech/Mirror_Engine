@@ -268,18 +268,35 @@ def test_inferred_match():
     check("not double-counted as unexplained", out["unmatched_follower_fills"], [])
 
 
-def test_inference_window_is_respected():
-    print("\na follower fill far outside the window is unexplained, not silently matched")
+def test_late_copy_is_measured_not_condemned():
+    print("\na late-but-real copy keeps its delay instead of being called a miss")
     f = follower("f1", "Follower A")
     out = run_compare([MASTER, f], {
         "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0)],
         "f1": [fill("777", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=600))],
     }, db=FakeDB())
-    check("master leg reads missing", leg_for(out["rows"][0], "f1")["verdict"], "missing")
-    check("the stray fill is listed", len(out["unmatched_follower_fills"]), 1)
+    leg = leg_for(out["rows"][0], "f1")
+    check("still a match — the accounts agree", leg["verdict"], "matched")
+    check("and the lateness is measured, not hidden", leg["delay_ms"], 600_000.0)
+    check("not counted as an error", out["summary"]["errors"], 0)
+    check("nothing unexplained — the master traded this symbol", out["unmatched_follower_fills"], [])
+
+
+def test_fill_on_untraded_symbol_is_unexplained():
+    print("\na follower fill on a symbol the master never traded IS unexplained")
+    f = follower("f1", "Follower A")
+    out = run_compare([MASTER, f], {
+        "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0)],
+        "f1": [fill("777", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=2)),
+               # The master has no SOLUSD order at all — the follower's own book.
+               fill("888", "SOLUSD", "buy", 9, 210.0, T0 + timedelta(seconds=3))],
+    }, db=FakeDB())
+    check("the BTCUSD copy still matches", leg_for(out["rows"][0], "f1")["verdict"], "matched")
+    check("the SOLUSD fill is listed", len(out["unmatched_follower_fills"]), 1)
     u = out["unmatched_follower_fills"][0]
-    check("with its order id", u["follower_order_id"], "777")
-    check("and an explanation", u["explanation"], "no copy record — placed outside the engine?")
+    check("with its order id", u["follower_order_id"], "888")
+    check("and an explanation", u["explanation"],
+          "master never traded this symbol/side today — follower's own trade?")
     check("counted in the summary", out["summary"]["unmatched_follower_fills"], 1)
 
 
@@ -304,9 +321,10 @@ def test_one_fill_claimed_once():
         ],
         "f1": [fill("777", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=1))],
     }, db=FakeDB())
-    verdicts = sorted(leg_for(r, "f1")["verdict"] for r in out["rows"])
-    check("one matched, one missing", verdicts, ["matched", "missing"])
-    check("exactly one error", out["summary"]["errors"], 1)
+    claimed = [leg_for(r, "f1")["follower_order_id"] for r in out["rows"]]
+    check("exactly one row claimed the fill", sum(1 for c in claimed if c), 1)
+    check("and it claimed the right one", [c for c in claimed if c], ["777"])
+    check("the other row claimed nothing", sorted(claimed, key=lambda c: c or ""), [None, "777"])
 
 
 def test_unreadable_follower():
@@ -435,6 +453,123 @@ def test_multiple_followers():
     check("B's ratio is double A's", per["f2"]["ratio"], 0.05)
 
 
+def test_paused_followers_are_not_graded():
+    """Regression — live run, 2026-08-26.
+
+    Two of three followers were PAUSED. The engine copies only to
+    status='active', so their fills are their own book, but they were graded
+    anyway: one had traded ~996 lots on strikes the master never touched, which
+    produced 36 phantom 'missing' legs, 44 phantom 'unexplained' fills, and
+    buried the one active follower's real 72% under a 0% headline.
+    """
+    print("\npaused followers are named but never graded")
+    active = follower("f1", "Active", status="active")
+    paused = follower("f2", "Paused", status="paused")
+    out = run_compare([MASTER, active, paused], {
+        "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0)],
+        "f1": [fill("555", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=1))],
+        # The paused account trades its own book, on a symbol the master never
+        # touched. None of this may reach the verdict.
+        "f2": [fill("666", "SOLUSD", "buy", 400, 210.0, T0 + timedelta(seconds=1))],
+    }, db=FakeDB())
+
+    check("only the active follower has a leg", len(out["rows"][0]["legs"]), 1)
+    check("and it is the active one", out["rows"][0]["legs"][0]["account_name"], "Active")
+    check("row is clean", out["rows"][0]["status"], "matched")
+    check("no phantom errors", out["summary"]["errors"], 0)
+    check("match rate is the active follower's", out["summary"]["match_rate_pct"], 100.0)
+    check("paused fills are not 'unexplained'", out["summary"]["unmatched_follower_fills"], 0)
+    check("only the active follower is summarised", len(out["summary"]["per_follower"]), 1)
+    check("the paused one is named, not dropped", len(out["excluded_followers"]), 1)
+    check("with its name", out["excluded_followers"][0]["name"], "Paused")
+    check("and why", out["excluded_followers"][0]["reason"],
+          "status is 'paused' — the engine does not copy to it")
+
+
+def test_laddered_exit_is_one_exit():
+    """Regression — live run, 2026-08-26.
+
+    The master laddered a sell across nine orders spanning 5.7 hours on
+    C-BTC-79800-260826, and the engine mirrors a ladder as ONE ladder. Grading
+    rung-by-rung called eight of the nine 'missing' on a day the follower was
+    tracking correctly.
+    """
+    print("\na laddered exit is judged on its total, not rung by rung")
+    f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
+    # Master ladders 300 lots across 3 rungs, hours apart.
+    m_fills = [
+        fill("900", "C-BTC-79800", "sell", 100, 5.0, T0),
+        fill("901", "C-BTC-79800", "sell", 100, 5.1, T0 + timedelta(hours=2)),
+        fill("902", "C-BTC-79800", "sell", 100, 5.2, T0 + timedelta(hours=4)),
+    ]
+    # The follower covers the whole ladder with ONE order: 30 lots = 300 x 0.1.
+    f_fills = [fill("555", "C-BTC-79800", "sell", 30, 5.05, T0 + timedelta(seconds=3))]
+    out = run_compare([MASTER, f], {"m1": m_fills, "f1": f_fills}, db=FakeDB())
+
+    check("three master order rows", len(out["rows"]), 3)
+    verdicts = sorted(leg_for(r, "f1")["verdict"] for r in out["rows"])
+    check("every rung is neutral", verdicts, ["ladder", "ladder", "ladder"])
+    check("NOT reported as missing", "missing" in verdicts, False)
+    check("NOT reported as over either", "over" in verdicts, False)
+    check("and each rung explains itself", leg_for(out["rows"][0], "f1")["note"],
+          "part of a 3-rung ladder on C-BTC-79800 sell — the total reconciles (30 of 30 lots)")
+
+    check("one group for the symbol/side", len(out["groups"]), 1)
+    g = out["groups"][0]
+    check("group verdict", g["verdict"], "matched")
+    check("group knows it was laddered", g["laddered"], True)
+    check("across three rungs", g["master_orders"], 3)
+    check("master total", g["master_lots"], 300.0)
+    check("target is the scaled total", g["target_lots"], 30.0)
+    check("follower total", g["filled_lots"], 30.0)
+
+    check("zero errors", out["summary"]["errors"], 0)
+    check("match rate 100%", out["summary"]["match_rate_pct"], 100.0)
+    check("the cover order is not 'unexplained'", out["summary"]["unmatched_follower_fills"], 0)
+
+
+def test_ladder_that_really_is_short():
+    print("\na ladder whose total falls short is still caught")
+    f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
+    m_fills = [
+        fill("900", "C-BTC-79800", "sell", 100, 5.0, T0),
+        fill("901", "C-BTC-79800", "sell", 100, 5.1, T0 + timedelta(hours=2)),
+        fill("902", "C-BTC-79800", "sell", 100, 5.2, T0 + timedelta(hours=4)),
+    ]
+    # Covered only 12 of the 30 lots it owed.
+    f_fills = [fill("555", "C-BTC-79800", "sell", 12, 5.05, T0 + timedelta(seconds=3))]
+    out = run_compare([MASTER, f], {"m1": m_fills, "f1": f_fills}, db=FakeDB())
+
+    g = out["groups"][0]
+    check("group verdict", g["verdict"], "short")
+    check("quantified against the total", g["note"],
+          "filled 12 of 30 lots across 3 master order(s)")
+    check("counted once, not once per rung", out["summary"]["errors"], 1)
+    check("match rate 0%", out["summary"]["match_rate_pct"], 0.0)
+    # The unfilled rungs stay 'missing' — the group did not reconcile, so there
+    # is nothing to excuse them.
+    verdicts = sorted(leg_for(r, "f1")["verdict"] for r in out["rows"])
+    check("every rung reports the ladder's real verdict", verdicts, ["short", "short", "short"])
+    check("with the group's reason, not a per-rung artefact",
+          leg_for(out["rows"][0], "f1")["note"],
+          "3-rung ladder: filled 12 of 30 lots across 3 master order(s)")
+
+
+def test_group_missing_when_nothing_filled():
+    print("\na symbol the follower never touched is one error, not N")
+    f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
+    out = run_compare([MASTER, f], {
+        "m1": [fill("900", "C-BTC-79800", "sell", 100, 5.0, T0),
+               fill("901", "C-BTC-79800", "sell", 100, 5.1, T0 + timedelta(hours=2))],
+        "f1": [],
+    }, db=FakeDB())
+    check("both rungs missing", [leg_for(r, "f1")["verdict"] for r in out["rows"]],
+          ["missing", "missing"])
+    check("but ONE group error", out["summary"]["errors"], 1)
+    check("group says so plainly", out["groups"][0]["note"],
+          "no follower fill on C-BTC-79800 sell at all")
+
+
 def test_no_master():
     print("\nno master configured → say so rather than reporting a clean match")
     out = run_compare([follower("f1", "Follower A")], {"f1": []}, db=FakeDB())
@@ -513,10 +648,12 @@ def test_renderers():
 
     csv_out = dr.render_csv(out)
     lines = [l for l in csv_out.strip().splitlines() if l]
-    check("csv header matches the declared columns",
-          lines[0], ",".join(dr.CSV_COLUMNS))
-    check_true("csv has a row per leg", len([l for l in lines if l.startswith("2026-08-26,")]) == 2,
-               str(lines[:4]))
+    check_true("csv leads with the reconciliation — that is the verdict",
+               lines[0].startswith('"SYMBOL/SIDE RECONCILIATION'), lines[0])
+    check_true("csv still carries the per-order detail header",
+               ",".join(dr.CSV_COLUMNS) in lines, str(lines[:6]))
+    check_true("csv has a row per leg", len([l for l in lines if l.startswith("2026-08-26,")]) >= 2,
+               str(lines[:6]))
     check_true("csv carries the unexplained section",
                "UNEXPLAINED FOLLOWER FILLS" in csv_out, csv_out[-200:])
 
@@ -540,11 +677,15 @@ def main():
     for fn in (
         test_grouping, test_parse_ts, test_linked_match, test_proportional_not_absolute,
         test_missing_copy, test_short_fill, test_one_lot_rounding_is_not_a_mismatch,
-        test_inferred_match, test_inference_window_is_respected,
+        test_inferred_match, test_late_copy_is_measured_not_condemned,
+        test_fill_on_untraded_symbol_is_unexplained,
         test_side_mismatch_is_not_inferred, test_one_fill_claimed_once,
         test_unreadable_follower, test_deliberate_skip_is_not_an_error,
         test_resting_order_is_not_missing, test_fill_path_legs_reached_via_trades,
-        test_delay_stats, test_multiple_followers, test_no_master,
+        test_delay_stats, test_multiple_followers,
+        test_paused_followers_are_not_graded, test_laddered_exit_is_one_exit,
+        test_ladder_that_really_is_short, test_group_missing_when_nothing_filled,
+        test_no_master,
         test_ratio_refuses_to_guess, test_unsized_follower_filled,
         test_ist_day_bounds, test_renderers,
     ):

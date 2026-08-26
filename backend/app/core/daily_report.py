@@ -36,6 +36,7 @@ _SENT_TTL = 60 * 60 * 72
 
 _VERDICT_LABEL = {
     "matched": "Matched",
+    "ladder": "Ladder rung",
     "short": "Short fill",
     "missing": "Missing",
     "over": "Over-filled",
@@ -89,11 +90,12 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
         f"<b>Master</b> {escape(str(m.get('name') or '—'))}: "
         f"{m.get('order_count', 0)} orders, {_lots(m.get('lots'))} lots",
         f"<b>Match rate</b> {s['match_rate_pct']}%  "
-        f"({s['matched_rows']}/{s['master_orders']} orders clean)",
+        f"({s['groups_matched']}/{s['groups']} symbol/side groups reconcile"
+        f" · {s['master_orders']} master orders)",
         f"<b>Errors</b> {s['errors']}"
-        + (f"  (missing {s['by_verdict'].get('missing', 0)}, "
-           f"short {s['by_verdict'].get('short', 0)}, "
-           f"over {s['by_verdict'].get('over', 0)})" if s["errors"] else ""),
+        + (f"  (missing {s['groups_by_verdict'].get('missing', 0)}, "
+           f"short {s['groups_by_verdict'].get('short', 0)}, "
+           f"over {s['groups_by_verdict'].get('over', 0)})" if s["errors"] else ""),
         f"<b>Delay</b> median {_ms(s['median_delay_ms'])} · "
         f"avg {_ms(s['avg_delay_ms'])} · p95 {_ms(s['p95_delay_ms'])} · "
         f"max {_ms(s['max_delay_ms'])}",
@@ -112,23 +114,29 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
 
     # The worst few rows, named. A count with no examples means opening the full
     # report to find out what broke, which defeats the point of the summary.
-    bad = [r for r in cmp["rows"] if r["status"] in fc.MISMATCH_VERDICTS]
+    bad = [g for g in cmp.get("groups") or [] if g["verdict"] in fc.MISMATCH_VERDICTS]
     if bad:
         lines += ["", f"<b>Needs attention</b> ({len(bad)})"]
-        for r in bad[:8]:
-            legs = ", ".join(
-                f"{escape(str(l['account_name']))} {_VERDICT_LABEL.get(l['verdict'], l['verdict'])}"
-                for l in r["legs"] if l["verdict"] in fc.MISMATCH_VERDICTS
-            )
+        for g in bad[:8]:
             lines.append(
-                f"· {_clock(r['master_first_fill_at'])} {escape(str(r['symbol']))} "
-                f"{r['side']} {_lots(r['master_lots'])} → {legs}"
+                f"· {escape(str(g['symbol']))} {g['side']} — "
+                f"{escape(str(g['account_name']))} "
+                f"{_VERDICT_LABEL.get(g['verdict'], g['verdict'])}: "
+                f"{_lots(g['filled_lots'])} of {_lots(g['target_lots'])} lots "
+                f"(master {_lots(g['master_lots'])}"
+                + (f" over {g['master_orders']} rungs" if g["laddered"] else "")
+                + ")"
             )
         if len(bad) > 8:
             lines.append(f"· …and {len(bad) - 8} more")
 
     if cmp.get("unmatched_follower_fills"):
-        lines += ["", f"<b>Unexplained follower fills</b> {len(cmp['unmatched_follower_fills'])}"]
+        lines += ["", f"<b>Unexplained follower fills</b> {len(cmp['unmatched_follower_fills'])}"
+                      " (symbols the master never traded today)"]
+
+    if cmp.get("excluded_followers"):
+        names = ", ".join(escape(str(e["name"])) for e in cmp["excluded_followers"])
+        lines += ["", f"<i>Not graded (not being copied to): {names}</i>"]
 
     for w in (cmp.get("warnings") or [])[:4]:
         lines += [f"⚠️ {escape(w)}"]
@@ -161,6 +169,21 @@ def render_csv(cmp: dict) -> str:
     day = cmp["window"].get("date") or cmp["window"]["start"][:10]
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
+    # Lead with the group reconciliation — it IS the verdict. A reader handed
+    # only rung-by-rung rows would have to reconstruct the totals by hand, which
+    # is exactly the mistake that made a laddered exit look like nine misses.
+    if cmp.get("groups"):
+        w.writerow(["SYMBOL/SIDE RECONCILIATION (the verdict — totals, ladder-safe)"])
+        w.writerow(["date", "follower", "symbol", "side", "verdict", "master_orders",
+                    "laddered", "master_lots", "target_lots", "filled_lots",
+                    "target_basis", "note"])
+        for g in cmp["groups"]:
+            w.writerow([day, g["account_name"], g["symbol"], g["side"], g["verdict"],
+                        g["master_orders"], "yes" if g["laddered"] else "no",
+                        _lots(g["master_lots"]), _lots(g["target_lots"]),
+                        _lots(g["filled_lots"]), g["target_basis"], g["note"]])
+        w.writerow([])
+        w.writerow(["PER-ORDER DETAIL (supporting rows)"])
     w.writerow(CSV_COLUMNS)
     for r in cmp["rows"]:
         for l in r["legs"]:
@@ -273,6 +296,8 @@ def render_html(cmp: dict, *, label: str = "") -> str:
     parts += [
         "<div class='cards'>",
         _card("Master orders", str(s["master_orders"])),
+        _card("Groups reconciled", f"{s['groups_matched']}/{s['groups']}",
+              "ok" if s["groups_matched"] == s["groups"] else "bad"),
         _card("Master lots", _lots(m.get("lots"))),
         _card("Match rate", f"{s['match_rate_pct']}%",
               "ok" if s["match_rate_pct"] >= 100 else "bad"),
@@ -283,6 +308,42 @@ def render_html(cmp: dict, *, label: str = "") -> str:
         _card("Max delay", _ms(s["max_delay_ms"])),
         "</div>",
     ]
+
+    if cmp.get("excluded_followers"):
+        names = ", ".join(
+            f"<strong>{escape(str(e['name']))}</strong> ({escape(str(e['status']))})"
+            for e in cmp["excluded_followers"]
+        )
+        parts.append(
+            f"<div class='warn'>Not graded, because the engine does not copy to them: {names}. "
+            "Any trading on these accounts is their own book, not a mirror.</div>"
+        )
+
+    # The verdict lives here rather than in the per-order table: a laddered exit
+    # spreads one decision across many rungs, so totals per symbol and side are
+    # the honest unit of comparison.
+    if cmp.get("groups"):
+        parts += ["<h2>Symbol / side reconciliation</h2>",
+                  "<p class='sub'>The verdict. Totals per follower per symbol and side, so a "
+                  "laddered exit is judged as one exit rather than rung by rung.</p>",
+                  "<div class='scroll'><table><thead><tr><th>Follower</th><th>Symbol</th>",
+                  "<th>Side</th><th>Verdict</th><th class='n'>Master lots</th>",
+                  "<th class='n'>Rungs</th><th class='n'>Target</th><th class='n'>Filled</th>",
+                  "<th>Note</th></tr></thead><tbody>"]
+        for g in cmp["groups"]:
+            side_cls = "side-buy" if g["side"] == "buy" else "side-sell"
+            parts.append(
+                f"<tr><td><strong>{escape(str(g['account_name']))}</strong></td>"
+                f"<td class='mono'>{escape(str(g['symbol']))}</td>"
+                f"<td class='{side_cls}'>{escape(str(g['side'] or '').upper())}</td>"
+                f"<td>{_pill(g['verdict'])}</td>"
+                f"<td class='n'>{_lots(g['master_lots'])}</td>"
+                f"<td class='n'>{g['master_orders']}</td>"
+                f"<td class='n' title=\"{escape(g['target_basis'])}\">{_lots(g['target_lots'])}</td>"
+                f"<td class='n'>{_lots(g['filled_lots'])}</td>"
+                f"<td class='muted'>{escape(g['note'] or '')}</td></tr>"
+            )
+        parts.append("</tbody></table></div>")
 
     # Per-follower rollup
     parts += ["<h2>Per follower</h2><div class='scroll'><table><thead><tr>",
@@ -367,9 +428,12 @@ def render_html(cmp: dict, *, label: str = "") -> str:
         parts.append("</tbody></table></div>")
 
     parts += [
-        "<footer>Fills read from Delta Exchange (<code>/v2/fills</code>) for every account and "
-        "matched per order; the engine's own copy records annotate each leg but never define a "
-        "match. <em>linked</em> = a recorded copy ties the two orders together; "
+        "<footer>Fills read from Delta Exchange (<code>/v2/fills</code>) for the master and every "
+        "ACTIVE follower, then matched per order; the engine's own copy records annotate each leg "
+        "but never define a match. The <strong>verdict is taken per symbol and side</strong>, not "
+        "per order, because the master ladders an exit across many rungs and the engine mirrors it "
+        "as one ladder — a rung with no fill of its own reads <em>Ladder rung</em>, not a miss, when "
+        "the total reconciles. <em>linked</em> = a recorded copy ties the two orders together; "
         "<em>inferred</em> = matched on symbol, side and timing because no copy record linked "
         f"them (within {int(fc.INFER_WINDOW_SEC)}s). Delay is the follower's first fill minus the "
         "master's — negative means the follower traded first.</footer>",
