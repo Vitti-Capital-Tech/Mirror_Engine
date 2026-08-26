@@ -101,31 +101,31 @@ class DeltaClient:
         return resp.json()
 
     async def get_positions(self) -> list:
-        """Fetch all open positions — both futures (margined) and options.
+        """Fetch all open positions. /v2/positions/margined returns them all —
+        BTC options included, which is what this desk trades.
 
-        The two legs run CONCURRENTLY. They used to be awaited one after the
-        other, which put two full round-trips in front of every position read —
-        and the exit path reads positions up to three times (master signed,
-        master remaining, follower held) before it places an order, so the
-        serialisation was costing several hundred ms on the hot copy path for no
-        reason: neither call depends on the other."""
-        margined, options = await asyncio.gather(
-            self._get_json("/v2/positions/margined"),
-            self._get_json("/v2/positions?product_types=put_options,call_options"),
-            return_exceptions=True,
-        )
+        There used to be a second, sequential call to
+        `/v2/positions?product_types=put_options,call_options`. Delta rejects
+        that URL outright ("one out of product_id or underlying_asset_symbol is
+        required"), and the old code only read the body `if status_code == 200`
+        with no else branch — so it had been 400ing on every single position read,
+        silently, and contributing nothing. It cost a full round-trip in front of
+        each read, and the exit path reads positions up to three times (master
+        signed, master remaining, follower held) before it places an order.
 
-        all_positions: list = []
-        for label, res in (("margined", margined), ("options", options)):
-            if isinstance(res, BaseException):
-                logger.warning(f"Could not fetch {label} positions: {res}")
-                continue
-            if res is None:
-                continue
-            rows = res.get("result", []) if isinstance(res, dict) else res
-            all_positions.extend(rows or [])
-
-        return all_positions
+        Proof it was dead rather than load-bearing: the positions table is
+        populated from this method and holds option symbols
+        (e.g. C-BTC-81400-260826), so the margined endpoint is already returning
+        them."""
+        try:
+            res = await self._get_json("/v2/positions/margined")
+        except Exception as e:
+            logger.warning(f"Could not fetch positions: {e}")
+            return []
+        if res is None:
+            return []
+        rows = res.get("result", []) if isinstance(res, dict) else res
+        return list(rows or [])
 
     async def get_order_history(self, page_size: int = 50) -> list:
         """Fetch recent closed/cancelled orders (order history)."""
