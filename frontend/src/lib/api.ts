@@ -44,6 +44,39 @@ async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+/**
+ * Same auth as fetchAPI, but returns the raw body. The report endpoints serve
+ * CSV and HTML, and every download here needs the bearer token — so a plain
+ * <a href> cannot fetch them; the blob is pulled here and handed to the browser.
+ */
+async function fetchBlob(path: string): Promise<Blob> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let detail = text;
+    try { detail = JSON.parse(text).detail || text; } catch { /* not JSON */ }
+    throw new Error(detail || `HTTP Error ${res.status}`);
+  }
+  return res.blob();
+}
+
+/** Hand a fetched blob to the browser as a download. */
+export function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoked on the next tick — revoking synchronously races the download start
+  // in Safari and the file arrives empty.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export const api = {
   auth: {
     signup: (email: string, password: string) =>
@@ -94,6 +127,19 @@ export const api = {
   dashboard: {
     stats: () => fetchAPI<any>('/api/dashboard/stats'),
     system: () => fetchAPI<any>('/api/dashboard/system'),
+  },
+  comparison: {
+    get: (params?: Record<string, any>) =>
+      fetchAPI<any>(`/api/comparison${buildQuery(params)}`),
+    csv: (params?: Record<string, any>) =>
+      fetchBlob(`/api/comparison/report.csv${buildQuery(params)}`),
+    html: (params?: Record<string, any>) =>
+      fetchBlob(`/api/comparison/report.html${buildQuery({ ...(params || {}), download: true })}`),
+    text: (params?: Record<string, any>) =>
+      fetchBlob(`/api/comparison/report.txt${buildQuery(params)}`).then(b => b.text()),
+    send: (date?: string) =>
+      fetchAPI<any>(`/api/comparison/report/send${buildQuery({ date })}`, { method: 'POST' }),
+    reportStatus: () => fetchAPI<any>('/api/comparison/report/status'),
   },
   admin: {
     overview: () => fetchAPI<any>('/api/admin/overview'),

@@ -13,7 +13,8 @@ from app.core.copy_engine import CopyEngine
 from app.core.position_monitor import position_monitor
 from app.core.connection_manager import connection_manager
 from app.core import order_history as oh
-from app.api import accounts, trades, positions, alerts, dashboard, auth, admin
+from app.core import daily_report as dreport
+from app.api import accounts, trades, positions, alerts, dashboard, auth, admin, comparison
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,10 +25,11 @@ copy_engine = None
 redis_consumer_task = None
 order_consumer_task = None
 position_poller_task = None
+daily_report_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, copy_engine, redis_consumer_task, order_consumer_task, position_poller_task
+    global redis_client, copy_engine, redis_consumer_task, order_consumer_task, position_poller_task, daily_report_task
     logger.info("Starting Copy Trading Backend...")
     
     # 1. Connect to Redis
@@ -109,7 +111,15 @@ async def lifespan(app: FastAPI):
     # 7. Start live position and PnL polling background loop (runs every 4 seconds)
     position_poller_task = asyncio.create_task(position_poller())
     logger.info("Background live position poller started.")
-    
+
+    # 8. Daily master-vs-follower fill match report to Telegram. Idempotent per
+    #    IST day via a Redis marker, so the deploy-time restarts don't re-send it.
+    if settings.DAILY_REPORT_ENABLED:
+        daily_report_task = asyncio.create_task(dreport.daily_report_scheduler(
+            db, redis_client,
+            settings.DAILY_REPORT_HOUR_IST, settings.DAILY_REPORT_MINUTE_IST,
+        ))
+
     yield
     
     # 8. Shutdown cleanups
@@ -132,6 +142,13 @@ async def lifespan(app: FastAPI):
         position_poller_task.cancel()
         try:
             await position_poller_task
+        except asyncio.CancelledError:
+            pass
+
+    if daily_report_task:
+        daily_report_task.cancel()
+        try:
+            await daily_report_task
         except asyncio.CancelledError:
             pass
 
@@ -235,6 +252,7 @@ app.include_router(positions.router)
 app.include_router(alerts.router)
 app.include_router(dashboard.router)
 app.include_router(admin.router)
+app.include_router(comparison.router)
 
 @app.get("/health")
 async def health():

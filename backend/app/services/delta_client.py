@@ -145,6 +145,49 @@ class DeltaClient:
         data = resp.json()
         return data.get("result", []) if isinstance(data, dict) else (data or [])
 
+    async def get_fills_range(
+        self,
+        start_time_us: int,
+        end_time_us: int,
+        page_size: int = 200,
+        max_pages: int = 25,
+    ) -> list:
+        """Every fill in a time window, following Delta's cursor pagination.
+
+        get_fills() takes only a page_size, so a busy day silently truncates at
+        the newest N executions — useless for "did the accounts match over this
+        day?", where a missing fill is exactly the thing being looked for. This
+        walks `meta.after` until the window is exhausted.
+
+        Bounded by max_pages so a paging bug can't spin forever; the caller is
+        told it was truncated by getting exactly page_size * max_pages rows.
+        """
+        out: list = []
+        after: Optional[str] = None
+        for _ in range(max_pages):
+            path = (
+                f"/v2/fills?start_time={int(start_time_us)}&end_time={int(end_time_us)}"
+                f"&page_size={page_size}"
+            )
+            if after:
+                path += f"&after={after}"
+            try:
+                data = await self._get_json(path)
+            except Exception as e:
+                logger.warning(f"get_fills_range failed: {e}")
+                break
+            if data is None:
+                break
+            rows = data.get("result", []) if isinstance(data, dict) else (data or [])
+            out.extend(rows or [])
+            meta = data.get("meta") or {} if isinstance(data, dict) else {}
+            after = meta.get("after")
+            # Delta keeps returning the same cursor once the page isn't full, so
+            # a short page is the real end-of-window signal.
+            if not after or len(rows or []) < page_size:
+                break
+        return out
+
     async def get_ticker(self, symbol: str) -> dict:
         """Fetch the public ticker for a symbol (spot_price / mark_price / close).
 

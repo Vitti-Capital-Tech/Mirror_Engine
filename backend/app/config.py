@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
 
+    # Daily master-vs-follower fill match report, posted to the Telegram chat
+    # above. Time is IST, because the day it reports on is an IST trading day.
+    # 23:45 by default: late enough that the session is over, early enough that
+    # the report is still filed against the day it describes.
+    DAILY_REPORT_ENABLED: bool = True
+    DAILY_REPORT_HOUR_IST: int = 23
+    DAILY_REPORT_MINUTE_IST: int = 45
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 

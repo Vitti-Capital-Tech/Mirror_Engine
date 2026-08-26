@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Wallet } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Wallet, GitCompareArrows } from 'lucide-react';
 // (Activity reused for admin Positions)
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
@@ -16,6 +16,7 @@ export function Sidebar() {
     { href: '/positions', label: 'Positions', icon: Activity },
     { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/trades', label: 'Trades Log', icon: FileText },
+    { href: '/comparison', label: 'Comparison', icon: GitCompareArrows },
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
   ];
 
@@ -24,6 +25,7 @@ export function Sidebar() {
     { href: '/admin/users', label: 'Users', icon: Users },
     { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
     { href: '/admin/trades', label: 'Trades Log', icon: FileText },
+    { href: '/admin/comparison', label: 'Comparison', icon: GitCompareArrows },
     { href: '/admin/alerts', label: 'Alert Feed', icon: Bell },
   ];
 

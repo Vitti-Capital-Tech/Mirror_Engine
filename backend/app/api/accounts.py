@@ -165,6 +165,8 @@ async def delete_account(id: str, user: CurrentUser = Depends(get_current_user))
             raise HTTPException(status_code=404, detail="Account not found.")
             
         return {"success": True, "message": "Account deleted successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error deleting account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -182,6 +184,8 @@ async def pause_account(id: str, user: CurrentUser = Depends(get_current_user)):
 
         acc = res.data[0]
         return _mask_secrets(acc)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error pausing account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -199,6 +203,8 @@ async def resume_account(id: str, user: CurrentUser = Depends(get_current_user))
         await start_account_ws(acc)
         
         return _mask_secrets(acc)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error resuming account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -216,6 +222,8 @@ async def reset_account(id: str, user: CurrentUser = Depends(get_current_user)):
         await start_account_ws(acc)
         
         return _mask_secrets(acc)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error resetting account: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Users, Activity, FileText, Bell, Wallet } from 'lucide-react';
+import { Users, Activity, FileText, Bell, Wallet, GitCompareArrows } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 
 export function MobileNav() {
@@ -14,6 +14,7 @@ export function MobileNav() {
     { href: '/positions', label: 'Positions', icon: Activity },
     { href: '/accounts', label: 'Accounts', icon: Users },
     { href: '/trades', label: 'Trades', icon: FileText },
+    { href: '/comparison', label: 'Match', icon: GitCompareArrows },
     { href: '/alerts', label: 'Alerts', icon: Bell },
   ];
   const adminLinks = [
@@ -21,6 +22,7 @@ export function MobileNav() {
     { href: '/admin/users', label: 'Users', icon: Users },
     { href: '/admin/accounts', label: 'Accounts', icon: Wallet },
     { href: '/admin/trades', label: 'Trades', icon: FileText },
+    { href: '/admin/comparison', label: 'Match', icon: GitCompareArrows },
     { href: '/admin/alerts', label: 'Alerts', icon: Bell },
   ];
   const links = isAdmin ? adminLinks : traderLinks;

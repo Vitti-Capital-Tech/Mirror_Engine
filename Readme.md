@@ -106,6 +106,56 @@ Both are read-only and owner-scoped. A "skipped" leg is an accounted-for decisio
 
 ---
 
+## Fill comparison — do the accounts actually match?
+
+The ledger and the Trades Log both describe **what the engine tried to do**. Neither can answer *do the two accounts match?*, because a copy that never reached the exchange, a fill the engine never observed, and an order placed on a follower by hand all look identical in records the engine wrote itself.
+
+So the **Comparison** tab takes the exchange as truth: `/v2/fills` for the master and for every follower over an IST day, grouped **per order** (a limit that fills in five clips is one order, not five), then matched up. The engine's own `trades` / `trade_copies` rows are layered on as *annotation* — they explain a mismatch (skipped for margin, sized to 0, failed with a reason) but never define one.
+
+**How a master order is matched to a follower's**, in descending confidence — each labelled on the row so a reader knows what to trust:
+
+| Link | Meaning |
+|------|---------|
+| `linked` | A recorded leg ties the master order id to a follower order id. Covers the large majority. |
+| `inferred` | No leg, but the follower filled the same symbol and side within `INFER_WINDOW_SEC` (180s). **This is the interesting case** — the copy reached the exchange and the engine failed to write it down. Calling it missing would be a false alarm; calling it `linked` would hide a bookkeeping bug. |
+| — | No follower fill for that master order at all. |
+
+**Sizes are compared against the follower's proportional target, never the master's raw lots.** A follower sized at 1/40th of the master is *correct* when it fills 1 lot against 40. The target is the recorded leg's `requested_quantity` when there is one (literally what the engine asked the exchange for) and is derived from the account's allocation settings when there isn't; which was used is shown, because a derived target on an `auto_ratio` account is only as good as the balances at read time. A 1-lot disagreement is absorbed — opens floor and closes ceil, so that is rounding, not a failure.
+
+**Verdicts are deliberately narrow.** `missing` means the exchange says there is no follower fill *and* the engine recorded no reason. It is **not** used for an account that couldn't be read (`unreadable`), an order still resting (`resting`), a copy the engine deliberately skipped (`skipped`), or a follower with no derivable target (`unsized`). Only `missing` / `short` / `over` count toward the error figure — a risk check doing its job is not a copy failure, and an unread account must never be reported as one that traded nothing.
+
+**Delay** is the follower's first fill minus the master's, reported as **median, mean and p95**. The mean alone is a poor summary: one mirrored limit that rested four minutes drags it into uselessness while the typical copy landed in under a second. Negative delays are kept, not clamped — both accounts rest a limit at the same price, so the follower's can trade first, and the sign is what tells you the mirror wasn't chasing.
+
+Follower fills that no master order accounts for are listed separately rather than counted as agreement — usually a mirror of an order placed just before the window opened, but a manual trade on a follower looks exactly the same here.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "$API/api/comparison"
+```
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "$API/api/comparison/report.html?date=2026-08-26" -o report.html
+```
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "$API/api/comparison/report.csv?date=2026-08-26" -o report.csv
+```
+
+Admins may pass `?owner_id=` to view another tenant's comparison. Read-only, like everything else an admin can reach.
+
+### The daily report
+
+Once per IST day (`DAILY_REPORT_HOUR_IST`, default 23:45) the same comparison is posted to the Telegram chat: match rate, error count, delay distribution, a per-follower rollup, and the worst few rows **named** — a count with no examples just means opening the full report to find out what broke.
+
+The send is **idempotent per day** via a Redis marker. The backend restarts on every deploy, and a report that re-sends itself after each one is noise the desk learns to ignore, which is worse than not sending it. The Comparison tab has *Send to Telegram* for an on-demand copy, which deliberately ignores the marker.
+
+Three renderings of the same data, because it gets read at three depths:
+
+* **Telegram** — the one-screen answer, read on a phone.
+* **CSV** — one row per (master order, follower) leg, for sorting and pivoting. Deliberately not one wide row per order with a column group per follower: that cannot be filtered and breaks the moment a follower is added.
+* **HTML** — the shareable doc. Self-contained (no external CSS, fonts or scripts) so it survives being attached to a message, opened offline, or printed to PDF.
+
+---
+
 ## Allocation & sizing
 
 Set per follower (editable any time via the ✏️ edit action):
@@ -188,6 +238,7 @@ Alert types raised: **position mismatch** (follower size ≠ master × ratio —
 * **Live Positions** (landing) — master on top, active followers below, read **directly from Delta** so it mirrors the exchange exactly. Shows **Today P&L** (realized + unrealized) and Active P&L per account. PnL is computed mark-to-market to match Delta's UI.
 * **Accounts** — add / edit / pause / resume / **promote-to-master** / delete, with test-connection.
 * **Trades Log** — full audit trail; expand any row for the per-follower execution breakdown (price, slippage, latency, status).
+* **Comparison** — master vs follower fills for an IST day, read from the exchange and matched order by order: match rate, error count, delay median/mean/p95, per-follower rollup, and CSV / HTML / Telegram exports. See [Fill comparison](#fill-comparison--do-the-accounts-actually-match).
 * **Alerts** — slippage, position-mismatch and connection events, with a bell notification dropdown.
 
 ## Admin console (admins only)
@@ -198,8 +249,9 @@ A dedicated console with its own navigation (regular sections are hidden):
 * **Users** — every account holder with their master, follower count, active accounts, copies and join date; regular users only.
 * **All Accounts** — every master/follower across all tenants (owner, role, status, env, balance, PnL).
 * **Trade Log / Alert Feed** — cross-tenant, collapsible per-user cards.
+* **Comparison** — pick a tenant, see their master vs their followers, plus the daily-report health (scheduled? Telegram wired up? sent today?) and a *send all tenants now* button.
 
-Admins are resolved from the `profiles.role` column; the first admin is set by hand in SQL, after which admins can promote/demote others.
+Admins are resolved from the `profiles.role` column; the first admin is set by hand in SQL, after which admins can promote/demote others. An admin has **full operational control** over any tenant's accounts — pause, resume, edit, delete and promote-to-master included — so the console is a management surface, not just a viewer.
 
 **Responsive:** on mobile the sidebar is replaced by a bottom tab bar; tables scroll horizontally.
 
@@ -212,6 +264,9 @@ Admins are resolved from the `profiles.role` column; the first admin is set by h
 * [core/copy_engine.py](backend/app/core/copy_engine.py) — consumes Redis events; mirrors positions, closes, limit & bracket orders; cancel/edit sync; SL/TP jitter; the 15s position reconciler (open / close / trim / top-up) and protection sync; owner-scoped followers.
 * [core/order_ledger.py](backend/app/core/order_ledger.py) — Redis order-ID ledger: every master order and each follower's outcome, so "which master order never reached this follower?" is answerable.
 * [test_order_ledger.py](backend/test_order_ledger.py) — self-contained regression suite (no network/Redis/Supabase) replaying real incidents: missed partial exit, stuck exit order, place/cancel loop, trigger-vs-cancel, deadband, liveness cache. Run with `python test_order_ledger.py`.
+* [core/fill_compare.py](backend/app/core/fill_compare.py) — the exchange-truth comparison: groups `/v2/fills` per order for master + every follower, matches them (`linked` / `inferred`), grades each leg against its proportional target, and summarises match rate, delays and errors.
+* [core/daily_report.py](backend/app/core/daily_report.py) — the three renderings (Telegram / CSV / self-contained HTML) plus the once-per-IST-day scheduler, idempotent through a Redis marker.
+* [test_fill_compare.py](backend/test_fill_compare.py) — self-contained checks (no network) for the ways the comparison could lie: an unrecorded copy read as missing, a correctly-sized follower read as short, an unreadable account read as one that did not trade, one follower fill claimed by two master orders. Run with `python test_fill_compare.py`.
 * [core/risk_engine.py](backend/app/core/risk_engine.py) — balance-ratio / multiplier sizing (floor on open, ceil on close), margin checks.
 * [core/order_executor.py](backend/app/core/order_executor.py) — async follower execution; FOK all-or-nothing entries + retries; reduce-only closes.
 * [core/auth.py](backend/app/core/auth.py) — token verification, `require_admin`, owner scoping, email-OTP 2FA helpers.
@@ -220,6 +275,7 @@ Admins are resolved from the `profiles.role` column; the first admin is set by h
 * [api/auth.py](backend/app/api/auth.py) — signup / login / 2FA / quick-admin passphrase.
 * [api/admin.py](backend/app/api/admin.py) — cross-tenant overview, users, accounts, positions, trades, alerts.
 * [api/positions.py](backend/app/api/positions.py) — live positions; **Today P&L = realized (ledger) + unrealized**.
+* [api/comparison.py](backend/app/api/comparison.py) — the comparison + report endpoints (JSON / CSV / HTML / text / send / status), owner-scoped.
 * [api/accounts.py](backend/app/api/accounts.py) — account CRUD, pause/resume, promote-to-master (encrypts secrets).
 * [database/migrations/](backend/database/migrations/) — `001_multitenant_auth.sql` (profiles, OTP, owner_id), `002_row_level_security.sql`.
 
@@ -229,6 +285,7 @@ Admins are resolved from the `profiles.role` column; the first admin is set by h
 * [app/positions/page.tsx](frontend/src/app/positions/page.tsx) — trader Live Positions.
 * [components/auth/AuthCard.tsx](frontend/src/components/auth/AuthCard.tsx) — flip-card login/signup; [AuthShell.tsx](frontend/src/components/auth/AuthShell.tsx) — split-screen shell.
 * [context/AuthContext.tsx](frontend/src/context/AuthContext.tsx) — session/role state (cached); [components/layout/AppShell.tsx](frontend/src/components/layout/AppShell.tsx) — route guards + chrome.
+* [components/comparison/ComparisonView.tsx](frontend/src/components/comparison/ComparisonView.tsx) — the Comparison tab: headline stats, per-follower rollup, expandable order-by-order table, unexplained-fill list, and a legend for every verdict. Shared by the trader and admin pages.
 * [components/layout/MobileNav.tsx](frontend/src/components/layout/MobileNav.tsx) — mobile bottom tab bar.
 
 ---
