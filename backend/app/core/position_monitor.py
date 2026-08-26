@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional
 from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
+from app.core import order_ledger as ledger
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,10 @@ class PositionMonitor:
         self.db = db_client
         self.socket_manager = socket_mgr
         self.risk_engine = RiskEngine()
+        # Set at startup. Needed to read the master's high-water size per symbol —
+        # without it this monitor alerts on gaps the copy engine is deliberately
+        # maintaining. See check_sync_and_alert.
+        self.redis = None
         # Cache of latest positions to avoid redundant DB queries on every message
         # Structure: account_id -> symbol -> position_dict
         self._positions_cache: Dict[str, Dict[str, dict]] = {}
@@ -238,6 +243,33 @@ class PositionMonitor:
             # 5. Check mismatch threshold (5% difference or minimum 1 lot mismatch)
             diff = abs(follower_qty - expected_qty)
             mismatch_limit = max(1.0, expected_qty * 0.05)
+
+            # An UNDER-exposed follower on a leg the master is unwinding is not a
+            # fault — it is the copy engine's deliberate choice. The reconciler
+            # refuses to top up while the master sits below its high-water size
+            # ("never add while the master is unwinding this symbol"), so alerting
+            # on the resulting gap means alerting on our own correct decision.
+            #
+            # Observed 2026-08-26 on P-BTC-76800-260826: peak 700, master holding
+            # 350, follower 3 against an expected 4-5. The reconciler logged
+            # "under-exposed (3 vs 4) but master is BELOW its peak (350 of 700) —
+            # net-reduced on this leg, not adding" while this check raised an ERROR
+            # alert to Telegram for the same state, repeatedly.
+            #
+            # OVER-exposure is still alerted: holding more than intended is a real
+            # risk whatever the master is doing.
+            if follower_qty < expected_qty and diff > mismatch_limit:
+                peak = await ledger.get_peak(self.redis, follower_account.get("owner_id"), symbol)
+                if peak and abs(master_qty) < peak:
+                    logger.info(
+                        f"{account_name} under-exposed on {symbol} ({follower_qty} vs "
+                        f"{expected_qty}) but master is BELOW its peak ({master_qty:.0f} of "
+                        f"{peak:.0f}) — expected while it unwinds, not alerting"
+                    )
+                    await self._resolve_mismatch_alert(account_id, symbol)
+                    self.db.table("positions").update({"sync_status": "synced"}).eq(
+                        "account_id", account_id).eq("symbol", symbol).execute()
+                    return "synced"
 
             if diff > mismatch_limit:
                 status = "out_of_sync"

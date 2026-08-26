@@ -49,7 +49,11 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to fetch accounts during startup: {e}")
         accounts_data = []
         
-    # Initialize position monitor cache
+    # Initialize position monitor cache. It needs Redis to read the master's
+    # high-water size per symbol: without it, a follower the reconciler is
+    # deliberately NOT topping up (master unwinding) reads as a position mismatch
+    # and alerts to Telegram on every pass.
+    position_monitor.redis = redis_client
     await position_monitor.start_monitoring(accounts_data)
     
     # 4. Connect WebSockets for active accounts

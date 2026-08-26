@@ -347,6 +347,23 @@ async def bump_peak(redis, owner_id, symbol, size) -> float:
         return cur
 
 
+async def get_peak(redis, owner_id, symbol) -> float:
+    """Read the master's high-water size on `symbol` WITHOUT recording anything.
+
+    bump_peak is the writer and refreshes the TTL; anything that only needs to ask
+    "is the master below its peak here, i.e. net-reduced on this leg?" must not
+    move the mark by asking. Returns 0.0 when unknown.
+    """
+    if not redis or not symbol:
+        return 0.0
+    try:
+        v = await redis.get(_peak_key(owner_id, symbol))
+        return float(v) if v else 0.0
+    except Exception as e:
+        logger.debug(f"ledger: get_peak failed for {symbol}: {e}")
+        return 0.0
+
+
 async def clear_peak(redis, owner_id, symbol) -> None:
     """Master closed the leg — the next position starts from a clean peak."""
     if not redis or not symbol:

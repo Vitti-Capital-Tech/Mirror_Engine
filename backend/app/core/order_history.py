@@ -22,17 +22,24 @@ Design notes
   They are genuinely different events anyway: "the master rested this" and "the
   master's order filled".
 
-* Every write here runs through asyncio.to_thread. The Supabase client is
-  SYNCHRONOUS, so a call from the event loop blocks it entirely — and these run
-  on the mirror hot path, behind the per-symbol lock, where a ~200ms stall
-  lengthens the queue for every event behind it. Recording is not on the critical
-  path: the ORDER must reach the exchange fast, the row can land a moment later.
+* Writes are made DIRECTLY from the event loop, not via asyncio.to_thread.
+  to_thread looked like free latency — the Supabase client is synchronous, so a
+  call from the loop blocks it — but the client is SHARED process-wide and using
+  it from pool threads concurrently with the loop's own calls corrupts it. The
+  symptom is Cloudflare 400s ("JSON could not be generated") landing on unrelated
+  callers: position_monitor, the positions API, wallet reads. That error had
+  occurred 3 times in five weeks; it happened 11 times in the first hour after
+  to_thread shipped, so the concurrency was removed rather than optimised.
+
+  Keeping these off the CRITICAL path is what actually mattered, and
+  asyncio.create_task already does that: the order reaches the exchange without
+  waiting for its own bookkeeping. The brief loop block during the write is the
+  same cost every other Supabase call in this codebase already pays.
 
 * Nothing here may raise into the caller. A history write failing must never stop
   a copy from being placed.
 """
 
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -46,9 +53,13 @@ def order_stage_id(master_order_id) -> str:
 
 
 async def _run(fn, *a, **kw):
-    """Run a blocking Supabase call off the event loop, swallowing failures."""
+    """Run a Supabase call, swallowing failures.
+
+    Deliberately NOT asyncio.to_thread — see the module docstring. The shared
+    Supabase client cannot be driven from pool threads alongside the event loop.
+    """
     try:
-        return await asyncio.to_thread(fn, *a, **kw)
+        return fn(*a, **kw)
     except Exception as e:
         logger.warning(f"order_history: {getattr(fn, '__name__', fn)} failed: {e}")
         return None
