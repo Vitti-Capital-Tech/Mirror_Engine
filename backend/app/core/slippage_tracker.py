@@ -46,13 +46,16 @@ class SlippageTracker:
         
         try:
             # Update trade_copies table
+            # Deliberately does NOT write `status`. It used to hardcode 'filled',
+            # which made this the second writer of a column the executor owns —
+            # and a partial fill would have been stamped 'filled' here moments
+            # before the executor recorded it as 'partial'.
             db.table("trade_copies").update({
                 "execution_price": follower_price,
                 "quantity": quantity,
                 "slippage_points": points,
                 "slippage_pct": pct,
                 "execution_time_ms": execution_time_ms,
-                "status": "filled"
             }).eq("id", trade_copy_id).execute()
             
             # Check alert threshold (0.03%)

@@ -195,6 +195,36 @@ class CopyEngine:
         self._master_exit_cache: dict = {}  # {symbol: (reason, ts)}
         self._MASTER_EXIT_TTL = 20.0  # seconds
 
+    def _record_skipped_copy(self, trade_uuid, follower: dict, reason: str, requested=None) -> None:
+        """Write a 'skipped' trade_copies row for a follower we deliberately did
+        NOT send an order to.
+
+        Without this the trade history shows the master trade with ZERO follower
+        legs, which reads identically to "the copy engine never ran" — 30 of the
+        53 trades on record are in that state. A deliberate skip is a legitimate
+        outcome and belongs in the history next to the fills, so the page can be
+        reconciled against the exchange instead of leaving gaps to guess at."""
+        row = {
+            "trade_id": trade_uuid,
+            "account_id": follower["id"],
+            "status": "skipped",
+            "quantity": 0,
+            "requested_quantity": requested,
+            "failure_reason": reason,
+            "owner_id": follower.get("owner_id"),
+        }
+        try:
+            self.db.table("trade_copies").insert(row).execute()
+        except Exception as e:
+            # requested_quantity arrives with 003_partial_fill_accounting.sql —
+            # still record the skip on a pre-migration database, just without it.
+            try:
+                self.db.table("trade_copies").insert(
+                    {k: v for k, v in row.items() if k != "requested_quantity"}
+                ).execute()
+            except Exception:
+                logger.warning(f"Could not record skipped copy for {follower.get('name')}: {e}")
+
     async def process_fill(self, event_dict: dict) -> None:
         """
         Process a master fill event:
@@ -394,10 +424,12 @@ class CopyEngine:
                             f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
                             f"target {int(target)} (master left {master_remaining:.0f})"
                         )
+                        skip_reason = f"already at target {int(target)} (holds {current:.0f})"
                         await ledger.record_follower_leg(
                             self.redis, master_trade_id, follower["id"], status="skipped",
-                            reason=f"already at target {int(target)} (holds {current:.0f})",
+                            reason=skip_reason,
                         )
+                        self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
                         continue
             else:
                 # Only open if the master genuinely holds a same-side position.
@@ -412,10 +444,12 @@ class CopyEngine:
                         f"Skipping follower OPEN for {follower['name']} {symbol} {side}: "
                         f"master holds {master_signed_now:+.0f} — not a genuine open (likely an unflagged close)."
                     )
+                    skip_reason = f"not a genuine open (master holds {master_signed_now:+.0f})"
                     await ledger.record_follower_leg(
                         self.redis, master_trade_id, follower["id"], status="skipped",
-                        reason=f"not a genuine open (master holds {master_signed_now:+.0f})",
+                        reason=skip_reason,
                     )
+                    self._record_skipped_copy(trade_uuid, follower, skip_reason)
                     continue
                 follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
 
@@ -447,19 +481,32 @@ class CopyEngine:
             acct = r.get("account_name") or "Follower"
             st = r.get("status")
             if r.get("account_id"):
+                # A 'partial' leg DID execute, so the ledger records it as filled
+                # (with the lots it got) rather than failed — it must not show up
+                # as a missing follower, which would send the reconciler chasing a
+                # leg that exists. The shortfall travels in `reason`.
                 await ledger.record_follower_leg(
                     self.redis, master_trade_id, r["account_id"],
-                    status="filled" if st == "filled" else ("skipped" if st in ("skipped", "skipped_circuit_breaker") else "failed"),
+                    status="filled" if st in ("filled", "partial") else ("skipped" if st in ("skipped", "skipped_circuit_breaker") else "failed"),
                     qty=r.get("filled_quantity"),
                     reason=r.get("failure_reason"),
                 )
-            if st == "filled":
+            if st in ("filled", "partial"):
                 lots = r.get("filled_quantity")
                 px = r.get("execution_price")
                 if is_exit:
                     asyncio.create_task(tg.notify_close(acct, symbol, lots, px))
                 else:
                     asyncio.create_task(tg.notify_open(acct, symbol, side, lots, px))
+                if st == "partial":
+                    # Sent as a failure notification on purpose: an out-of-proportion
+                    # follower is the thing the desk needs told about, and the
+                    # notify_open/close above only says what DID fill.
+                    key = f"partial:{r.get('account_id')}:{symbol}:{side}:{'exit' if is_exit else 'entry'}"
+                    asyncio.create_task(tg.notify_fail(
+                        acct, symbol, side, None,
+                        r.get("failure_reason") or "partial fill", key=key,
+                    ))
             elif st == "failed":
                 reason = r.get("failure_reason") or "order not filled"
                 key = f"fail:{r.get('account_id')}:{symbol}:{side}:{'exit' if is_exit else 'entry'}"
@@ -467,15 +514,21 @@ class CopyEngine:
 
         # 5. Determine final master trade status
         filled_count = sum(1 for r in results if r.get("status") == "filled")
+        partial_count = sum(1 for r in results if r.get("status") == "partial")
         failed_count = sum(1 for r in results if r.get("status") == "failed")
         skipped_count = sum(1 for r in results if r.get("status") in ("skipped", "skipped_circuit_breaker"))
 
         final_status = "copied"
         if failed_count > 0:
-            if filled_count > 0:
+            if filled_count or partial_count:
                 final_status = "partial"
             else:
                 final_status = "failed"
+        elif partial_count > 0:
+            # Every leg executed, but at least one is out of proportion with the
+            # master. That is not a clean 'copied' — it used to report as one
+            # because a short fill was indistinguishable from a full one here.
+            final_status = "partial"
         elif filled_count == 0 and skipped_count > 0:
             final_status = "failed"
 

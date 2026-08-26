@@ -90,31 +90,40 @@ class DeltaClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def _get_json(self, path: str) -> dict | list | None:
+        """Signed GET returning the parsed body, or None on a non-200/error."""
+        resp = await self._client.get(
+            f"{self.rest_url}{path}", headers=self._get_headers("GET", path)
+        )
+        if resp.status_code != 200:
+            logger.warning(f"GET {path} returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.json()
+
     async def get_positions(self) -> list:
-        """Fetch all open positions — both futures (margined) and options."""
-        all_positions = []
+        """Fetch all open positions — both futures (margined) and options.
 
-        # 1. Futures / margined positions
-        try:
-            path = "/v2/positions/margined"
-            headers = self._get_headers("GET", path)
-            resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
-            if resp.status_code == 200:
-                all_positions.extend(resp.json().get("result", []))
-        except Exception as e:
-            logger.warning(f"Could not fetch margined positions: {e}")
+        The two legs run CONCURRENTLY. They used to be awaited one after the
+        other, which put two full round-trips in front of every position read —
+        and the exit path reads positions up to three times (master signed,
+        master remaining, follower held) before it places an order, so the
+        serialisation was costing several hundred ms on the hot copy path for no
+        reason: neither call depends on the other."""
+        margined, options = await asyncio.gather(
+            self._get_json("/v2/positions/margined"),
+            self._get_json("/v2/positions?product_types=put_options,call_options"),
+            return_exceptions=True,
+        )
 
-        # 2. Options positions
-        try:
-            path = "/v2/positions?product_types=put_options,call_options"
-            headers = self._get_headers("GET", path)
-            resp = await self._client.get(f"{self.rest_url}{path}", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                opts = data.get("result", []) if isinstance(data, dict) else data
-                all_positions.extend(opts)
-        except Exception as e:
-            logger.warning(f"Could not fetch options positions: {e}")
+        all_positions: list = []
+        for label, res in (("margined", margined), ("options", options)):
+            if isinstance(res, BaseException):
+                logger.warning(f"Could not fetch {label} positions: {res}")
+                continue
+            if res is None:
+                continue
+            rows = res.get("result", []) if isinstance(res, dict) else res
+            all_positions.extend(rows or [])
 
         return all_positions
 

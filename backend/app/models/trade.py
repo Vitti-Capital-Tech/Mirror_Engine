@@ -29,6 +29,10 @@ class TradeStatus(str, Enum):
 class CopyStatus(str, Enum):
     pending = "pending"
     filled = "filled"
+    # An order that executed for LESS than the follower's proportional target.
+    # Distinct from 'filled' because the follower is left out of proportion with
+    # the master, which is a problem to surface, not a success to hide.
+    partial = "partial"
     failed = "failed"
     skipped = "skipped"
     retrying = "retrying"
@@ -61,6 +65,10 @@ class TradeCopyResult(BaseModel):
     slippage_pct: Optional[float] = None
     execution_time_ms: Optional[int] = None
     failure_reason: Optional[str] = None
+    # What actually filled vs what the proportional target was. Both are needed
+    # to judge a copy: "3 lots" is only meaningful against the 3 (or 34) asked for.
+    quantity: Optional[float] = None
+    requested_quantity: Optional[float] = None
 
 
 class TradeResponse(BaseModel):
@@ -83,6 +91,7 @@ class TradeResponse(BaseModel):
 class TradeStatsResponse(BaseModel):
     total_trades: int
     successful_copies: int
+    partial_copies: int = 0
     failed_copies: int
     success_rate_pct: float
     avg_slippage_pct: float

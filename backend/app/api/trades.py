@@ -26,7 +26,7 @@ async def list_trades(
     """List the caller's trades with pagination and joined copy details."""
     try:
         # Construct query
-        query = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)"), user)
+        query = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, quantity, requested_quantity, execution_price, slippage_pct, execution_time_ms, failure_reason)"), user)
 
         if symbol:
             query = query.eq("symbol", symbol.upper())
@@ -50,6 +50,8 @@ async def list_trades(
                     "account_id": copy.get("account_id"),
                     "account_name": account_name,
                     "status": copy.get("status"),
+                    "quantity": copy.get("quantity"),
+                    "requested_quantity": copy.get("requested_quantity"),
                     "execution_price": copy.get("execution_price"),
                     "slippage_pct": copy.get("slippage_pct"),
                     "execution_time_ms": copy.get("execution_time_ms"),
@@ -72,24 +74,30 @@ async def get_trade_stats(user: CurrentUser = Depends(get_current_user)):
         
         total_copies = len(copies)
         successful_copies = sum(1 for c in copies if c["status"] == "filled")
+        partial_copies = sum(1 for c in copies if c["status"] == "partial")
         failed_copies = sum(1 for c in copies if c["status"] == "failed")
-        
+
+        # A partial is NOT a success: the follower executed, but not in proportion
+        # to the master. Counting it as one is what let short fills read as a 100%
+        # success rate.
         success_rate_pct = (successful_copies / total_copies * 100) if total_copies > 0 else 100.0
-        
-        # Slippage calculations
+
+        # ...but it DID execute, so its price and latency are real samples and
+        # belong in the slippage/latency averages.
+        executed = ("filled", "partial")
         slippages = [
-            float(c["slippage_pct"]) 
-            for c in copies 
-            if c["status"] == "filled" and c.get("slippage_pct") is not None
+            float(c["slippage_pct"])
+            for c in copies
+            if c["status"] in executed and c.get("slippage_pct") is not None
         ]
         avg_slippage_pct = (sum(slippages) / len(slippages)) if slippages else 0.0
         max_slippage_pct = max(slippages) if slippages else 0.0
         
         # Execution latency
         latencies = [
-            int(c["execution_time_ms"]) 
-            for c in copies 
-            if c["status"] == "filled" and c.get("execution_time_ms") is not None
+            int(c["execution_time_ms"])
+            for c in copies
+            if c["status"] in executed and c.get("execution_time_ms") is not None
         ]
         avg_execution_time_ms = (sum(latencies) / len(latencies)) if latencies else 0.0
         
@@ -100,6 +108,7 @@ async def get_trade_stats(user: CurrentUser = Depends(get_current_user)):
         return {
             "total_trades": total_trades,
             "successful_copies": successful_copies,
+            "partial_copies": partial_copies,
             "failed_copies": failed_copies,
             "success_rate_pct": round(success_rate_pct, 2),
             "avg_slippage_pct": round(avg_slippage_pct, 6),
@@ -205,7 +214,7 @@ async def ledger_by_symbol(
 async def get_trade(id: str, user: CurrentUser = Depends(get_current_user)):
     """Fetch details of a single trade by ID (must be owned)."""
     try:
-        res = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, execution_price, slippage_pct, execution_time_ms, failure_reason)").eq("id", id), user).execute()
+        res = scope_owned(db.table("trades").select("*, copies:trade_copies(account_id, accounts(name), status, quantity, requested_quantity, execution_price, slippage_pct, execution_time_ms, failure_reason)").eq("id", id), user).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Trade not found.")
             

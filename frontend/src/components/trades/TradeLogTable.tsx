@@ -54,6 +54,7 @@ export function TradeLogTable({
     const s = status?.toLowerCase();
     const base = 'inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold';
     if (s === 'filled') return <span className={`${base} bg-emerald-500/10 text-emerald-400`}>FILLED</span>;
+    if (s === 'partial') return <span className={`${base} bg-amber-500/10 text-amber-400`}>PARTIAL</span>;
     if (s === 'skipped') return <span className={`${base} bg-slate-500/10 text-slate-300`}>SKIPPED</span>;
     if (s === 'retrying') return <span className={`${base} bg-blue-500/10 text-blue-400`}>RETRYING</span>;
     return <span className={`${base} bg-red-500/10 text-red-400`}>FAILED</span>;
@@ -110,6 +111,9 @@ export function TradeLogTable({
                   
                   const copies = trade.copies || [];
                   const filledCopiesCount = copies.filter((c: any) => c.status === 'filled').length;
+                  // A partial executed but is out of proportion with the master, so it
+                  // counts as neither filled nor failed — it gets its own amber state.
+                  const partialCopiesCount = copies.filter((c: any) => c.status === 'partial').length;
 
                   return (
                     <React.Fragment key={trade.id}>
@@ -133,13 +137,13 @@ export function TradeLogTable({
                         <td className="text-right font-mono text-text-primary">{Number(trade.entry_price).toFixed(2)}</td>
                         <td className="text-center">
                           <span
-                            title={`${filledCopiesCount} of ${copies.length} follower${copies.length === 1 ? '' : 's'} filled`}
+                            title={`${filledCopiesCount} of ${copies.length} follower${copies.length === 1 ? '' : 's'} filled${partialCopiesCount ? `, ${partialCopiesCount} partial` : ''}`}
                             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold font-mono ${
                               copies.length === 0
                                 ? 'bg-bg-secondary text-text-muted'
                                 : filledCopiesCount === copies.length
                                   ? 'bg-emerald-500/10 text-emerald-400'
-                                  : filledCopiesCount === 0
+                                  : filledCopiesCount === 0 && partialCopiesCount === 0
                                     ? 'bg-red-500/10 text-red-400'
                                     : 'bg-amber-500/10 text-amber-400'
                             }`}
@@ -169,6 +173,7 @@ export function TradeLogTable({
                                     <thead>
                                       <tr className="text-text-muted uppercase font-bold text-[9px] bg-bg-secondary/60 select-none">
                                         <th className="py-2.5 px-4">Follower</th>
+                                        <th className="text-right px-4">Lots</th>
                                         <th className="text-right px-4">Exec Price</th>
                                         <th className="text-right px-4">Slippage</th>
                                         <th className="text-right px-4">Latency</th>
@@ -184,11 +189,22 @@ export function TradeLogTable({
                                         return (
                                           <tr key={index} className="hover:bg-bg-secondary/30 transition-colors">
                                             <td className="py-2.5 px-4 text-text-primary font-bold">{copy.account_name}</td>
+                                            <td className="text-right px-4 font-mono">
+                                              {copy.requested_quantity != null && Number(copy.requested_quantity) !== Number(copy.quantity ?? 0) ? (
+                                                <span className="text-amber-400" title="lots filled of the proportional target">
+                                                  {Number(copy.quantity ?? 0).toFixed(0)}/{Number(copy.requested_quantity).toFixed(0)}
+                                                </span>
+                                              ) : (
+                                                <span className="text-text-primary">
+                                                  {copy.quantity != null ? Number(copy.quantity).toFixed(0) : '-'}
+                                                </span>
+                                              )}
+                                            </td>
                                             <td className="text-right px-4 font-mono text-text-primary">
                                               {copy.execution_price ? Number(copy.execution_price).toFixed(2) : '-'}
                                             </td>
                                             <td className="text-right px-4 font-mono">
-                                              {copy.status === 'filled' ? (
+                                              {copy.status === 'filled' || copy.status === 'partial' ? (
                                                 <span className={`inline-flex items-center justify-end gap-1 ${isHighSlippage ? 'text-red-400 font-bold' : 'text-emerald-400'}`}>
                                                   {isHighSlippage && <AlertTriangle className="w-3 h-3" />}
                                                   {slippagePct.toFixed(4)}%
