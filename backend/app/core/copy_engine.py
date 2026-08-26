@@ -1919,11 +1919,22 @@ class CopyEngine:
 
         _hist_outcomes: list = []
 
-        def _hist_leg(fol: dict, **kw):
-            """Record one follower's leg of this order, off the hot path."""
+        def _hist_leg(fol: dict, once: bool = False, **kw):
+            """Record one follower's leg of this order, off the hot path.
+
+            once=True writes at most one row per (order, follower) ever, guarded by
+            a Redis marker. Used from the already-mirrored short-circuits: those
+            fire on every 30s reconcile pass, and that fast path exists precisely
+            to do no work — but without recording there, an order mirrored before
+            this code existed would never get a leg at all, leaving the row
+            looking like the engine never ran."""
             _hist_outcomes.append(kw.get("status"))
             async def _go():
                 try:
+                    if once:
+                        mk = f"histleg:{master_order_id}:{fol.get('id')}"
+                        if not await self.redis.set(mk, "1", nx=True, ex=7 * 24 * 3600):
+                            return
                     await oh.record_leg(self.db, await _hist_trade, master_order_id, fol, **kw)
                 except Exception as e:
                     logger.debug(f"history: leg not recorded for {fol.get('name')}: {e}")
@@ -2049,8 +2060,12 @@ class CopyEngine:
                     # on P-BTC-62800-040826, 2026-08-04, came from exactly that).
                     done_key = f"mirrordone:{master_order_id}:{follower['id']}"
                     if await self.redis.get(done_key):
+                        _hist_leg(follower, once=True, status="pending",
+                                  follower_order_id=mapped)
                         continue
                     if await self._order_is_live(client, mapped, follower["id"]):
+                        _hist_leg(follower, once=True, status="pending",
+                                  follower_order_id=mapped)
                         continue
                     # Not resting any more — but WHY matters. A mirror that FILLED
                     # has done its job and must never be re-placed; only one that was
