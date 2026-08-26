@@ -477,14 +477,25 @@ def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[
                 l for r in rows if (r["symbol"], r["side"]) == key
                 for l in r["legs"] if l["account_id"] == acc["id"]
             ]
-            # Target: prefer the sum of what the engine actually asked for across
-            # the group's rungs; fall back to scaling the group's master lots.
-            recorded = [l["target_lots"] for l in legs if l.get("target_basis", "").startswith("recorded")]
-            if recorded and len(recorded) == len(legs):
-                target, basis = sum(recorded), "recorded (sum of what the engine asked for)"
-            else:
-                target, basis = expected_lots(master_lots, acc, st["master"])
-                basis = f"derived — {basis}"
+            # Target is ALWAYS the ratio applied to the group's master lots —
+            # never the sum of the recorded per-order requests.
+            #
+            # The two bases are not interchangeable at this level, because
+            # `filled` below sums EVERY follower fill on this symbol and side,
+            # including reconciler top-ups whose master order is not one of these
+            # rungs. Summing recorded requests therefore under-counts the target
+            # for exactly those fills. Observed 2026-08-26: on C-BTC-81200 the
+            # buy side had complete leg records (sum 12) and read "over" at 29
+            # filled, while the sell side of the same symbol fell back to the
+            # derived target (29) and read matched — the same follower, the same
+            # day, graded two different ways by an accident of which legs got
+            # written down.
+            #
+            # `recorded` stays the right basis on the per-ORDER rows, where it
+            # measures execution fidelity against one specific request. Here the
+            # question is proportional position, so the ratio is the answer.
+            target, basis = expected_lots(master_lots, acc, st["master"])
+            basis = f"derived — {basis}"
 
             filled = sum(g["lots"] for g in st["groups"]
                          if (g.get("symbol"), g.get("side")) == key)
