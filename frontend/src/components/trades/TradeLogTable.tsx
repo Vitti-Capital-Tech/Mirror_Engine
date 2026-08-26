@@ -43,6 +43,16 @@ export function TradeLogTable({
         </span>
       );
     }
+    // A row still being dispatched. It used to fall through to the red FAILED
+    // default below, so a trade mid-flight — and every order-stage row before its
+    // status was rolled up — read as a failure.
+    if (s === 'processing') {
+      return (
+        <span className="bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2 py-0.5 rounded text-[10px] font-bold">
+          WORKING
+        </span>
+      );
+    }
     return (
       <span className="bg-red-500/10 text-red-400 border border-red-500/20 px-2 py-0.5 rounded text-[10px] font-bold">
         FAILED

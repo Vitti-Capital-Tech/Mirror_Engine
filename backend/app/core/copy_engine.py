@@ -1917,13 +1917,39 @@ class CopyEngine:
             owner_id=owner_id,
         ))
 
+        _hist_outcomes: list = []
+
         def _hist_leg(fol: dict, **kw):
             """Record one follower's leg of this order, off the hot path."""
+            _hist_outcomes.append(kw.get("status"))
             async def _go():
                 try:
                     await oh.record_leg(self.db, await _hist_trade, master_order_id, fol, **kw)
                 except Exception as e:
                     logger.debug(f"history: leg not recorded for {fol.get('name')}: {e}")
+            asyncio.create_task(_go())
+
+        def _hist_rollup():
+            """Roll the order-stage row up from 'processing' to a final status.
+
+            Without this the row sat at 'processing' forever — and the Trades page
+            renders anything that is not copied/partial as a red FAILED, so every
+            correctly mirrored resting order read as a failure."""
+            placed = sum(1 for st in _hist_outcomes if st == "pending")
+            failed = sum(1 for st in _hist_outcomes if st == "failed")
+            if failed and placed:
+                status = "partial"
+            elif failed:
+                status = "failed"
+            else:
+                # Placed, or deliberately skipped (already at target, nothing to
+                # protect): either way the order was handled.
+                status = "copied"
+            async def _go():
+                try:
+                    await oh.record_order_status(self.db, await _hist_trade, status)
+                except Exception as e:
+                    logger.debug(f"history: order status not recorded: {e}")
             asyncio.create_task(_go())
 
         # Is this the master's PROTECTION (SL/TP) rather than a directional order?
@@ -2109,6 +2135,8 @@ class CopyEngine:
                                 self.redis, master_order_id, follower["id"],
                                 status="placed", follower_order_id=foid,
                             )
+                            _hist_leg(follower, status="pending", requested=qty,
+                                      follower_order_id=foid)
                         logger.info(f"Mirrored bracket {master_order_id} ({stop_order_type}, trigger={trigger_method}) -> {follower['name']}")
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
@@ -2361,6 +2389,9 @@ class CopyEngine:
                 asyncio.create_task(tg.notify_fail(
                     follower.get("name"), symbol, side, int(qty), _short_reason(e, body), key=key,
                 ))
+
+        # Every follower decided — settle the order-stage row's status.
+        _hist_rollup()
 
     @staticmethod
     def _order_done(od: dict) -> bool:
