@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from app.config import settings
 from app.core import daily_report as dr
 from app.core import fill_compare as fc
+from app.core import order_compare as oc
 from app.core.auth import CurrentUser, get_current_user, require_admin
 from app.database import db
 
@@ -69,7 +70,7 @@ async def _build(user: CurrentUser, owner_id, day, start, end) -> dict:
     owner = _resolve_owner(user, owner_id)
     s, e, d = _resolve_window(day, start, end)
     try:
-        out = await fc.compare_for_owner(db, owner, s, e)
+        out = await oc.compare_for_owner(db, owner, s, e)
     except Exception as ex:
         logger.error(f"Comparison failed for owner {owner}: {ex}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(ex))
@@ -159,7 +160,7 @@ async def send_report_now(
         # An admin's own accounts are usually empty, so a manual send from the
         # admin console covers every tenant — the same thing the scheduler sends.
         return await dr.send_daily_report(db, day, redis=_redis, force=True)
-    cmp = await fc.compare_for_day(db, user.id, day)
+    cmp = await oc.compare_for_day(db, user.id, day)
     text = dr.render_telegram(cmp)
     from app.services import telegram_client as tg
     ok = await tg.send_message(text)

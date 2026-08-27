@@ -145,6 +145,47 @@ class DeltaClient:
         data = resp.json()
         return data.get("result", []) if isinstance(data, dict) else (data or [])
 
+    async def get_order_history_range(
+        self,
+        start_time_us: int,
+        end_time_us: int,
+        page_size: int = 200,
+        max_pages: int = 25,
+    ) -> list:
+        """Every ORDER in a time window — placed, filled, cancelled alike.
+
+        Fills alone cannot answer "did the follower punch the right order?": an
+        order that was placed at the wrong size and then unwound leaves fills
+        that net out correctly, and an order the master cancelled without filling
+        leaves no fill at all. Both are exactly what the comparison needs to see.
+
+        Same cursor pagination as get_fills_range; get_order_history() takes only
+        a page_size and so silently truncates a busy day.
+        """
+        out: list = []
+        after: Optional[str] = None
+        for _ in range(max_pages):
+            path = (
+                f"/v2/orders/history?start_time={int(start_time_us)}"
+                f"&end_time={int(end_time_us)}&page_size={page_size}"
+            )
+            if after:
+                path += f"&after={after}"
+            try:
+                data = await self._get_json(path)
+            except Exception as e:
+                logger.warning(f"get_order_history_range failed: {e}")
+                break
+            if data is None:
+                break
+            rows = data.get("result", []) if isinstance(data, dict) else (data or [])
+            out.extend(rows or [])
+            meta = data.get("meta") or {} if isinstance(data, dict) else {}
+            after = meta.get("after")
+            if not after or len(rows or []) < page_size:
+                break
+        return out
+
     async def get_fills_range(
         self,
         start_time_us: int,

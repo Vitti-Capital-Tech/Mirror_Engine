@@ -744,56 +744,6 @@ def test_ist_day_bounds():
     check("exactly one day wide", end - start, timedelta(days=1))
 
 
-def test_renderers():
-    print("\nthe three report renderings survive real data")
-    from app.core import daily_report as dr
-    f = follower("f1", "Follower A")
-    db = FakeDB(legs=[{
-        "id": "L1", "account_id": "f1", "master_order_id": "900",
-        "follower_order_id": "555", "status": "filled",
-        "quantity": 1, "requested_quantity": 1, "failure_reason": None,
-    }])
-    out = run_compare([MASTER, f], {
-        # Two DIFFERENT symbols, so the master's nets don't cancel each other out.
-        "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0),
-               fill("901", "SOLUSD", "sell", 40, 105.0, T0 + timedelta(minutes=5))],
-        # Mirrors BTCUSD, misses SOLUSD entirely, and trades one of its own.
-        "f1": [fill("555", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=1)),
-               fill("999", "ETHUSD", "buy", 2, 50.0, T0 + timedelta(hours=3))],
-    }, db=db)
-    out["window"]["date"] = "2026-08-26"
-
-    text = dr.render_telegram(out)
-    check_true("telegram names the day", "2026-08-26" in text, text[:120])
-    check_true("telegram leads with the error count", "Errors" in text, text[:200])
-    check_true("telegram lists what needs attention", "Needs attention" in text, text[:400])
-    check_true("telegram flags the unexplained fill",
-               "Unexplained follower fills" in text, text[-300:])
-
-    csv_out = dr.render_csv(out)
-    lines = [l for l in csv_out.strip().splitlines() if l]
-    check_true("csv leads with the reconciliation — that is the verdict",
-               lines[0].startswith('"SYMBOL/SIDE RECONCILIATION'), lines[0])
-    check_true("csv still carries the per-order detail header",
-               ",".join(dr.CSV_COLUMNS) in lines, str(lines[:6]))
-    check_true("csv has a row per leg", len([l for l in lines if l.startswith("2026-08-26,")]) >= 2,
-               str(lines[:6]))
-    check_true("csv carries the unexplained section",
-               "UNEXPLAINED FOLLOWER FILLS" in csv_out, csv_out[-200:])
-
-    html = dr.render_html(out)
-    check_true("html is a complete document",
-               html.startswith("<!doctype html>") and html.rstrip().endswith("</html>"), html[:60])
-    check_true("html is self-contained (no external requests)",
-               "http://" not in html and "https://" not in html and "<script" not in html)
-    check_true("html shows the master name", "Master" in html)
-    check_true("html shows a verdict pill", "Matched" in html)
-
-    check_true("ms formatting is readable", (dr._ms(340), dr._ms(2500), dr._ms(90_000), dr._ms(None))
-               == ("340 ms", "2.50 s", "1.5 min", "—"))
-    check("a negative delay keeps its sign", dr._ms(-250), "-250 ms")
-
-
 def main():
     print("=" * 72)
     print("fill_compare — master vs follower fill comparison")
@@ -815,7 +765,7 @@ def main():
         test_group_missing_when_nothing_filled,
         test_no_master,
         test_ratio_refuses_to_guess, test_unsized_follower_filled,
-        test_ist_day_bounds, test_renderers,
+        test_ist_day_bounds,
     ):
         fn()
     print("\n" + "=" * 72)

@@ -1,21 +1,23 @@
-"""The daily "do the accounts match?" report — Telegram summary, CSV, and a
-shareable HTML doc.
+"""The daily "do the orders match?" report — Telegram summary, CSV, shareable doc.
 
-Three renderings of the same comparison, because they answer the question at
-three different depths:
+Renders the ORDER-level comparison (app.core.order_compare). It deliberately no
+longer reports net position as the verdict: the 15s reconciler repairs position,
+so a position-based report can only ever say "matched" — it scored 2026-08-27 as
+a clean day while the engine was punching double-sized orders and unwinding them
+a minute later. Orders record what the engine actually did, before anything
+cleaned up after it.
 
-* Telegram — the one-screen answer. Read on a phone, first thing. It leads with
-  the mismatch and error counts because those are the only reason to open the
-  full report.
-* CSV — one row per (master order, follower) leg, for anyone who wants to sort,
-  filter or diff it in a spreadsheet.
-* HTML — the shareable doc. Self-contained (no external CSS, no fonts, no
-  scripts) so it survives being attached to a message, opened offline, or
-  printed to PDF without turning into unstyled text.
+Three renderings, because the question gets asked at three depths:
+
+* Telegram — the one-screen answer, read on a phone. Leads with the mismatch
+  count and names the worst offenders, since a bare count just means opening the
+  full report to find out what broke.
+* CSV — one row per (master order, follower), for sorting and pivoting.
+* HTML — the shareable doc. Self-contained (no external CSS, fonts or scripts) so
+  it survives being attached to a message, opened offline, or printed to PDF.
 
 The scheduler runs once per IST day and is idempotent through a Redis marker, so
-a backend restart — which happens on every deploy — cannot re-send a report that
-already went out.
+the restart on every deploy cannot re-send a report that already went out.
 """
 
 import asyncio
@@ -26,6 +28,7 @@ from datetime import date, datetime, timedelta
 from html import escape
 
 from app.core import fill_compare as fc
+from app.core import order_compare as oc
 from app.services import telegram_client as tg
 
 logger = logging.getLogger(__name__)
@@ -36,11 +39,13 @@ _SENT_TTL = 60 * 60 * 72
 
 _VERDICT_LABEL = {
     "matched": "Matched",
-    "ladder": "Ladder rung",
-    "short": "Short fill",
+    "oversized": "Over-punched",
+    "undersized": "Under-punched",
     "missing": "Missing",
-    "over": "Over-filled",
-    "resting": "Resting",
+    "cancel_missed": "Cancel missed",
+    "extra": "Unwanted fill",
+    "cancelled_ok": "Cancelled OK",
+    "ladder": "Ladder rung",
     "skipped": "Skipped",
     "unsized": "No target",
     "unreadable": "Unreadable",
@@ -62,15 +67,28 @@ def _ms(v) -> str:
 
 
 def _lots(v) -> str:
-    if v is None:
-        return "—"
-    return f"{float(v):g}"
+    return "—" if v is None else f"{float(v):g}"
 
 
-def _clock(iso: str | None) -> str:
+def _ratio(v) -> str:
+    return "—" if v is None else f"{float(v):.5f}"
+
+
+def _clock(iso) -> str:
     """ISO timestamp → HH:MM:SS in IST, the timezone the desk thinks in."""
     dt = fc.parse_ts(iso)
     return dt.astimezone(fc.IST).strftime("%H:%M:%S") if dt else "—"
+
+
+def _bad_legs(cmp: dict) -> list:
+    """Every mismatched leg, worst first, with its master order attached."""
+    out = []
+    for r in cmp.get("rows") or []:
+        for l in r["legs"]:
+            if l["verdict"] in oc.MISMATCH_VERDICTS:
+                out.append((r, l))
+    out.sort(key=lambda rl: -oc._SEVERITY.get(rl[1]["verdict"], 0))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -81,79 +99,54 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
     s = cmp["summary"]
     m = cmp.get("master") or {}
     day = cmp["window"].get("date") or cmp["window"]["start"][:10]
-    verdict_ok = s["errors"] == 0 and not cmp.get("warnings")
+    ok = s["errors"] == 0 and not cmp.get("warnings")
 
-    head = "✅" if verdict_ok else ("🚨" if s["errors"] else "⚠️")
+    head = "✅" if ok else ("🚨" if s["errors"] else "⚠️")
     lines = [
-        f"{head} <b>Fill Match Report — {day}</b>" + (f" · {escape(label)}" if label else ""),
+        f"{head} <b>Order Match Report — {day}</b>" + (f" · {escape(label)}" if label else ""),
         "",
         f"<b>Master</b> {escape(str(m.get('name') or '—'))}: "
         f"{m.get('order_count', 0)} orders, {_lots(m.get('lots'))} lots",
         f"<b>Match rate</b> {s['match_rate_pct']}%  "
-        f"({s['groups_matched']}/{s['groups']} symbols reconcile on net position"
-        f" · {s['master_orders']} master orders)",
-        f"<b>Errors</b> {s['errors']}"
-        + (f"  (missing {s['groups_by_verdict'].get('missing', 0)}, "
-           f"short {s['groups_by_verdict'].get('short', 0)}, "
-           f"over {s['groups_by_verdict'].get('over', 0)})" if s["errors"] else ""),
-        f"<b>Delay</b> median {_ms(s['median_delay_ms'])} · "
-        f"avg {_ms(s['avg_delay_ms'])} · p95 {_ms(s['p95_delay_ms'])} · "
-        f"max {_ms(s['max_delay_ms'])}",
+        f"({s['matched']}/{s['legs']} order legs punched correctly)",
+        f"<b>Unmatched</b> {s['errors']}"
+        + ("  (" + ", ".join(
+            f"{_VERDICT_LABEL.get(v, v).lower()} {s['by_verdict'][v]}"
+            for v in ("oversized", "undersized", "missing", "cancel_missed", "extra")
+            if s["by_verdict"].get(v)
+          ) + ")" if s["errors"] else ""),
+        f"<b>Time diff</b> median {_ms(s['median_time_diff_ms'])} · "
+        f"avg {_ms(s['avg_time_diff_ms'])} · p95 {_ms(s['p95_time_diff_ms'])} · "
+        f"max {_ms(s['max_time_diff_ms'])}",
     ]
-
-    # Churn gets its own headline. It is not a position fault — the account can be
-    # exactly right and still have paid for a wasted round trip to get there —
-    # so it must not be folded into the error count, and must not be omitted.
-    if s.get("churn_symbols"):
-        lines.append(
-            f"<b>Churn</b> {s['churn_symbols']} symbol(s), "
-            f"{_lots(s['excess_churn_lots'])} lots round-tripped beyond the master"
-        )
 
     if s["per_follower"]:
         lines += ["", "<b>Per follower</b>"]
         for f in s["per_follower"]:
             rate = "—" if f["match_rate_pct"] is None else f"{f['match_rate_pct']}%"
             lines.append(
-                f"· {escape(str(f['account_name']))}: {rate} matched, "
-                f"{f['errors']} err, median {_ms(f['median_delay_ms'])}, "
-                f"{_lots(f['filled_lots'])} lots"
+                f"· {escape(str(f['account_name']))} (ratio {_ratio(f['ratio'])}): "
+                f"{rate} matched, {f['errors']} unmatched, "
+                f"median {_ms(f['median_time_diff_ms'])}"
                 + (" ⚠️ unreadable" if f["unreadable"] else "")
             )
 
-    # The worst few rows, named. A count with no examples means opening the full
-    # report to find out what broke, which defeats the point of the summary.
-    bad = [g for g in cmp.get("groups") or [] if g["verdict"] in fc.MISMATCH_VERDICTS]
+    bad = _bad_legs(cmp)
     if bad:
         lines += ["", f"<b>Needs attention</b> ({len(bad)})"]
-        for g in bad[:8]:
+        for r, l in bad[:8]:
             lines.append(
-                f"· {escape(str(g['symbol']))} — "
-                f"{escape(str(g['account_name']))} "
-                f"{_VERDICT_LABEL.get(g['verdict'], g['verdict'])}: "
-                f"net {g['follower_net']:+g} against {g['target_net']:+g} "
-                f"(master net {g['master_net']:+g}"
-                + (f" over {g['master_orders']} rungs" if g["laddered"] else "")
-                + ")"
+                f"· {_clock(r['placed_at'])} {escape(str(r['symbol']))} {r['side']} "
+                f"{_lots(r['master_lots'])} → {escape(str(l['account_name']))} "
+                f"<b>{_VERDICT_LABEL.get(l['verdict'], l['verdict'])}</b>"
+                + (f": {escape(l['note'], quote=False)}" if l.get("note") else "")
             )
         if len(bad) > 8:
             lines.append(f"· …and {len(bad) - 8} more")
 
-    churned = [g for g in (cmp.get("groups") or []) if g.get("churn_flag")]
-    if churned:
-        lines += ["", f"<b>Round-tripping</b> ({len(churned)}) — right position, wasted turnover"]
-        for g in churned[:6]:
-            lines.append(
-                f"· {escape(str(g['symbol']))} — {escape(str(g['account_name']))}: "
-                f"{_lots(g['follower_gross'])} lots gross to hold {g['follower_net']:+g} "
-                f"({_lots(g['excess_churn_lots'])} excess)"
-            )
-        if len(churned) > 6:
-            lines.append(f"· …and {len(churned) - 6} more")
-
-    if cmp.get("unmatched_follower_fills"):
-        lines += ["", f"<b>Unexplained follower fills</b> {len(cmp['unmatched_follower_fills'])}"
-                      " (symbols the master never traded today)"]
+    if cmp.get("extra_follower_orders"):
+        lines += ["", f"<b>Orders on symbols the master never traded</b> "
+                      f"{len(cmp['extra_follower_orders'])}"]
 
     if cmp.get("excluded_followers"):
         names = ", ".join(escape(str(e["name"])) for e in cmp["excluded_followers"])
@@ -170,76 +163,49 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 CSV_COLUMNS = [
-    "date", "master_order_id", "symbol", "side", "order_type",
-    "master_lots", "master_avg_price", "master_first_fill_ist",
-    "follower", "verdict", "link", "follower_order_id",
-    "follower_lots", "target_lots", "target_basis", "follower_avg_price",
-    "follower_first_fill_ist", "delay_ms", "slippage_pct",
-    "place_latency_ms", "leg_status", "note",
+    "date", "time_ist", "symbol", "side", "order_type", "master_order_id",
+    "master_lots", "master_filled", "master_state",
+    "follower", "verdict", "follower_order_id",
+    "punched_lots", "target_lots", "filled_lots", "follower_state",
+    "ratio_actual", "ratio_target", "time_diff_ms", "link", "reason",
 ]
 
 
 def render_csv(cmp: dict) -> str:
-    """One row per (master order, follower) leg.
+    """One row per (master order, follower).
 
-    Deliberately one row per LEG rather than per order: a wide row with a column
-    group per follower cannot be filtered or pivoted, and breaks the moment a
-    follower is added. Every row repeats its master-order columns so any single
+    One row per LEG rather than a wide row per order with a column group per
+    follower: the wide shape cannot be filtered or pivoted and breaks the moment
+    a follower is added. Every row repeats its master-order columns so any single
     row stands on its own.
     """
     day = cmp["window"].get("date") or cmp["window"]["start"][:10]
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    # Lead with the group reconciliation — it IS the verdict. A reader handed
-    # only rung-by-rung rows would have to reconstruct the totals by hand, which
-    # is exactly the mistake that made a laddered exit look like nine misses.
-    if cmp.get("groups"):
-        w.writerow(["SYMBOL/SIDE RECONCILIATION (the verdict — totals, ladder-safe)"])
-        w.writerow(["date", "follower", "symbol", "verdict", "master_orders", "laddered",
-                    "master_net", "target_net", "follower_net",
-                    "master_gross", "follower_gross", "churn_lots", "excess_churn_lots",
-                    "churn_flag", "target_basis", "note", "churn_note"])
-        for g in cmp["groups"]:
-            w.writerow([day, g["account_name"], g["symbol"], g["verdict"],
-                        g["master_orders"], "yes" if g["laddered"] else "no",
-                        _lots(g["master_net"]), _lots(g["target_net"]), _lots(g["follower_net"]),
-                        _lots(g["master_gross"]), _lots(g["follower_gross"]),
-                        _lots(g["churn_lots"]), _lots(g["excess_churn_lots"]),
-                        "yes" if g["churn_flag"] else "no",
-                        g["target_basis"], g["note"], g["churn_note"]])
-        w.writerow([])
-        w.writerow(["PER-ORDER DETAIL (supporting rows)"])
     w.writerow(CSV_COLUMNS)
-    for r in cmp["rows"]:
+    for r in cmp.get("rows") or []:
         for l in r["legs"]:
             w.writerow([
-                day, r["master_order_id"], r["symbol"], r["side"], r.get("order_type") or "",
-                _lots(r["master_lots"]), r.get("master_avg_price") or "",
-                _clock(r["master_first_fill_at"]),
-                l["account_name"], l["verdict"], l.get("link") or "",
-                l.get("follower_order_id") or "",
-                _lots(l.get("filled_lots")), _lots(l.get("target_lots")),
-                l.get("target_basis") or "", l.get("avg_price") or "",
-                _clock(l.get("first_fill_at")),
-                "" if l.get("delay_ms") is None else l["delay_ms"],
-                "" if l.get("slippage_pct") is None else l["slippage_pct"],
-                "" if l.get("place_latency_ms") is None else l["place_latency_ms"],
-                l.get("leg_status") or "", l.get("note") or "",
+                day, _clock(r["placed_at"]), r["symbol"], r["side"],
+                r.get("order_type") or "", r["master_order_id"],
+                _lots(r["master_lots"]), _lots(r.get("master_filled")),
+                r.get("master_state") or "",
+                l["account_name"], l["verdict"], l.get("follower_order_id") or "",
+                _lots(l.get("placed_lots")), _lots(l.get("target_lots")),
+                _lots(l.get("filled_lots")), l.get("state") or "",
+                _ratio(l.get("ratio_actual")), _ratio(l.get("ratio_target")),
+                "" if l.get("time_diff_ms") is None else l["time_diff_ms"],
+                l.get("link") or "", l.get("note") or l.get("leg_reason") or "",
             ])
-    # Unexplained follower fills belong in the same file. Shipped as a separate
-    # attachment they get lost; as a trailing section they travel with the data
-    # they contradict.
-    if cmp.get("unmatched_follower_fills"):
+    if cmp.get("extra_follower_orders"):
         w.writerow([])
-        w.writerow(["UNEXPLAINED FOLLOWER FILLS (no master order matched)"])
-        w.writerow(["follower", "follower_order_id", "symbol", "side", "lots",
-                    "avg_price", "first_fill_ist", "master_order_id", "explanation"])
-        for u in cmp["unmatched_follower_fills"]:
-            w.writerow([
-                u["account_name"], u["follower_order_id"], u["symbol"], u["side"],
-                _lots(u["lots"]), u.get("avg_price") or "", _clock(u["first_fill_at"]),
-                u.get("master_order_id") or "", u["explanation"],
-            ])
+        w.writerow(["FOLLOWER ORDERS ON SYMBOLS THE MASTER NEVER TRADED"])
+        w.writerow(["time_ist", "follower", "symbol", "side", "lots", "filled",
+                    "state", "order_id", "explanation"])
+        for e in cmp["extra_follower_orders"]:
+            w.writerow([_clock(e["placed_at"]), e["account_name"], e["symbol"],
+                        e["side"], _lots(e["lots"]), _lots(e["filled"]),
+                        e["state"], e["follower_order_id"], e["explanation"]])
     return buf.getvalue()
 
 
@@ -248,9 +214,10 @@ def render_csv(cmp: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _VERDICT_COLOR = {
-    "matched": "#0f7b46", "short": "#b45309", "over": "#b45309",
-    "missing": "#b91c1c", "resting": "#0369a1", "skipped": "#64748b",
-    "unsized": "#7c3aed", "unreadable": "#b91c1c",
+    "matched": "#0f7b46", "ladder": "#4338ca", "cancelled_ok": "#0f7b46",
+    "oversized": "#b91c1c", "undersized": "#b45309", "missing": "#b91c1c",
+    "cancel_missed": "#b91c1c", "extra": "#b45309",
+    "skipped": "#64748b", "unsized": "#7c3aed", "unreadable": "#b91c1c",
 }
 
 _CSS = """
@@ -258,7 +225,7 @@ _CSS = """
 * { box-sizing: border-box; }
 body { margin:0; padding:32px; background:#f6f7f9; color:#16181d;
        font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
-.wrap { max-width:1180px; margin:0 auto; }
+.wrap { max-width:1280px; margin:0 auto; }
 h1 { font-size:22px; margin:0 0 4px; letter-spacing:-.01em; }
 h2 { font-size:15px; margin:32px 0 10px; text-transform:uppercase;
      letter-spacing:.08em; color:#5b6472; }
@@ -276,6 +243,7 @@ th { text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing
 td { padding:8px 10px; border-bottom:1px solid #f0f2f5; vertical-align:top; }
 tr:last-child td { border-bottom:none; }
 td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+tr.bad td { background:#fff5f5; }
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; }
 .pill { display:inline-block; padding:1px 7px; border-radius:20px; font-size:10.5px;
         font-weight:650; border:1px solid currentColor; white-space:nowrap; }
@@ -302,7 +270,7 @@ def render_html(cmp: dict, *, label: str = "") -> str:
     s = cmp["summary"]
     m = cmp.get("master") or {}
     day = cmp["window"].get("date") or cmp["window"]["start"][:10]
-    title = f"Fill Match Report — {day}"
+    title = f"Order Match Report — {day}"
 
     parts = [
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
@@ -310,169 +278,126 @@ def render_html(cmp: dict, *, label: str = "") -> str:
         f"<title>{escape(title)}</title><style>{_CSS}</style></head><body><div class='wrap'>",
         f"<h1>{escape(title)}</h1>",
         f"<p class='sub'>Master <strong>{escape(str(m.get('name') or '—'))}</strong> vs "
-        f"{len(cmp.get('followers') or [])} follower(s)"
+        f"{len(cmp.get('followers') or [])} active follower(s)"
         + (f" · {escape(label)}" if label else "")
         + f" · IST day · generated {datetime.now(fc.IST).strftime('%d %b %Y %H:%M IST')}</p>",
     ]
 
     for w in cmp.get("warnings") or []:
         parts.append(f"<div class='warn'>⚠️ {escape(w)}</div>")
+    if cmp.get("excluded_followers"):
+        names = ", ".join(f"<strong>{escape(str(e['name']))}</strong> ({escape(str(e['status']))})"
+                          for e in cmp["excluded_followers"])
+        parts.append(f"<div class='warn'>Not graded, because the engine does not copy to "
+                     f"them: {names}.</div>")
 
     parts += [
         "<div class='cards'>",
         _card("Master orders", str(s["master_orders"])),
-        _card("Groups reconciled", f"{s['groups_matched']}/{s['groups']}",
-              "ok" if s["groups_matched"] == s["groups"] else "bad"),
-        _card("Master lots", _lots(m.get("lots"))),
+        _card("Order legs", str(s["legs"])),
         _card("Match rate", f"{s['match_rate_pct']}%",
               "ok" if s["match_rate_pct"] >= 100 else "bad"),
-        _card("Errors", str(s["errors"]), "bad" if s["errors"] else "ok"),
-        _card("Excess churn", _lots(s.get("excess_churn_lots") or 0),
-              "bad" if s.get("churn_symbols") else "ok"),
-        _card("Median delay", _ms(s["median_delay_ms"])),
-        _card("Avg delay", _ms(s["avg_delay_ms"])),
-        _card("p95 delay", _ms(s["p95_delay_ms"])),
-        _card("Max delay", _ms(s["max_delay_ms"])),
+        _card("Unmatched", str(s["errors"]), "bad" if s["errors"] else "ok"),
+        _card("Median time diff", _ms(s["median_time_diff_ms"])),
+        _card("p95 time diff", _ms(s["p95_time_diff_ms"])),
+        _card("Max time diff", _ms(s["max_time_diff_ms"])),
         "</div>",
     ]
 
-    if cmp.get("excluded_followers"):
-        names = ", ".join(
-            f"<strong>{escape(str(e['name']))}</strong> ({escape(str(e['status']))})"
-            for e in cmp["excluded_followers"]
-        )
-        parts.append(
-            f"<div class='warn'>Not graded, because the engine does not copy to them: {names}. "
-            "Any trading on these accounts is their own book, not a mirror.</div>"
-        )
-
-    # The verdict lives here rather than in the per-order table: a laddered exit
-    # spreads one decision across many rungs, so totals per symbol and side are
-    # the honest unit of comparison.
-    if cmp.get("groups"):
-        parts += ["<h2>Symbol / side reconciliation</h2>",
-                  "<p class='sub'>The verdict, on NET position per symbol — buys and sells "
-                  "offset, so a laddered exit is judged as one exit and a round trip is not "
-                  "mistaken for over-filling. Turnover is judged separately, on the right.</p>",
-                  "<div class='scroll'><table><thead><tr><th>Follower</th><th>Symbol</th>",
-                  "<th>Verdict</th><th class='n'>Master net</th><th class='n'>Rungs</th>",
-                  "<th class='n'>Target net</th><th class='n'>Follower net</th>",
-                  "<th class='n'>Gross</th><th class='n'>Excess churn</th>",
-                  "<th>Note</th></tr></thead><tbody>"]
-        for g in cmp["groups"]:
-            churn = (f"<span style='color:#b45309;font-weight:650'>{_lots(g['excess_churn_lots'])}</span>"
-                     if g["churn_flag"] else "—")
-            note = g["note"] or ""
-            if g["churn_flag"]:
-                note = (note + " · " if note else "") + escape(g["churn_note"])
-            else:
-                note = escape(note)
-            parts.append(
-                f"<tr><td><strong>{escape(str(g['account_name']))}</strong></td>"
-                f"<td class='mono'>{escape(str(g['symbol']))}</td>"
-                f"<td>{_pill(g['verdict'])}</td>"
-                f"<td class='n'>{_lots(g['master_net'])}</td>"
-                f"<td class='n'>{g['master_orders']}</td>"
-                f"<td class='n' title=\"{escape(g['target_basis'])}\">{_lots(g['target_net'])}</td>"
-                f"<td class='n'>{_lots(g['follower_net'])}</td>"
-                f"<td class='n muted'>{_lots(g['follower_gross'])}</td>"
-                f"<td class='n'>{churn}</td>"
-                f"<td class='muted'>{note}</td></tr>"
-            )
-        parts.append("</tbody></table></div>")
-
-    # Per-follower rollup
     parts += ["<h2>Per follower</h2><div class='scroll'><table><thead><tr>",
-              "<th>Follower</th><th class='n'>Ratio</th><th class='n'>Legs</th>",
-              "<th class='n'>Matched</th><th class='n'>Errors</th><th class='n'>Lots</th>",
-              "<th class='n'>Median delay</th><th class='n'>Avg delay</th>",
-              "<th class='n'>Max delay</th><th>Breakdown</th></tr></thead><tbody>"]
+              "<th>Follower</th><th class='n'>Ratio</th><th class='n'>Order legs</th>",
+              "<th class='n'>Matched</th><th class='n'>Unmatched</th>",
+              "<th class='n'>Median</th><th class='n'>Avg</th><th class='n'>Max</th>",
+              "<th>Breakdown</th></tr></thead><tbody>"]
     for f in s["per_follower"]:
-        breakdown = " · ".join(
-            f"{escape(_VERDICT_LABEL.get(k, k))} {v}" for k, v in sorted(f["by_verdict"].items())
-        ) or "—"
+        breakdown = " · ".join(f"{escape(_VERDICT_LABEL.get(k, k))} {v}"
+                               for k, v in sorted(f["by_verdict"].items())) or "—"
         rate = "—" if f["match_rate_pct"] is None else f"{f['match_rate_pct']}%"
-        ratio = "—" if f["ratio"] is None else f"{f['ratio']:.4f}"
         flag = " <span class='pill' style='color:#b91c1c'>Unreadable</span>" if f["unreadable"] else ""
         parts.append(
             f"<tr><td><strong>{escape(str(f['account_name']))}</strong>{flag}</td>"
-            f"<td class='n'>{ratio}</td>"
-            f"<td class='n'>{f['legs']}</td><td class='n'>{rate}</td>"
-            f"<td class='n'>{f['errors']}</td><td class='n'>{_lots(f['filled_lots'])}</td>"
-            f"<td class='n'>{_ms(f['median_delay_ms'])}</td>"
-            f"<td class='n'>{_ms(f['avg_delay_ms'])}</td>"
-            f"<td class='n'>{_ms(f['max_delay_ms'])}</td>"
+            f"<td class='n mono' title=\"{escape(str(f.get('ratio_basis') or ''))}\">{_ratio(f['ratio'])}</td>"
+            f"<td class='n'>{f['orders']}</td><td class='n'>{rate}</td>"
+            f"<td class='n'>{f['errors']}</td>"
+            f"<td class='n'>{_ms(f['median_time_diff_ms'])}</td>"
+            f"<td class='n'>{_ms(f['avg_time_diff_ms'])}</td>"
+            f"<td class='n'>{_ms(f['max_time_diff_ms'])}</td>"
             f"<td class='muted'>{breakdown}</td></tr>"
         )
     parts.append("</tbody></table></div>")
 
-    # Full order-by-order comparison
-    parts += [f"<h2>Order comparison ({len(cmp['rows'])})</h2><div class='scroll'>",
-              "<table><thead><tr><th>Time (IST)</th><th>Symbol</th><th>Side</th>",
-              "<th class='n'>Master lots</th><th class='n'>Master px</th>",
-              "<th>Follower</th><th>Verdict</th><th class='n'>Filled</th>",
-              "<th class='n'>Target</th><th class='n'>Px</th><th class='n'>Delay</th>",
-              "<th>Link</th><th>Note</th></tr></thead><tbody>"]
-    if not cmp["rows"]:
-        parts.append("<tr><td colspan='13' class='muted'>No master fills in this window.</td></tr>")
-    for r in cmp["rows"]:
+    parts += [f"<h2>Order comparison ({len(cmp.get('rows') or [])})</h2>",
+              "<p class='sub'>One row per master order per follower. This is the verdict — "
+              "it records what the engine did at the moment it did it, which is what a "
+              "position check cannot show once the reconciler has tidied up.</p>",
+              "<div class='scroll'><table><thead><tr><th>Time (IST)</th><th>Symbol</th>",
+              "<th>Side</th><th>Type</th><th class='n'>Master lots</th><th>State</th>",
+              "<th>Follower</th><th>Verdict</th><th class='n'>Punched</th>",
+              "<th class='n'>Target</th><th class='n'>Ratio</th><th class='n'>Time diff</th>",
+              "<th>Reason</th></tr></thead><tbody>"]
+    rows = cmp.get("rows") or []
+    if not rows:
+        parts.append("<tr><td colspan='13' class='muted'>No master orders in this window.</td></tr>")
+    for r in rows:
         span = max(1, len(r["legs"]))
         side_cls = "side-buy" if r["side"] == "buy" else "side-sell"
         for i, l in enumerate(r["legs"] or [None]):
+            bad = bool(l and l["verdict"] in oc.MISMATCH_VERDICTS)
             cells = ""
             if i == 0:
                 cells = (
-                    f"<td rowspan='{span}' class='mono'>{_clock(r['master_first_fill_at'])}</td>"
+                    f"<td rowspan='{span}' class='mono'>{_clock(r['placed_at'])}</td>"
                     f"<td rowspan='{span}' class='mono'>{escape(str(r['symbol']))}</td>"
                     f"<td rowspan='{span}' class='{side_cls}'>{escape(str(r['side'] or '').upper())}</td>"
+                    f"<td rowspan='{span}' class='muted'>{escape(str(r.get('order_type') or ''))}</td>"
                     f"<td rowspan='{span}' class='n'>{_lots(r['master_lots'])}</td>"
-                    f"<td rowspan='{span}' class='n mono'>{r.get('master_avg_price') or '—'}</td>"
+                    f"<td rowspan='{span}' class='muted'>{escape(str(r.get('master_state') or ''))}</td>"
                 )
             if l is None:
-                parts.append(f"<tr>{cells}<td colspan='8' class='muted'>No followers configured.</td></tr>")
+                parts.append(f"<tr>{cells}<td colspan='7' class='muted'>No active followers.</td></tr>")
                 continue
             parts.append(
-                f"<tr>{cells}"
+                f"<tr class='{'bad' if bad else ''}'>{cells}"
                 f"<td>{escape(str(l['account_name']))}</td>"
                 f"<td>{_pill(l['verdict'])}</td>"
-                f"<td class='n'>{_lots(l.get('filled_lots'))}</td>"
-                f"<td class='n'>{_lots(l.get('target_lots'))}</td>"
-                f"<td class='n mono'>{l.get('avg_price') or '—'}</td>"
-                f"<td class='n'>{_ms(l.get('delay_ms'))}</td>"
-                f"<td class='muted'>{escape(l.get('link') or '—')}</td>"
-                f"<td class='muted'>{escape(l.get('note') or '')}</td></tr>"
+                f"<td class='n'>{_lots(l.get('placed_lots'))}</td>"
+                f"<td class='n' title=\"{escape(str(l.get('target_basis') or ''))}\">{_lots(l.get('target_lots'))}</td>"
+                f"<td class='n mono'>{_ratio(l.get('ratio_actual'))}</td>"
+                f"<td class='n'>{_ms(l.get('time_diff_ms'))}</td>"
+                f"<td class='muted'>{escape(l.get('note') or l.get('leg_reason') or '')}</td></tr>"
             )
     parts.append("</tbody></table></div>")
 
-    if cmp.get("unmatched_follower_fills"):
-        parts += [f"<h2>Unexplained follower fills ({len(cmp['unmatched_follower_fills'])})</h2>",
+    if cmp.get("extra_follower_orders"):
+        parts += [f"<h2>Orders on symbols the master never traded "
+                  f"({len(cmp['extra_follower_orders'])})</h2>",
                   "<div class='scroll'><table><thead><tr><th>Time (IST)</th><th>Follower</th>",
-                  "<th>Symbol</th><th>Side</th><th class='n'>Lots</th><th class='n'>Px</th>",
-                  "<th>Order id</th><th>Explanation</th></tr></thead><tbody>"]
-        for u in cmp["unmatched_follower_fills"]:
-            side_cls = "side-buy" if u["side"] == "buy" else "side-sell"
+                  "<th>Symbol</th><th>Side</th><th class='n'>Lots</th><th class='n'>Filled</th>",
+                  "<th>State</th><th>Order id</th></tr></thead><tbody>"]
+        for e in cmp["extra_follower_orders"]:
+            side_cls = "side-buy" if e["side"] == "buy" else "side-sell"
             parts.append(
-                f"<tr><td class='mono'>{_clock(u['first_fill_at'])}</td>"
-                f"<td>{escape(str(u['account_name']))}</td>"
-                f"<td class='mono'>{escape(str(u['symbol']))}</td>"
-                f"<td class='{side_cls}'>{escape(str(u['side'] or '').upper())}</td>"
-                f"<td class='n'>{_lots(u['lots'])}</td>"
-                f"<td class='n mono'>{u.get('avg_price') or '—'}</td>"
-                f"<td class='mono'>{escape(str(u['follower_order_id']))}</td>"
-                f"<td class='muted'>{escape(u['explanation'])}</td></tr>"
+                f"<tr><td class='mono'>{_clock(e['placed_at'])}</td>"
+                f"<td>{escape(str(e['account_name']))}</td>"
+                f"<td class='mono'>{escape(str(e['symbol']))}</td>"
+                f"<td class='{side_cls}'>{escape(str(e['side'] or '').upper())}</td>"
+                f"<td class='n'>{_lots(e['lots'])}</td><td class='n'>{_lots(e['filled'])}</td>"
+                f"<td class='muted'>{escape(str(e['state']))}</td>"
+                f"<td class='mono'>{escape(str(e['follower_order_id']))}</td></tr>"
             )
         parts.append("</tbody></table></div>")
 
     parts += [
-        "<footer>Fills read from Delta Exchange (<code>/v2/fills</code>) for the master and every "
-        "ACTIVE follower, then matched per order; the engine's own copy records annotate each leg "
-        "but never define a match. The <strong>verdict is taken per symbol and side</strong>, not "
-        "per order, because the master ladders an exit across many rungs and the engine mirrors it "
-        "as one ladder — a rung with no fill of its own reads <em>Ladder rung</em>, not a miss, when "
-        "the total reconciles. <em>linked</em> = a recorded copy ties the two orders together; "
-        "<em>inferred</em> = matched on symbol, side and timing because no copy record linked "
-        f"them (within {int(fc.INFER_WINDOW_SEC)}s). Delay is the follower's first fill minus the "
-        "master's — negative means the follower traded first.</footer>",
+        "<footer>Orders read from Delta Exchange (<code>/v2/orders/history</code>) for the "
+        "master and every ACTIVE follower, matched per order. A follower's order should be "
+        "<code>ceil(master lots × ratio)</code>; anything else is Over- or Under-punched, "
+        "however tidy the resulting position looks — the reconciler repairs position, which "
+        "is why position is not the verdict here. Cancels are compared too: the master "
+        "cancelling and the follower not is a mismatch no fill would ever show. A rung of a "
+        "laddered exit is judged on the ladder's total, not on its own, because the engine "
+        "mirrors a ladder as one action. Jittered SL/TP orders are excluded — they are not "
+        "one-for-one mirrors by design. Time diff is when the follower's order was placed "
+        "minus the master's.</footer>",
         "</div></body></html>",
     ]
     return "".join(parts)
@@ -482,7 +407,7 @@ def render_html(cmp: dict, *, label: str = "") -> str:
 # Scheduled send
 # ---------------------------------------------------------------------------
 
-def _owners_with_masters(db) -> list[dict]:
+def _owners_with_masters(db) -> list:
     """Owners that actually have a master, with their email for labelling."""
     try:
         accounts = (db.table("accounts").select("owner_id, is_master").execute().data) or []
@@ -490,7 +415,7 @@ def _owners_with_masters(db) -> list[dict]:
         logger.error(f"daily_report: could not list accounts: {e}")
         return []
     owners = sorted({a["owner_id"] for a in accounts if a.get("is_master") and a.get("owner_id")})
-    emails: dict = {}
+    emails = {}
     try:
         profiles = (db.table("profiles").select("id, email").execute().data) or []
         emails = {p["id"]: p.get("email") for p in profiles}
@@ -522,7 +447,7 @@ async def send_daily_report(db, day: date, redis=None, force: bool = False) -> d
     sent, failures = 0, []
     for o in owners:
         try:
-            cmp = await fc.compare_for_day(db, o["owner_id"], day)
+            cmp = await oc.compare_for_day(db, o["owner_id"], day)
             text = render_telegram(cmp, label=o["email"] if len(owners) > 1 else "")
             if await tg.send_message(text):
                 sent += 1
@@ -551,26 +476,25 @@ async def daily_report_scheduler(db, redis, hour: int, minute: int) -> None:
     what makes a single setting work for either preference, instead of a morning
     report cheerfully covering a session that is four hours old and still open.
     """
-    logger.info(f"Daily fill-match report scheduled for {hour:02d}:{minute:02d} IST.")
+    logger.info(f"Daily order-match report scheduled for {hour:02d}:{minute:02d} IST.")
     while True:
         now = datetime.now(fc.IST)
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
-        wait = (target - now).total_seconds()
         try:
-            await asyncio.sleep(wait)
+            await asyncio.sleep((target - now).total_seconds())
         except asyncio.CancelledError:
             break
         fire = datetime.now(fc.IST)
         day = fire.date() if fire.hour >= 12 else (fire.date() - timedelta(days=1))
         try:
             res = await send_daily_report(db, day, redis=redis)
-            logger.info(f"Daily fill-match report: {res}")
+            logger.info(f"Daily order-match report: {res}")
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Daily fill-match report failed: {e}", exc_info=True)
+            logger.error(f"Daily order-match report failed: {e}", exc_info=True)
         # Step off the exact firing minute so the next loop can't compute a
         # zero-length wait and send twice.
         await asyncio.sleep(90)
