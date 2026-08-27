@@ -47,7 +47,8 @@ async def _fake_send(text: str) -> bool:
 def reset():
     SENT.clear()
     tg._seen.clear()
-    tg._redis = False          # force the in-memory dedupe path, no Redis
+    tg._redis = False          # force the in-memory paths, no Redis
+    tg._last_fail.clear()
     tg.send_message = _fake_send
 
 
@@ -115,7 +116,7 @@ async def test_deliberate_skip_is_not_labelled_a_failure():
     print("\na deliberate skip must not read as something breaking")
     reset()
     await tg.notify_fail("Mini Prathav", "BTCUSD", "topup", 5, "price drifted 70%")
-    check_true("labelled a skip, not a failure", "Copy Skipped" in SENT[0], SENT[0])
+    check_true("labelled a skip, not a failure", "Left out of sync" in SENT[0], SENT[0])
     check_true("says nothing broke", "nothing failed" in SENT[0], SENT[0])
 
 
@@ -129,6 +130,70 @@ async def test_routine_trade_notifications_have_no_callers():
     check_true("corrections ARE wired up", src.count("tg.notify_correction(") >= 4,
                src.count("tg.notify_correction("))
     check_true("failures are still wired up", src.count("tg.notify_fail(") > 0)
+
+
+async def test_position_mismatch_is_not_forwarded():
+    print("\nposition_mismatch is covered by better messages — muted on Telegram")
+    reset()
+    await tg.send_alert({"level": "error", "type": "position_mismatch",
+                         "message": "Mini Prathav out of sync on BTCUSD"})
+    check("nothing sent", len(SENT), 0)
+    # ...but other alert types still go through.
+    await tg.send_alert({"level": "warning", "type": "high_slippage",
+                         "message": "0.05% on BTCUSD"})
+    check("high_slippage still sends", len(SENT), 1)
+
+
+async def test_persistent_condition_alerts_once_not_hourly():
+    print("\na condition that holds all day is announced ONCE")
+    reset()
+    for _ in range(200):        # the sweep runs every 15s
+        await tg.notify_fail("Mini Prathav", "C-BTC-80400", "topup", 2,
+                             "price drifted 70% from master entry",
+                             key="drift:f1:C-BTC-80400", window=tg.ONCE_WINDOW)
+    check("one message for the whole episode", len(SENT), 1)
+    check_true("and it says it was deliberate",
+               "Left out of sync" in SENT[0], SENT[0])
+
+
+async def test_resolved_condition_re_arms():
+    print("\nbut once it resolves, the NEXT occurrence is announced again")
+    reset()
+    await tg.notify_fail("Mini Prathav", "BTCUSD", "buy", 5, "insufficient_margin",
+                         key="recon:f1:BTCUSD", window=tg.ONCE_WINDOW)
+    check("first occurrence sent", len(SENT), 1)
+    await tg.notify_fail("Mini Prathav", "BTCUSD", "buy", 5, "insufficient_margin",
+                         key="recon:f1:BTCUSD", window=tg.ONCE_WINDOW)
+    check("still suppressed while it persists", len(SENT), 1)
+    # The reconciler fixes it and clears the key.
+    await tg.clear_alert("recon:f1:BTCUSD")
+    await tg.notify_fail("Mini Prathav", "BTCUSD", "buy", 5, "insufficient_margin",
+                         key="recon:f1:BTCUSD", window=tg.ONCE_WINDOW)
+    check("a fresh episode alerts again", len(SENT), 2)
+
+
+async def test_correction_quotes_the_earlier_failure():
+    print("\ncause and cure in one message")
+    reset()
+    await tg.notify_fail("Mini Prathav", "C-BTC-81600", "buy", 26, "insufficient_margin")
+    await tg.notify_correction("Mini Prathav", "C-BTC-81600", "OPENED", 26,
+                               held=0, target=26, master=2300,
+                               why="the follower had no leg at all")
+    check("two messages", len(SENT), 2)
+    check_true("the correction names the exchange's reason",
+               "insufficient_margin" in SENT[1], SENT[1])
+    check_true("labelled as the earlier failure",
+               "earlier failure" in SENT[1], SENT[1])
+
+
+async def test_deliberate_skip_is_not_recorded_as_a_cause():
+    print("\na deliberate skip must not be quoted as a failure cause")
+    reset()
+    await tg.notify_fail("Mini Prathav", "ETHUSD", "topup", 2, "price drifted 70%")
+    await tg.notify_correction("Mini Prathav", "ETHUSD", "TOPPED UP", 2,
+                               held=1, target=3, master=200)
+    check_true("no phantom cause on the correction",
+               "earlier failure" not in SENT[1], SENT[1])
 
 
 async def test_silent_when_not_configured():
@@ -159,7 +224,12 @@ async def main():
             test_failures_still_alert,
             test_deliberate_skip_is_not_labelled_a_failure,
             test_routine_trade_notifications_have_no_callers,
-            test_silent_when_not_configured,
+            test_position_mismatch_is_not_forwarded,
+        test_persistent_condition_alerts_once_not_hourly,
+        test_resolved_condition_re_arms,
+        test_correction_quotes_the_earlier_failure,
+        test_deliberate_skip_is_not_recorded_as_a_cause,
+        test_silent_when_not_configured,
         ):
             await fn()
     finally:

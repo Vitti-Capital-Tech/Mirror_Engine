@@ -27,6 +27,31 @@ DUP_EVENT_WINDOW = 45.0
 # with clear_alert() so the next genuine occurrence still gets through.
 STATE_ALERT_WINDOW = 6 * 3600.0
 
+# ONE message per episode, not one per hour.
+#
+# These conditions are re-evaluated every 15s and can hold all day, so a 30-60min
+# window meant the same unchanged problem re-announcing itself all afternoon.
+# What is wanted is edge-triggered: say it when it STARTS, stay quiet while it
+# persists, say it again only if it comes back after resolving. clear_alert()
+# provides that second half and is called wherever a condition is actually fixed.
+#
+# Not infinite, deliberately. If a clear_alert() is ever missed the condition
+# would go permanently silent, which is a worse failure than one repeat — so this
+# is a week: effectively "once" for any real episode, while guaranteeing a
+# genuinely stuck problem cannot stay quiet forever.
+ONCE_WINDOW = 7 * 24 * 3600.0
+
+# Alert types NOT forwarded to Telegram, because a better message already covers
+# them. They still land in the database and the in-app Alert Feed.
+#
+#   position_mismatch — fires when a follower's size differs from its target,
+#     which is exactly what the reconciler acts on. You would get the mismatch,
+#     then a "Reconciler corrected" for the same event saying what was actually
+#     done — or, when the reconciler declines, a "Left out of sync" saying so.
+#     The mismatch alert is the least informative of the three and arrives first,
+#     so it reads as the headline when it is really the footnote.
+SILENT_ALERT_TYPES = {"position_mismatch"}
+
 
 def telegram_enabled() -> bool:
     return bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
@@ -119,6 +144,51 @@ async def clear_alert(key: str) -> None:
             pass
 
 
+# In-process fallback for the failure→correction link, mirroring what _dedupe
+# does for suppression. Redis is preferred (it survives the reload on every
+# deploy), but this must not be the kind of feature that silently stops working
+# when Redis hiccups — a correction with no cause attached is a worse message,
+# and there is no way to tell from the outside that it was meant to have one.
+_FAIL_TTL = 1800.0
+_last_fail: dict = {}
+
+
+async def _remember_failure(account: str, symbol: str, reason: str) -> None:
+    """Stash why a leg last failed, so a later correction can name the cause.
+
+    The reconciler knows a leg was missing; it cannot know the exchange said
+    "insufficient_margin". Correlating the two by hand across two messages is
+    work the reader should not have to do.
+    """
+    if not reason:
+        return
+    key = f"lastfail:{account}:{symbol}"
+    _last_fail[key] = (str(reason)[:200], time.time())
+    r = _r()
+    if r is None:
+        return
+    try:
+        await r.set(key, str(reason)[:200], ex=int(_FAIL_TTL))
+    except Exception:
+        pass
+
+
+async def _recent_failure(account: str, symbol: str) -> str:
+    key = f"lastfail:{account}:{symbol}"
+    r = _r()
+    if r is not None:
+        try:
+            hit = await r.get(key)
+            if hit:
+                return hit
+        except Exception:
+            pass
+    cached = _last_fail.get(key)
+    if cached and (time.time() - cached[1]) < _FAIL_TTL:
+        return cached[0]
+    return ""
+
+
 def _num(v) -> str:
     if v is None or v == "":
         return "—"
@@ -181,13 +251,20 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
     # A deliberate decision not to act is NOT a failure. Labelling a price-guard
     # skip "Mirror Failed" reads like something broke and trains you to ignore the
     # alert that matters — an order the exchange actually rejected.
+    #
+    # Kept, and load-bearing: this is the ONLY notification for a leg the
+    # reconciler has knowingly abandoned (price drifted too far from the master's
+    # entry to be worth chasing). No correction fires, because no correction
+    # happened — the follower is deliberately left out of sync.
     skipped = str(side).lower() in ("topup", "recover") or "drift" in (reason or "").lower()
     if skipped:
-        text = (f"ℹ️ <b>Copy Skipped</b> · {account}\n"
+        text = (f"ℹ️ <b>Left out of sync</b> · {account}\n"
                 f"<code>{symbol}</code>\n"
                 f"{lot_str.strip() or 'leg'} — {reason}\n"
                 f"<i>Deliberate: nothing failed, the follower was left as-is.</i>")
     else:
+        # Only a real failure is worth remembering as the cause of a later fix.
+        await _remember_failure(account, symbol, reason)
         text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
                 f"<code>{symbol}</code>\n"
                 f"{str(side).title()}{lot_str} — {reason}")
@@ -248,6 +325,11 @@ async def notify_correction(
     ]
     if why:
         lines.append(f"<i>{why}</i>")
+    # Cause and cure in one message, rather than leaving the reader to correlate
+    # a "Mirror Failed" and a "Reconciler corrected" by symbol and timestamp.
+    cause = await _recent_failure(account, symbol)
+    if cause:
+        lines.append(f"↳ earlier failure: <code>{cause}</code>")
     await send_message("\n".join(lines))
 
 
@@ -258,6 +340,8 @@ async def send_alert(alert: dict) -> None:
     — a position mismatch, restored protection — reads as one notification rather
     than a stream of identical ones."""
     if not telegram_enabled():
+        return
+    if (alert.get("type") or "").lower() in SILENT_ALERT_TYPES:
         return
     level = (alert.get("level") or "info").lower()
     icon = _ICON.get(level, "•")

@@ -1404,7 +1404,7 @@ class CopyEngine:
                                 asyncio.create_task(tg.notify_fail(
                                     fol.get("name"), sym, "topup", short_by,
                                     f"price drifted {drift:.0f}% from master entry",
-                                    key=f"drift:{fid}:{sym}", window=3600,
+                                    key=f"drift:{fid}:{sym}", window=tg.ONCE_WINDOW,
                                 ))
                                 self._recon_open_ts[(fid, sym)] = now
                                 continue
@@ -1430,6 +1430,11 @@ class CopyEngine:
                                     f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
                                     f"({held} -> {int(target)}, master {msz:+.0f}, drift {drift:.1f}%)"
                                 )
+                                # Episode over: re-arm both keys so the NEXT
+                                # shortfall on this leg alerts instead of being
+                                # swallowed by the once-per-episode window.
+                                asyncio.create_task(tg.clear_alert(f"topup:{fid}:{sym}"))
+                                asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
                                 asyncio.create_task(tg.notify_correction(
                                     fol.get("name"), sym, "TOPPED UP", int(short_by),
                                     held=held, target=int(target), master=int(msz),
@@ -1440,7 +1445,7 @@ class CopyEngine:
                                 logger.warning(f"reconcile top-up failed for {fol.get('name')} {sym}: {e} {body}")
                                 asyncio.create_task(tg.notify_fail(
                                     fol.get("name"), sym, side, int(short_by), _short_reason(e, body),
-                                    key=f"topup:{fid}:{sym}", window=1800,
+                                    key=f"topup:{fid}:{sym}", window=tg.ONCE_WINDOW,
                                 ))
                             continue
 
@@ -1474,6 +1479,7 @@ class CopyEngine:
                                 f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
                                 f"exit order(s): {missed or 'none recorded in ledger'}"
                             )
+                            asyncio.create_task(tg.clear_alert(f"recon:{fol.get('id')}:{sym}"))
                             asyncio.create_task(tg.notify_correction(
                                 fol.get("name"), sym, "TRIMMED", int(excess),
                                 held=held, target=int(target), master=int(msz),
@@ -1604,7 +1610,7 @@ class CopyEngine:
                             asyncio.create_task(tg.notify_fail(
                                 fol.get("name"), sym, "recover", int(target),
                                 f"price drifted {drift:.0f}% from master entry — follower left flat",
-                                key=f"drift:{fid}:{sym}", window=tg.STATE_ALERT_WINDOW,
+                                key=f"drift:{fid}:{sym}", window=tg.ONCE_WINDOW,
                             ))
                             self._recon_open_ts[key] = now
                             continue
@@ -1635,7 +1641,7 @@ class CopyEngine:
                         logger.warning(f"reconcile open failed for {fol.get('name')} {sym}: {e} {body}")
                         asyncio.create_task(tg.notify_fail(
                             fol.get("name"), sym, side, int(target), _short_reason(e, body),
-                            key=f"recon:{fol.get('id')}:{sym}", window=1800,
+                            key=f"recon:{fol.get('id')}:{sym}", window=tg.ONCE_WINDOW,
                         ))
             except Exception as e:
                 logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
@@ -1792,11 +1798,16 @@ class CopyEngine:
                             f"sync_protection: PLACED missing {stype} on {sym} for "
                             f"{fol.get('name')} @ {jittered} (master {stop_price}, order {foid})"
                         )
-                        asyncio.create_task(tg.send_alert({
-                            "level": "warning", "type": "protection_restored",
-                            "message": (f"{fol.get('name')} was holding {sym} with no {stype} — "
-                                        f"restored at {jittered}"),
-                        }))
+                        # This is the safety net acting, exactly like a top-up or
+                        # a trim, so it reads in the same format as the others
+                        # rather than as a differently-shaped alert.
+                        asyncio.create_task(tg.notify_correction(
+                            fol.get("name"), sym, f"RESTORED {stype}", None,
+                            why=(f"the follower was holding with no {stype} at all — "
+                                 f"placed at {jittered} (master {stop_price})")))
+                        # Protection is back, so a future loss of it alerts again.
+                        asyncio.create_task(tg.clear_alert(
+                            f"prot:{fol.get('id')}:{sym}:{stype}"))
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
                         logger.error(
@@ -1805,7 +1816,7 @@ class CopyEngine:
                         )
                         asyncio.create_task(tg.notify_fail(
                             fol.get("name"), sym, stype, None, _short_reason(e, body),
-                            key=f"prot:{fol.get('id')}:{sym}:{stype}", window=1800,
+                            key=f"prot:{fol.get('id')}:{sym}:{stype}", window=tg.ONCE_WINDOW,
                         ))
             except Exception as e:
                 logger.warning(f"sync_protection: error for {fol.get('name')}: {e}")
@@ -2802,7 +2813,7 @@ class CopyEngine:
             logger.warning(f"Exit settle after cancel failed for {name} {symbol}: {e} {body}")
             asyncio.create_task(tg.notify_fail(
                 name, symbol, "close", None, _short_reason(e, body),
-                key=f"settle:{follower.get('id')}:{symbol}", window=900,
+                key=f"settle:{follower.get('id')}:{symbol}", window=tg.ONCE_WINDOW,
             ))
 
     async def _mirror_cancel(self, master_order_id: str, event: dict | None = None) -> None:
