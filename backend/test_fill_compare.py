@@ -296,7 +296,7 @@ def test_fill_on_untraded_symbol_is_unexplained():
     u = out["unmatched_follower_fills"][0]
     check("with its order id", u["follower_order_id"], "888")
     check("and an explanation", u["explanation"],
-          "master never traded this symbol/side today — follower's own trade?")
+          "master never traded this symbol today — follower's own trade?")
     check("counted in the summary", out["summary"]["unmatched_follower_fills"], 1)
 
 
@@ -307,8 +307,14 @@ def test_side_mismatch_is_not_inferred():
         "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0)],
         "f1": [fill("777", "BTCUSD", "sell", 1, 100.0, T0 + timedelta(seconds=2))],
     }, db=FakeDB())
-    check("opposite side is not a match", leg_for(out["rows"][0], "f1")["verdict"], "missing")
-    check("it shows up as unexplained instead", len(out["unmatched_follower_fills"]), 1)
+    check("opposite side is never paired to the order", leg_for(out["rows"][0], "f1")["link"], None)
+    # NOT "unexplained" — the master did trade this symbol. The net check is the
+    # precise place for it, and it says the follower is positioned backwards.
+    check("not filed as unexplained", len(out["unmatched_follower_fills"]), 0)
+    g = out["groups"][0]
+    check("net catches the wrong direction", g["verdict"], "short")
+    check_true("and says so", "wrong direction" in g["note"], g["note"])
+    check("counted as an error", out["summary"]["errors"], 1)
 
 
 def test_one_fill_claimed_once():
@@ -512,7 +518,7 @@ def test_laddered_exit_is_one_exit():
     check("NOT reported as missing", "missing" in verdicts, False)
     check("NOT reported as over either", "over" in verdicts, False)
     check("and each rung explains itself", leg_for(out["rows"][0], "f1")["note"],
-          "part of a 3-rung ladder on C-BTC-79800 sell — the total reconciles (30 of 30 lots)")
+          "part of a 3-rung ladder on C-BTC-79800 — the net reconciles (-30 against -30)")
 
     check("one group for the symbol/side", len(out["groups"]), 1)
     g = out["groups"][0]
@@ -542,8 +548,8 @@ def test_ladder_that_really_is_short():
 
     g = out["groups"][0]
     check("group verdict", g["verdict"], "short")
-    check("quantified against the total", g["note"],
-          "filled 12 of 30 lots across 3 master order(s)")
+    check("quantified against the net", g["note"],
+          "net -12 against a target of -30 lots")
     check("counted once, not once per rung", out["summary"]["errors"], 1)
     check("match rate 0%", out["summary"]["match_rate_pct"], 0.0)
     # The unfilled rungs stay 'missing' — the group did not reconcile, so there
@@ -552,7 +558,7 @@ def test_ladder_that_really_is_short():
     check("every rung reports the ladder's real verdict", verdicts, ["short", "short", "short"])
     check("with the group's reason, not a per-rung artefact",
           leg_for(out["rows"][0], "f1")["note"],
-          "3-rung ladder: filled 12 of 30 lots across 3 master order(s)")
+          "3-rung ladder: net -12 against a target of -30 lots")
 
 
 def test_per_rung_rounding_is_not_over_filling():
@@ -602,8 +608,73 @@ def test_shortfall_gets_no_rounding_allowance():
     }, db=FakeDB())
     g = out["groups"][0]
     check("still short", g["verdict"], "short")
-    check("quantified", g["note"], "filled 2 of 10 lots across 4 master order(s)")
+    check("quantified", g["note"], "net -2 against a target of -10 lots")
     check("one error", out["summary"]["errors"], 1)
+
+
+def test_round_trip_is_churn_not_over_filling():
+    """Regression — live run, 2026-08-27, C-BTC-81600-270826.
+
+    A duplicate mirror made the follower sell 26 twice; the reconciler bought 26
+    back. Gross sells came to 57 (5 + 26 + 26) against a target of 29, and the
+    report cried "over-filled" — while the account's NET was exactly -29, i.e.
+    precisely where it should be. Grading gross fills on one side against a net
+    target is a category error; buys and sells offset.
+
+    The wasted round trip is still real and still costs fees, so it is reported
+    as CHURN instead of being either ignored or mislabelled as a position fault.
+    """
+    print("\na round trip is churn, not over-filling")
+    f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
+    out = run_compare([MASTER, f], {
+        # Master sells 290 net, in two rungs, with no round-tripping of its own.
+        "m1": [fill("900", "C-BTC-81600", "sell", 50, 10.0, T0),
+               fill("901", "C-BTC-81600", "sell", 240, 11.0, T0 + timedelta(minutes=4))],
+        # Follower: 5 + 26 + 26 sold, 2 + 26 bought back. Gross 85, net -29.
+        "f1": [fill("500", "C-BTC-81600", "sell", 5, 10.0, T0 + timedelta(seconds=6)),
+               fill("501", "C-BTC-81600", "buy", 2, 12.0, T0 + timedelta(minutes=1)),
+               fill("502", "C-BTC-81600", "sell", 26, 12.0, T0 + timedelta(minutes=4, seconds=4)),
+               fill("503", "C-BTC-81600", "sell", 26, 12.0, T0 + timedelta(minutes=4, seconds=13)),
+               fill("504", "C-BTC-81600", "buy", 26, 17.0, T0 + timedelta(minutes=5, seconds=23))],
+    }, db=FakeDB())
+
+    check("one group for the symbol", len(out["groups"]), 1)
+    g = out["groups"][0]
+    check("master net", g["master_net"], -290.0)
+    check("target follows the master's net", g["target_net"], -29.0)
+    check("follower net is exactly right", g["follower_net"], -29.0)
+    check("so the POSITION is matched, not over", g["verdict"], "matched")
+    check("no position error", out["summary"]["errors"], 0)
+
+    # ...but the round trip is surfaced on its own terms.
+    check("gross tells the other story", g["follower_gross"], 85.0)
+    check("churn is the offsetting volume", g["churn_lots"], 56.0)
+    check("the master did none of its own", g["master_gross"], 290.0)
+    check("so all of it is excess", g["excess_churn_lots"], 56.0)
+    check("and it is flagged", g["churn_flag"], True)
+    check_true("with a note naming the cost", "round-tripping" in g["churn_note"], g["churn_note"])
+    check("summary counts the symbol", out["summary"]["churn_symbols"], 1)
+    check("and the wasted lots", out["summary"]["excess_churn_lots"], 56.0)
+
+
+def test_master_round_trip_is_not_follower_churn():
+    print("\nchurn the master itself did is not the follower's fault")
+    f = follower("f1", "Follower A", allocation_mode="multiplier", allocation_value=0.1)
+    out = run_compare([MASTER, f], {
+        # The master round-trips 200 lots and ends flat.
+        "m1": [fill("900", "BTCUSD", "buy", 200, 100.0, T0),
+               fill("901", "BTCUSD", "sell", 200, 101.0, T0 + timedelta(minutes=3))],
+        # The follower mirrors that faithfully: in and back out, ending flat.
+        "f1": [fill("500", "BTCUSD", "buy", 20, 100.0, T0 + timedelta(seconds=2)),
+               fill("501", "BTCUSD", "sell", 20, 101.0, T0 + timedelta(minutes=3, seconds=2))],
+    }, db=FakeDB())
+    g = out["groups"][0]
+    check("both end flat", (g["master_net"], g["follower_net"]), (0.0, 0.0))
+    check("target is flat too", g["target_net"], 0.0)
+    check("matched", g["verdict"], "matched")
+    check("the follower's churn mirrors the master's", g["excess_churn_lots"], 0.0)
+    check("so nothing is flagged", g["churn_flag"], False)
+    check("no errors", out["summary"]["errors"], 0)
 
 
 def test_group_missing_when_nothing_filled():
@@ -618,7 +689,7 @@ def test_group_missing_when_nothing_filled():
           ["missing", "missing"])
     check("but ONE group error", out["summary"]["errors"], 1)
     check("group says so plainly", out["groups"][0]["note"],
-          "no follower fill on C-BTC-79800 sell at all")
+          "no follower fill on C-BTC-79800 at all")
 
 
 def test_no_master():
@@ -683,8 +754,10 @@ def test_renderers():
         "quantity": 1, "requested_quantity": 1, "failure_reason": None,
     }])
     out = run_compare([MASTER, f], {
+        # Two DIFFERENT symbols, so the master's nets don't cancel each other out.
         "m1": [fill("900", "BTCUSD", "buy", 40, 100.0, T0),
-               fill("901", "BTCUSD", "sell", 40, 105.0, T0 + timedelta(minutes=5))],
+               fill("901", "SOLUSD", "sell", 40, 105.0, T0 + timedelta(minutes=5))],
+        # Mirrors BTCUSD, misses SOLUSD entirely, and trades one of its own.
         "f1": [fill("555", "BTCUSD", "buy", 1, 100.0, T0 + timedelta(seconds=1)),
                fill("999", "ETHUSD", "buy", 2, 50.0, T0 + timedelta(hours=3))],
     }, db=db)
@@ -736,7 +809,10 @@ def main():
         test_delay_stats, test_multiple_followers,
         test_paused_followers_are_not_graded, test_laddered_exit_is_one_exit,
         test_ladder_that_really_is_short, test_per_rung_rounding_is_not_over_filling,
-        test_shortfall_gets_no_rounding_allowance, test_group_missing_when_nothing_filled,
+        test_shortfall_gets_no_rounding_allowance,
+        test_round_trip_is_churn_not_over_filling,
+        test_master_round_trip_is_not_follower_churn,
+        test_group_missing_when_nothing_filled,
         test_no_master,
         test_ratio_refuses_to_guess, test_unsized_follower_filled,
         test_ist_day_bounds, test_renderers,

@@ -442,113 +442,163 @@ MISMATCH_VERDICTS = {"missing", "short", "over"}
 NEUTRAL_VERDICTS = {"ladder", "skipped", "resting", "unsized", "unreadable"}
 
 
-def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[dict]) -> list[dict]:
-    """Reconcile master vs follower at the (symbol, side) level, per follower.
+def _signed(g: dict) -> float:
+    """A fill group's lots, signed: buy positive, sell negative."""
+    return g["lots"] if g.get("side") == "buy" else -g["lots"]
 
-    Why this exists — the per-order comparison alone is wrong for how this desk
-    actually trades. The master ladders an exit across many rungs (observed
-    2026-08-26: nine sell orders on C-BTC-79800-260826 spanning 5.7 hours), and
-    the engine deliberately mirrors a ladder as ONE ladder rather than rung by
-    rung. So most individual rungs have no follower fill of their own, and
-    grading them one-to-one reported 36 "missing" copies on a day when the
-    follower was tracking the master correctly — the exact false alarm this
-    module is supposed to prevent.
 
-    For a laddered exit "do the accounts match?" is a question about the TOTAL
-    on that symbol and side, not about each rung. So the totals are the verdict,
-    and the per-order rows become supporting detail. Non-laddered trading
-    degrades to the same thing: one master order is simply a group of one.
+def expected_net(master_net: float, follower: dict, master: dict) -> tuple[Optional[float], str]:
+    """The SIGNED net position a follower should hold from this master net.
 
-    Aggregate lots come from the follower's fills on that (symbol, side) over the
-    whole window — including fills no single row claimed, which is precisely the
-    ladder's cover order.
+    Scales the magnitude and keeps the direction. A master net of zero — bought
+    and sold back within the window — asks for a follower net of zero, not the
+    one-lot floor expected_lots() applies to a real order.
     """
-    m_by_key: dict = {}
+    if not master_net:
+        return 0.0, "master netted flat"
+    lots, basis = expected_lots(abs(master_net), follower, master)
+    if lots is None:
+        return None, basis
+    return math.copysign(lots, master_net), basis
+
+
+def reconcile_groups(rows: list[dict], f_state: list[dict], master_groups: list[dict]) -> list[dict]:
+    """Reconcile master vs follower per SYMBOL, on NET position, per follower.
+
+    Two things this gets right that per-order comparison cannot.
+
+    **Ladders.** The master ladders an exit across many rungs (observed
+    2026-08-26: nine sell orders on C-BTC-79800-260826 spanning 5.7 hours) and
+    the engine deliberately mirrors a ladder as ONE ladder. Grading rung by rung
+    reported 36 "missing" copies on a day the follower was tracking correctly.
+
+    **Round trips.** Grading per (symbol, SIDE) sums gross fills on one side and
+    compares them to a target that describes a net position — so a follower that
+    sold 57 and bought back 28 to reach a net of -29 was reported as "filled 57
+    against a target of 29" while sitting exactly where it should be
+    (C-BTC-81600-270826, 2026-08-27). Buys and sells on a symbol offset each
+    other; only the net says whether the accounts match.
+
+    So the verdict is net-vs-net. The round-tripping that the gross view was
+    mislabelling as over-filling is not discarded, though — it is real and it
+    costs fees. It is reported on its own terms as CHURN: lots the follower
+    traded that cancelled out, beyond the master's own round-tripping scaled by
+    the ratio. That is the number that points at duplicate orders, which is what
+    the gross reading was accidentally detecting all along.
+    """
+    m_by_sym: dict = {}
     for g in master_groups:
-        m_by_key.setdefault((g.get("symbol"), g.get("side")), []).append(g)
+        m_by_sym.setdefault(g.get("symbol"), []).append(g)
 
     out = []
     for st in f_state:
         acc = st["account"]
-        for key, mgs in sorted(m_by_key.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
-            symbol, side = key
-            master_lots = sum(g["lots"] for g in mgs)
+        for symbol, mgs in sorted(m_by_sym.items(), key=lambda kv: str(kv[0])):
+            master_net = sum(_signed(g) for g in mgs)
+            master_gross = sum(g["lots"] for g in mgs)
+            # Lots the master itself opened and closed inside the window. The
+            # follower is entitled to mirror this much round-tripping.
+            master_churn = master_gross - abs(master_net)
+
+            f_groups = [g for g in st["groups"] if g.get("symbol") == symbol]
+            follower_net = sum(_signed(g) for g in f_groups)
+            follower_gross = sum(g["lots"] for g in f_groups)
+            follower_churn = follower_gross - abs(follower_net)
+
             legs = [
-                l for r in rows if (r["symbol"], r["side"]) == key
+                l for r in rows if r["symbol"] == symbol
                 for l in r["legs"] if l["account_id"] == acc["id"]
             ]
-            # Target is ALWAYS the ratio applied to the group's master lots —
-            # never the sum of the recorded per-order requests.
-            #
-            # The two bases are not interchangeable at this level, because
-            # `filled` below sums EVERY follower fill on this symbol and side,
-            # including reconciler top-ups whose master order is not one of these
-            # rungs. Summing recorded requests therefore under-counts the target
-            # for exactly those fills. Observed 2026-08-26: on C-BTC-81200 the
-            # buy side had complete leg records (sum 12) and read "over" at 29
+
+            # Target is ALWAYS the ratio applied to the master's net — never the
+            # sum of the recorded per-order requests. The two are not
+            # interchangeable here, because `follower_net` includes reconciler
+            # top-ups whose master order is not among these rungs, so summing
+            # recorded requests under-counts. Observed 2026-08-26: on C-BTC-81200
+            # the buy side had complete leg records (sum 12) and read "over" at 29
             # filled, while the sell side of the same symbol fell back to the
-            # derived target (29) and read matched — the same follower, the same
-            # day, graded two different ways by an accident of which legs got
-            # written down.
+            # derived target (29) and read matched — same follower, same day,
+            # graded two ways by an accident of which legs got written down.
             #
-            # `recorded` stays the right basis on the per-ORDER rows, where it
-            # measures execution fidelity against one specific request. Here the
-            # question is proportional position, so the ratio is the answer.
-            target, basis = expected_lots(master_lots, acc, st["master"])
+            # `recorded` stays right on the per-ORDER rows, where it measures
+            # execution fidelity against one specific ask.
+            target, basis = expected_net(master_net, acc, st["master"])
             basis = f"derived — {basis}"
 
-            filled = sum(g["lots"] for g in st["groups"]
-                         if (g.get("symbol"), g.get("side")) == key)
+            ratio = st["ratio"]
+            expected_churn = (ratio * master_churn) if ratio is not None else 0.0
+            excess_churn = follower_churn - expected_churn
 
-            # Over-fill tolerance scales with the number of rungs. The sizing path
-            # CEILS every placement (opens and reduce-only closes alike), so each
-            # rung of a ladder may legitimately round up by just under a lot, and
-            # nine rungs can legitimately land eight lots above a single ceiled
-            # total. Observed 2026-08-26: a 9-rung exit filled 11 against a target
-            # of 7, flagged "over" — accumulated by-design rounding reported as a
-            # fault, which is the same false alarm as the ladder bug wearing a
-            # different hat. Shortfalls get no such allowance: rounding up cannot
-            # cause one.
-            over_allowance = SHORT_LOT_TOLERANCE + max(0, len(mgs) - 1)
+            # Tolerance scales with the number of rungs: the sizing path CEILS
+            # every placement, so each rung may legitimately round up by just
+            # under a lot and nine rungs can land eight lots above a single ceiled
+            # total. Applied to the magnitude in both directions now that the
+            # comparison is signed — an exit ceiling overshoots the short side
+            # exactly as an entry ceiling overshoots the long.
+            allowance = SHORT_LOT_TOLERANCE + max(0, len(mgs) - 1)
 
             if st["error"]:
                 verdict, note = "unreadable", "follower fills could not be read"
-            elif filled <= 0:
-                # Nothing at all on this symbol/side. Only a real miss if the
-                # engine wasn't deliberately standing down on every rung.
+            elif target is None:
+                verdict, note = "unsized", "follower traded, but no proportional target could be derived"
+            elif not f_groups:
                 deliberate = legs and all(
                     l["verdict"] in ("skipped", "resting") for l in legs
                 )
                 if deliberate:
-                    verdict, note = "skipped", "engine stood down on every rung of this group"
+                    verdict, note = "skipped", "engine stood down on every rung of this symbol"
+                elif target == 0:
+                    verdict, note = "matched", "master netted flat and the follower did nothing"
                 else:
-                    verdict, note = "missing", f"no follower fill on {symbol} {side} at all"
-            elif target is None:
-                verdict, note = "unsized", "follower traded, but no proportional target could be derived"
-            elif filled + SHORT_LOT_TOLERANCE < target:
-                verdict, note = "short", f"filled {filled:g} of {target:g} lots across {len(mgs)} master order(s)"
-            elif filled > target + over_allowance:
-                verdict, note = "over", (
-                    f"filled {filled:g} against a target of {target:g} lots"
-                    + (f" (allowing {over_allowance:g} for per-rung rounding across "
-                       f"{len(mgs)} rungs)" if len(mgs) > 1 else "")
-                )
+                    verdict, note = "missing", f"no follower fill on {symbol} at all"
+            elif abs(follower_net) + SHORT_LOT_TOLERANCE < abs(target) or (
+                target and follower_net * target < 0
+            ):
+                # Short, or holding the wrong way round entirely.
+                verdict = "short"
+                note = (f"net {follower_net:+g} against a target of {target:+g} lots"
+                        + (" — wrong direction" if target and follower_net * target < 0 else ""))
+            elif abs(follower_net) > abs(target) + allowance:
+                verdict = "over"
+                note = (f"net {follower_net:+g} against a target of {target:+g} lots"
+                        + (f" (allowing {allowance:g} for per-rung rounding across "
+                           f"{len(mgs)} rungs)" if len(mgs) > 1 else ""))
             else:
                 verdict, note = "matched", ""
+
+            # Churn is a SEPARATE finding from position. A symbol can be perfectly
+            # positioned and still have cost you a round trip to get there, which
+            # is exactly what a duplicate order looks like.
+            churn_flag = bool(excess_churn > allowance)
+            churn_note = ""
+            if churn_flag:
+                churn_note = (
+                    f"traded {follower_gross:g} lots gross to hold {follower_net:+g} — "
+                    f"{excess_churn:.0f} lots of round-tripping the master did not do"
+                )
 
             out.append({
                 "account_id": acc["id"],
                 "account_name": acc.get("name"),
                 "symbol": symbol,
-                "side": side,
+                # The master's net direction, for display. Kept as `side` so the
+                # report and UI keep reading one field.
+                "side": "buy" if master_net > 0 else "sell" if master_net < 0 else "flat",
                 "master_orders": len(mgs),
-                "master_lots": round(master_lots, 8),
-                "target_lots": target,
+                "master_lots": round(abs(master_net), 8),
+                "master_net": round(master_net, 8),
+                "master_gross": round(master_gross, 8),
+                "target_lots": None if target is None else abs(target),
+                "target_net": target,
                 "target_basis": basis,
-                "filled_lots": round(filled, 8),
-                "follower_orders": sum(
-                    1 for g in st["groups"] if (g.get("symbol"), g.get("side")) == key
-                ),
+                "filled_lots": round(abs(follower_net), 8),
+                "follower_net": round(follower_net, 8),
+                "follower_gross": round(follower_gross, 8),
+                "churn_lots": round(follower_churn, 8),
+                "excess_churn_lots": round(excess_churn, 8),
+                "churn_flag": churn_flag,
+                "churn_note": churn_note,
+                "follower_orders": len(f_groups),
                 "laddered": len(mgs) > 1,
                 "verdict": verdict,
                 "note": note,
@@ -575,17 +625,17 @@ def _apply_group_context(rows: list[dict], groups: list[dict]) -> None:
     verdict is exactly the group verdict, and it is the more precise place to
     read it.
     """
-    by_key = {(g["account_id"], g["symbol"], g["side"]): g for g in groups}
+    by_key = {(g["account_id"], g["symbol"]): g for g in groups}
     for r in rows:
         for l in r["legs"]:
-            g = by_key.get((l["account_id"], r["symbol"], r["side"]))
+            g = by_key.get((l["account_id"], r["symbol"]))
             if not g or not g["laddered"]:
                 continue
             if g["verdict"] in ("matched", "over", "skipped"):
                 l["verdict"] = "ladder"
                 l["note"] = (f"part of a {g['master_orders']}-rung ladder on "
-                             f"{r['symbol']} {r['side']} — the total reconciles "
-                             f"({_fmt(g['filled_lots'])} of {_fmt(g['target_lots'])} lots)")
+                             f"{r['symbol']} — the net reconciles "
+                             f"({_fmt(g['follower_net'])} against {_fmt(g['target_net'])})")
             else:
                 # The ladder as a whole is wrong. Every rung says so, identically,
                 # so a reader landing on any one of them sees the real problem
@@ -769,11 +819,11 @@ async def compare(
     # by the group reconciliation above, so only a symbol/side the master never
     # touched is genuinely unexplained. That is the real signal: a follower
     # trading its own book.
-    master_keys = {(g.get("symbol"), g.get("side")) for g in master_groups}
+    master_keys = {g.get("symbol") for g in master_groups}
     unmatched = []
     for st in f_state:
         for g in st["groups"]:
-            if (g.get("symbol"), g.get("side")) in master_keys:
+            if g.get("symbol") in master_keys:
                 continue
             leg = legs["by_follower"].get(g["order_id"])
             unmatched.append({
@@ -788,7 +838,7 @@ async def compare(
                 "master_order_id": (leg or {}).get("master_order_id"),
                 "explanation": (
                     "mirrors a master order outside this window"
-                    if leg else "master never traded this symbol/side today — "
+                    if leg else "master never traded this symbol today — "
                                 "follower's own trade?"
                 ),
             })
@@ -833,6 +883,7 @@ def _empty_summary() -> dict:
         "master_orders": 0, "matched_rows": 0, "mismatched_rows": 0,
         "legs": 0, "by_verdict": {}, "errors": 0,
         "groups": 0, "groups_matched": 0, "groups_by_verdict": {},
+        "churn_symbols": 0, "excess_churn_lots": 0,
         "avg_delay_ms": None, "median_delay_ms": None, "max_delay_ms": None,
         "p95_delay_ms": None, "delay_samples": 0,
         "match_rate_pct": 100.0, "per_follower": [], "unmatched_follower_fills": 0,
@@ -889,6 +940,13 @@ def summarise(rows: list[dict], groups: list[dict], unmatched: list[dict],
     # and a ladder rung with no fill of its own are not faults.
     errors = sum(groups_by_verdict.get(v, 0) for v in MISMATCH_VERDICTS)
 
+    # Churn is counted and reported SEPARATELY from position errors. A symbol can
+    # be perfectly positioned and still have cost a wasted round trip to get
+    # there — which is what a duplicate order looks like from the outside, and
+    # is invisible to a net-position check by construction.
+    churned = [g for g in groups if g.get("churn_flag")]
+    excess_churn = round(sum(g.get("excess_churn_lots") or 0 for g in churned), 8)
+
     per_follower = []
     for st in f_state:
         fid = st["account"]["id"]
@@ -911,6 +969,10 @@ def summarise(rows: list[dict], groups: list[dict], unmatched: list[dict],
             "median_delay_ms": f_delays[len(f_delays) // 2] if f_delays else None,
             "max_delay_ms": max(f_delays) if f_delays else None,
             "filled_lots": round(sum(g["filled_lots"] for g in my_groups), 8),
+            "gross_lots": round(sum(g["follower_gross"] for g in my_groups), 8),
+            "churn_symbols": sum(1 for g in my_groups if g.get("churn_flag")),
+            "excess_churn_lots": round(
+                sum(g.get("excess_churn_lots") or 0 for g in my_groups if g.get("churn_flag")), 8),
             "unreadable": bool(st["error"]),
         })
 
@@ -925,6 +987,8 @@ def summarise(rows: list[dict], groups: list[dict], unmatched: list[dict],
         "groups_matched": groups_by_verdict.get("matched", 0),
         "groups_by_verdict": groups_by_verdict,
         "errors": errors,
+        "churn_symbols": len(churned),
+        "excess_churn_lots": excess_churn,
         "avg_delay_ms": round(sum(delays) / len(delays), 1) if delays else None,
         "median_delay_ms": pct(0.5),
         "p95_delay_ms": pct(0.95),

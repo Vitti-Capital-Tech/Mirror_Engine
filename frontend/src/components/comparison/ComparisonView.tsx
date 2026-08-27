@@ -88,6 +88,11 @@ function ms(v: number | null | undefined) {
 function lots(v: number | null | undefined) {
   return v === null || v === undefined ? '—' : `${v}`;
 }
+/** Signed lots — the sign is the position direction, so never drop it. */
+function signed(v: number | null | undefined) {
+  if (v === null || v === undefined) return '—';
+  return v > 0 ? `+${v}` : `${v}`;
+}
 function px(v: number | null | undefined) {
   return v === null || v === undefined ? '—' : `${v}`;
 }
@@ -287,10 +292,15 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               sub={`${lots(data.master?.lots)} lots filled`} />
             <Stat label="Match rate" value={`${s.match_rate_pct}%`}
               tone={s.match_rate_pct >= 100 ? 'good' : s.match_rate_pct >= 95 ? 'warn' : 'bad'}
-              sub={`${s.groups_matched} of ${s.groups} symbol/side groups reconcile`} />
+              sub={`${s.groups_matched} of ${s.groups} symbols reconcile on net position`} />
             <Stat label="Errors" value={s.errors}
               tone={s.errors === 0 ? 'good' : 'bad'}
               sub={`missing ${s.groups_by_verdict?.missing || 0} · short ${s.groups_by_verdict?.short || 0} · over ${s.groups_by_verdict?.over || 0}`} />
+            <Stat label="Excess churn" value={lots(s.excess_churn_lots ?? 0)}
+              tone={s.churn_symbols ? 'warn' : 'good'}
+              sub={s.churn_symbols
+                ? `${s.churn_symbols} symbol${s.churn_symbols === 1 ? '' : 's'} round-tripped`
+                : 'no wasted turnover'} />
             <Stat label="Median delay" value={ms(s.median_delay_ms)}
               sub={`${s.delay_samples} sample${s.delay_samples === 1 ? '' : 's'}`} />
             <Stat label="Avg delay" value={ms(s.avg_delay_ms)}
@@ -320,10 +330,12 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               Symbol / side reconciliation
             </h3>
             <p className="text-[11px] text-text-muted mb-3 leading-relaxed">
-              <strong className="text-text-secondary">This is the verdict.</strong> Totals per
-              follower per symbol and side, so a laddered exit is judged as one exit rather than
-              rung by rung — the master splits an exit across many orders and the engine mirrors
-              it as a single ladder.
+              <strong className="text-text-secondary">This is the verdict.</strong> NET position
+              per symbol — buys and sells offset. That way a laddered exit is judged as one exit
+              rather than rung by rung, and a round trip (sell 57, buy back 28, hold 29) is not
+              mistaken for over-filling. The wasted turnover is real though, so it is judged
+              separately as <strong className="text-text-secondary">excess churn</strong> — which
+              is what a duplicate order looks like from the outside.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs border-collapse">
@@ -331,30 +343,30 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                   <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">
                     <th className="py-2.5">Follower</th>
                     <th>Symbol</th>
-                    <th>Side</th>
                     <th className="text-center">Verdict</th>
-                    <th className="text-right">Master lots</th>
+                    <th className="text-right">Master net</th>
                     <th className="text-right">Rungs</th>
-                    <th className="text-right">Target</th>
-                    <th className="text-right">Filled</th>
+                    <th className="text-right">Target net</th>
+                    <th className="text-right">Follower net</th>
+                    <th className="text-right" title="Total lots traded, both directions">Gross</th>
+                    <th className="text-right" title="Lots round-tripped beyond the master">Excess churn</th>
                     <th className="pl-4">Note</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/[0.04] font-medium">
                   {(data.groups || []).length === 0 && (
-                    <tr><td colSpan={9} className="py-8 text-center text-text-muted">
+                    <tr><td colSpan={10} className="py-8 text-center text-text-muted">
                       Nothing to reconcile on this day.
                     </td></tr>
                   )}
                   {(data.groups || []).map((g: any) => (
-                    <tr key={`${g.account_id}-${g.symbol}-${g.side}`} className="hover:bg-bg-panel/40">
+                    <tr key={`${g.account_id}-${g.symbol}`} className="hover:bg-bg-panel/40">
                       <td className="py-2.5 font-semibold text-text-primary">{g.account_name}</td>
                       <td className="font-mono text-text-primary">{g.symbol}</td>
-                      <td className={`font-bold ${g.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {(g.side || '').toUpperCase()}
-                      </td>
                       <td className="text-center"><VerdictBadge v={g.verdict} /></td>
-                      <td className="text-right font-mono text-text-primary">{lots(g.master_lots)}</td>
+                      <td className={`text-right font-mono ${g.master_net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {signed(g.master_net)}
+                      </td>
                       <td className="text-right font-mono text-text-secondary">
                         {g.master_orders}
                         {g.laddered && (
@@ -365,10 +377,22 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                         )}
                       </td>
                       <td className="text-right font-mono text-text-secondary" title={g.target_basis || ''}>
-                        {lots(g.target_lots)}
+                        {signed(g.target_net)}
                       </td>
-                      <td className="text-right font-mono text-text-primary">{lots(g.filled_lots)}</td>
-                      <td className="pl-4 text-text-muted">{g.note || '—'}</td>
+                      <td className={`text-right font-mono font-semibold ${g.follower_net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {signed(g.follower_net)}
+                      </td>
+                      <td className="text-right font-mono text-text-muted">{lots(g.follower_gross)}</td>
+                      <td className={`text-right font-mono ${g.churn_flag ? 'text-amber-400 font-bold' : 'text-text-muted'}`}
+                        title={g.churn_note || ''}>
+                        {g.churn_flag ? lots(g.excess_churn_lots) : '—'}
+                      </td>
+                      <td className="pl-4 text-text-muted">
+                        {g.note || '—'}
+                        {g.churn_flag && (
+                          <span className="block text-amber-400/80 mt-0.5">{g.churn_note}</span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

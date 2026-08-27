@@ -90,7 +90,7 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
         f"<b>Master</b> {escape(str(m.get('name') or '—'))}: "
         f"{m.get('order_count', 0)} orders, {_lots(m.get('lots'))} lots",
         f"<b>Match rate</b> {s['match_rate_pct']}%  "
-        f"({s['groups_matched']}/{s['groups']} symbol/side groups reconcile"
+        f"({s['groups_matched']}/{s['groups']} symbols reconcile on net position"
         f" · {s['master_orders']} master orders)",
         f"<b>Errors</b> {s['errors']}"
         + (f"  (missing {s['groups_by_verdict'].get('missing', 0)}, "
@@ -100,6 +100,15 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
         f"avg {_ms(s['avg_delay_ms'])} · p95 {_ms(s['p95_delay_ms'])} · "
         f"max {_ms(s['max_delay_ms'])}",
     ]
+
+    # Churn gets its own headline. It is not a position fault — the account can be
+    # exactly right and still have paid for a wasted round trip to get there —
+    # so it must not be folded into the error count, and must not be omitted.
+    if s.get("churn_symbols"):
+        lines.append(
+            f"<b>Churn</b> {s['churn_symbols']} symbol(s), "
+            f"{_lots(s['excess_churn_lots'])} lots round-tripped beyond the master"
+        )
 
     if s["per_follower"]:
         lines += ["", "<b>Per follower</b>"]
@@ -119,16 +128,28 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
         lines += ["", f"<b>Needs attention</b> ({len(bad)})"]
         for g in bad[:8]:
             lines.append(
-                f"· {escape(str(g['symbol']))} {g['side']} — "
+                f"· {escape(str(g['symbol']))} — "
                 f"{escape(str(g['account_name']))} "
                 f"{_VERDICT_LABEL.get(g['verdict'], g['verdict'])}: "
-                f"{_lots(g['filled_lots'])} of {_lots(g['target_lots'])} lots "
-                f"(master {_lots(g['master_lots'])}"
+                f"net {g['follower_net']:+g} against {g['target_net']:+g} "
+                f"(master net {g['master_net']:+g}"
                 + (f" over {g['master_orders']} rungs" if g["laddered"] else "")
                 + ")"
             )
         if len(bad) > 8:
             lines.append(f"· …and {len(bad) - 8} more")
+
+    churned = [g for g in (cmp.get("groups") or []) if g.get("churn_flag")]
+    if churned:
+        lines += ["", f"<b>Round-tripping</b> ({len(churned)}) — right position, wasted turnover"]
+        for g in churned[:6]:
+            lines.append(
+                f"· {escape(str(g['symbol']))} — {escape(str(g['account_name']))}: "
+                f"{_lots(g['follower_gross'])} lots gross to hold {g['follower_net']:+g} "
+                f"({_lots(g['excess_churn_lots'])} excess)"
+            )
+        if len(churned) > 6:
+            lines.append(f"· …and {len(churned) - 6} more")
 
     if cmp.get("unmatched_follower_fills"):
         lines += ["", f"<b>Unexplained follower fills</b> {len(cmp['unmatched_follower_fills'])}"
@@ -174,14 +195,18 @@ def render_csv(cmp: dict) -> str:
     # is exactly the mistake that made a laddered exit look like nine misses.
     if cmp.get("groups"):
         w.writerow(["SYMBOL/SIDE RECONCILIATION (the verdict — totals, ladder-safe)"])
-        w.writerow(["date", "follower", "symbol", "side", "verdict", "master_orders",
-                    "laddered", "master_lots", "target_lots", "filled_lots",
-                    "target_basis", "note"])
+        w.writerow(["date", "follower", "symbol", "verdict", "master_orders", "laddered",
+                    "master_net", "target_net", "follower_net",
+                    "master_gross", "follower_gross", "churn_lots", "excess_churn_lots",
+                    "churn_flag", "target_basis", "note", "churn_note"])
         for g in cmp["groups"]:
-            w.writerow([day, g["account_name"], g["symbol"], g["side"], g["verdict"],
+            w.writerow([day, g["account_name"], g["symbol"], g["verdict"],
                         g["master_orders"], "yes" if g["laddered"] else "no",
-                        _lots(g["master_lots"]), _lots(g["target_lots"]),
-                        _lots(g["filled_lots"]), g["target_basis"], g["note"]])
+                        _lots(g["master_net"]), _lots(g["target_net"]), _lots(g["follower_net"]),
+                        _lots(g["master_gross"]), _lots(g["follower_gross"]),
+                        _lots(g["churn_lots"]), _lots(g["excess_churn_lots"]),
+                        "yes" if g["churn_flag"] else "no",
+                        g["target_basis"], g["note"], g["churn_note"]])
         w.writerow([])
         w.writerow(["PER-ORDER DETAIL (supporting rows)"])
     w.writerow(CSV_COLUMNS)
@@ -302,6 +327,8 @@ def render_html(cmp: dict, *, label: str = "") -> str:
         _card("Match rate", f"{s['match_rate_pct']}%",
               "ok" if s["match_rate_pct"] >= 100 else "bad"),
         _card("Errors", str(s["errors"]), "bad" if s["errors"] else "ok"),
+        _card("Excess churn", _lots(s.get("excess_churn_lots") or 0),
+              "bad" if s.get("churn_symbols") else "ok"),
         _card("Median delay", _ms(s["median_delay_ms"])),
         _card("Avg delay", _ms(s["avg_delay_ms"])),
         _card("p95 delay", _ms(s["p95_delay_ms"])),
@@ -324,24 +351,33 @@ def render_html(cmp: dict, *, label: str = "") -> str:
     # the honest unit of comparison.
     if cmp.get("groups"):
         parts += ["<h2>Symbol / side reconciliation</h2>",
-                  "<p class='sub'>The verdict. Totals per follower per symbol and side, so a "
-                  "laddered exit is judged as one exit rather than rung by rung.</p>",
+                  "<p class='sub'>The verdict, on NET position per symbol — buys and sells "
+                  "offset, so a laddered exit is judged as one exit and a round trip is not "
+                  "mistaken for over-filling. Turnover is judged separately, on the right.</p>",
                   "<div class='scroll'><table><thead><tr><th>Follower</th><th>Symbol</th>",
-                  "<th>Side</th><th>Verdict</th><th class='n'>Master lots</th>",
-                  "<th class='n'>Rungs</th><th class='n'>Target</th><th class='n'>Filled</th>",
+                  "<th>Verdict</th><th class='n'>Master net</th><th class='n'>Rungs</th>",
+                  "<th class='n'>Target net</th><th class='n'>Follower net</th>",
+                  "<th class='n'>Gross</th><th class='n'>Excess churn</th>",
                   "<th>Note</th></tr></thead><tbody>"]
         for g in cmp["groups"]:
-            side_cls = "side-buy" if g["side"] == "buy" else "side-sell"
+            churn = (f"<span style='color:#b45309;font-weight:650'>{_lots(g['excess_churn_lots'])}</span>"
+                     if g["churn_flag"] else "—")
+            note = g["note"] or ""
+            if g["churn_flag"]:
+                note = (note + " · " if note else "") + escape(g["churn_note"])
+            else:
+                note = escape(note)
             parts.append(
                 f"<tr><td><strong>{escape(str(g['account_name']))}</strong></td>"
                 f"<td class='mono'>{escape(str(g['symbol']))}</td>"
-                f"<td class='{side_cls}'>{escape(str(g['side'] or '').upper())}</td>"
                 f"<td>{_pill(g['verdict'])}</td>"
-                f"<td class='n'>{_lots(g['master_lots'])}</td>"
+                f"<td class='n'>{_lots(g['master_net'])}</td>"
                 f"<td class='n'>{g['master_orders']}</td>"
-                f"<td class='n' title=\"{escape(g['target_basis'])}\">{_lots(g['target_lots'])}</td>"
-                f"<td class='n'>{_lots(g['filled_lots'])}</td>"
-                f"<td class='muted'>{escape(g['note'] or '')}</td></tr>"
+                f"<td class='n' title=\"{escape(g['target_basis'])}\">{_lots(g['target_net'])}</td>"
+                f"<td class='n'>{_lots(g['follower_net'])}</td>"
+                f"<td class='n muted'>{_lots(g['follower_gross'])}</td>"
+                f"<td class='n'>{churn}</td>"
+                f"<td class='muted'>{note}</td></tr>"
             )
         parts.append("</tbody></table></div>")
 
