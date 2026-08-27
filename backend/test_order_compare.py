@@ -188,6 +188,8 @@ def test_cancel_matching():
     l = leg_for(out["rows"][0], "f1")
     check("both cancelled", l["verdict"], "cancelled_ok")
     check("not an error", out["summary"]["errors"], 0)
+    check("a mirrored cancel counts as matched", out["summary"]["matched"], 1)
+    check("match rate 100%", out["summary"]["match_rate_pct"], 100.0)
 
 
 def test_cancel_missed_is_an_error():
@@ -225,8 +227,12 @@ def test_ladder_is_not_graded_rung_by_rung():
     fo = [order("555", "C-BTC-79800", "sell", 30, T0 + timedelta(seconds=3), filled=30)]
     out = run([MASTER, f], {"m1": m, "f1": fo})
     verdicts = sorted(leg_for(r, "f1")["verdict"] for r in out["rows"])
-    check("all three rungs neutral", verdicts, ["ladder", "ladder", "ladder"])
+    check("all three rungs read as ladder", verdicts, ["ladder", "ladder", "ladder"])
     check("no errors", out["summary"]["errors"], 0)
+    # A correctly-covered rung is a RIGHT answer, so it counts as matched. It used
+    # to be excluded from the rate, which read 0% on a day with nothing wrong.
+    check("counted as matched", out["summary"]["matched"], 3)
+    check("match rate is 100%, not 0%", out["summary"]["match_rate_pct"], 100.0)
 
 
 def test_ladder_that_is_genuinely_oversized():
@@ -277,6 +283,21 @@ def test_unreadable_follower():
     check("not counted as an error", out["summary"]["errors"], 0)
     check_true("surfaced as a warning", any("unreadable" in w for w in out["warnings"]),
                str(out["warnings"]))
+
+
+def test_ungradable_stays_out_of_the_rate():
+    print("\nan unreadable account is neither a pass nor a fail")
+    f = follower()
+    out = run([MASTER, f], {
+        "m1": [order("900", "P-BTC-74500", "sell", 2750, T0, filled=2750)],
+    }, errors={"f1": "401 Unauthorized"})
+    s = out["summary"]
+    check("not counted as matched", s["matched"], 0)
+    check("not counted as an error", s["errors"], 0)
+    check("nothing gradable at all", s["graded"], 0)
+    # No gradable legs -> the rate is not a claim about anything, so it defaults
+    # to 100 rather than inventing a failure.
+    check("rate does not invent a failure", s["match_rate_pct"], 100.0)
 
 
 def test_time_diff_stats():
@@ -370,6 +391,7 @@ def main():
         test_paused_followers_excluded,
         test_stop_orders_excluded,
         test_unreadable_follower,
+        test_ungradable_stays_out_of_the_rate,
         test_time_diff_stats,
         test_extra_order_on_untraded_symbol,
         test_renderers,

@@ -45,13 +45,17 @@ const VERDICT: Record<string, { label: string; cls: string; help: string }> = {
     label: 'UNWANTED FILL', cls: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
     help: 'The master cancelled without filling, but the follower traded anyway.',
   },
+  // These are CORRECT outcomes, so they read as MATCHED. The tooltip carries
+  // which kind, and the CSV keeps the precise verdict for anyone who needs the
+  // split — but on the row itself "the engine did the right thing" is the fact
+  // that matters, and three shades of green just made it harder to scan.
   cancelled_ok: {
-    label: 'CANCELLED OK', cls: 'bg-emerald-500/10 text-emerald-400/90 border-emerald-500/20',
-    help: 'The master cancelled and the follower cancelled too — correctly mirrored.',
+    label: 'MATCHED', cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    help: 'Matched (cancel): the master cancelled its order and the follower cancelled its mirror too.',
   },
   ladder: {
-    label: 'LADDER', cls: 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20',
-    help: 'One rung of a laddered action. The engine mirrors a ladder as ONE order, so the ladder’s total is judged rather than this rung.',
+    label: 'MATCHED', cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    help: 'Matched (ladder): this rung had no follower order of its own — which is correct, the engine mirrors a whole ladder with ONE order — and the ladder’s total came out right.',
   },
   skipped: {
     label: 'SKIPPED', cls: 'bg-slate-500/10 text-slate-300 border-slate-500/20',
@@ -68,6 +72,8 @@ const VERDICT: Record<string, { label: string; cls: string; help: string }> = {
 };
 
 const MISMATCH = new Set(['oversized', 'undersized', 'missing', 'cancel_missed', 'extra']);
+/** Correct outcomes — counted as matched everywhere. */
+const PASS = new Set(['matched', 'ladder', 'cancelled_ok']);
 
 function VerdictBadge({ v }: { v: string }) {
   const m = VERDICT[v] || { label: (v || '?').toUpperCase(), cls: 'bg-slate-500/10 text-slate-300 border-slate-500/20', help: '' };
@@ -138,7 +144,7 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
       for (const l of r.legs || []) out.push({ r, l });
     }
     if (filter === 'mismatch') return out.filter(x => MISMATCH.has(x.l.verdict));
-    if (filter === 'matched') return out.filter(x => x.l.verdict === 'matched');
+    if (filter === 'matched') return out.filter(x => PASS.has(x.l.verdict));
     return out;
   }, [rows, filter]);
 
@@ -147,7 +153,7 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
     for (const r of rows) for (const l of r.legs || []) {
       total++;
       if (MISMATCH.has(l.verdict)) mis++;
-      else if (l.verdict === 'matched') ok++;
+      else if (PASS.has(l.verdict)) ok++;
     }
     return { mis, ok, total };
   }, [rows]);
@@ -320,7 +326,16 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                       <td className="px-3 text-right font-mono text-text-secondary whitespace-nowrap">{ms(f.max_time_diff_ms)}</td>
                       <td className="px-3">
                         <div className="flex flex-wrap gap-1">
-                          {Object.entries(f.by_verdict || {}).map(([v, n]) => (
+                          {/* grouped by the badge that will be shown — ladder and
+                              cancelled_ok both render MATCHED, so counting them
+                              apart would print the same badge twice */}
+                          {Object.entries(
+                            Object.entries(f.by_verdict || {}).reduce((acc: any, [v, n]) => {
+                              const key = PASS.has(v) ? 'matched' : v;
+                              acc[key] = (acc[key] || 0) + (n as number);
+                              return acc;
+                            }, {})
+                          ).map(([v, n]) => (
                             <span key={v} className="inline-flex items-center gap-1">
                               <VerdictBadge v={v} />
                               <span className="text-text-muted font-mono text-[10px]">{n as number}</span>
@@ -476,10 +491,18 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
           <div className="card-premium p-5">
             <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.12em] mb-3">How to read this</h3>
             <div className="grid sm:grid-cols-2 gap-x-8 gap-y-2">
-              {Object.entries(VERDICT).map(([k, v]) => (
+              {Object.entries(VERDICT)
+                // ladder / cancelled_ok render as MATCHED, so listing all three
+                // would show the same badge three times.
+                .filter(([k]) => k !== 'ladder' && k !== 'cancelled_ok')
+                .map(([k, v]) => (
                 <div key={k} className="flex items-start gap-2">
                   <span className="shrink-0 mt-0.5"><VerdictBadge v={k} /></span>
-                  <span className="text-[11px] text-text-muted leading-relaxed">{v.help}</span>
+                  <span className="text-[11px] text-text-muted leading-relaxed">
+                    {k === 'matched'
+                      ? 'The engine did the right thing. Covers a correctly-sized order, a rung of a ladder whose total is right, and a cancel the follower mirrored. Hover a row for which.'
+                      : v.help}
+                  </span>
                 </div>
               ))}
             </div>

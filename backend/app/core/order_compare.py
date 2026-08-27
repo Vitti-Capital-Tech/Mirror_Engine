@@ -77,7 +77,24 @@ INFER_WINDOW_SEC = 120.0
 SIZE_TOLERANCE = 1.0
 
 MISMATCH_VERDICTS = {"missing", "oversized", "undersized", "cancel_missed", "extra"}
-NEUTRAL_VERDICTS = {"ladder", "skipped", "unsized", "unreadable", "cancelled_ok"}
+
+# Outcomes that are CORRECT — the engine did what it was supposed to. All three
+# count as matched in the rate and render as matched in every view.
+#
+#   matched      — the follower punched the right size for this master order.
+#   ladder       — this rung had no follower order of its own, which is exactly
+#                  what should happen (the engine mirrors a whole ladder with one
+#                  order), AND the ladder's total came out right.
+#   cancelled_ok — the master cancelled and the follower cancelled too.
+#
+# `ladder` and `cancelled_ok` used to be excluded from the rate rather than
+# counted, which read as 0% on a day with four correctly-covered rungs and one
+# correctly-mirrored cancel. Excluding a right answer is not neutrality.
+PASS_VERDICTS = {"matched", "ladder", "cancelled_ok"}
+
+# Genuinely ungradable — we cannot say whether these were right or wrong, so they
+# are left out of the rate in either direction rather than scored as a guess.
+NEUTRAL_VERDICTS = {"skipped", "unsized", "unreadable"}
 
 # Worst-first, so a master order's row takes its worst leg.
 _SEVERITY = {
@@ -365,11 +382,13 @@ def summarise(rows: list, f_state: list, extra_orders: list) -> dict:
         return diffs[min(len(diffs) - 1, max(0, int(round((len(diffs) - 1) * p))))]
 
     def rate(items):
+        """Of the legs we could actually judge, how many were right."""
         graded = [i for i in items
-                  if i["verdict"] in MISMATCH_VERDICTS or i["verdict"] == "matched"]
+                  if i["verdict"] in MISMATCH_VERDICTS or i["verdict"] in PASS_VERDICTS]
         if not graded:
             return None
-        return round(sum(1 for i in graded if i["verdict"] == "matched") / len(graded) * 100, 2)
+        passed = sum(1 for i in graded if i["verdict"] in PASS_VERDICTS)
+        return round(passed / len(graded) * 100, 2)
 
     per_follower = []
     for st in f_state:
@@ -387,6 +406,8 @@ def summarise(rows: list, f_state: list, extra_orders: list) -> dict:
             "orders": len(mine),
             "by_verdict": counts,
             "errors": sum(counts.get(v, 0) for v in MISMATCH_VERDICTS),
+            "matched": sum(counts.get(v, 0) for v in PASS_VERDICTS),
+            "graded": sum(counts.get(v, 0) for v in PASS_VERDICTS | MISMATCH_VERDICTS),
             "match_rate_pct": rate(mine),
             "avg_time_diff_ms": round(sum(d) / len(d), 1) if d else None,
             "median_time_diff_ms": d[len(d) // 2] if d else None,
@@ -399,7 +420,9 @@ def summarise(rows: list, f_state: list, extra_orders: list) -> dict:
         "master_orders": len(rows),
         "legs": len(all_legs),
         "by_verdict": by_verdict,
-        "matched": by_verdict.get("matched", 0),
+        "matched": sum(by_verdict.get(v, 0) for v in PASS_VERDICTS),
+        "graded": sum(by_verdict.get(v, 0)
+                      for v in PASS_VERDICTS | MISMATCH_VERDICTS),
         "errors": sum(by_verdict.get(v, 0) for v in MISMATCH_VERDICTS),
         "match_rate_pct": 100.0 if r is None else r,
         "avg_time_diff_ms": round(sum(diffs) / len(diffs), 1) if diffs else None,

@@ -44,8 +44,9 @@ _VERDICT_LABEL = {
     "missing": "Missing",
     "cancel_missed": "Cancel missed",
     "extra": "Unwanted fill",
-    "cancelled_ok": "Cancelled OK",
-    "ladder": "Ladder rung",
+    # Correct outcomes, so they read as Matched. The CSV keeps the raw verdict.
+    "cancelled_ok": "Matched",
+    "ladder": "Matched",
     "skipped": "Skipped",
     "unsized": "No target",
     "unreadable": "Unreadable",
@@ -214,7 +215,7 @@ def render_csv(cmp: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _VERDICT_COLOR = {
-    "matched": "#0f7b46", "ladder": "#4338ca", "cancelled_ok": "#0f7b46",
+    "matched": "#0f7b46", "ladder": "#0f7b46", "cancelled_ok": "#0f7b46",
     "oversized": "#b91c1c", "undersized": "#b45309", "missing": "#b91c1c",
     "cancel_missed": "#b91c1c", "extra": "#b45309",
     "skipped": "#64748b", "unsized": "#7c3aed", "unreadable": "#b91c1c",
@@ -311,8 +312,13 @@ def render_html(cmp: dict, *, label: str = "") -> str:
               "<th class='n'>Median</th><th class='n'>Avg</th><th class='n'>Max</th>",
               "<th>Breakdown</th></tr></thead><tbody>"]
     for f in s["per_follower"]:
-        breakdown = " · ".join(f"{escape(_VERDICT_LABEL.get(k, k))} {v}"
-                               for k, v in sorted(f["by_verdict"].items())) or "—"
+        # Group by DISPLAY label: ladder and cancelled_ok both read "Matched",
+        # so counting them separately would print Matched twice.
+        merged: dict = {}
+        for k, v in f["by_verdict"].items():
+            label = _VERDICT_LABEL.get(k, k)
+            merged[label] = merged.get(label, 0) + v
+        breakdown = " · ".join(f"{escape(k)} {v}" for k, v in sorted(merged.items())) or "—"
         rate = "—" if f["match_rate_pct"] is None else f"{f['match_rate_pct']}%"
         flag = " <span class='pill' style='color:#b91c1c'>Unreadable</span>" if f["unreadable"] else ""
         parts.append(
