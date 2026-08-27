@@ -286,15 +286,15 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">
-                    <th className="py-2.5">Follower</th>
-                    <th className="text-right">Ratio</th>
-                    <th className="text-right">Order legs</th>
-                    <th className="text-right">Matched</th>
-                    <th className="text-right">Unmatched</th>
-                    <th className="text-right">Median</th>
-                    <th className="text-right">Avg</th>
-                    <th className="text-right">Max</th>
-                    <th className="pl-4">Breakdown</th>
+                    <th className="py-2.5 px-3 whitespace-nowrap">Follower</th>
+                    <th className="px-3 text-right whitespace-nowrap">Ratio</th>
+                    <th className="px-3 text-right whitespace-nowrap">Order legs</th>
+                    <th className="px-3 text-right whitespace-nowrap">Matched</th>
+                    <th className="px-3 text-right whitespace-nowrap">Unmatched</th>
+                    <th className="px-3 text-right whitespace-nowrap">Median</th>
+                    <th className="px-3 text-right whitespace-nowrap">Avg</th>
+                    <th className="px-3 text-right whitespace-nowrap">Max</th>
+                    <th className="px-3">Breakdown</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/[0.04] font-medium">
@@ -303,22 +303,22 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                   )}
                   {(s.per_follower || []).map((f: any) => (
                     <tr key={f.account_id} className="hover:bg-bg-panel/40">
-                      <td className="py-2.5 font-semibold text-text-primary">
+                      <td className="py-2.5 px-3 font-semibold text-text-primary whitespace-nowrap">
                         {f.account_name}
                         {f.unreadable && <span className="ml-2"><VerdictBadge v="unreadable" /></span>}
                       </td>
-                      <td className="text-right font-mono text-text-secondary" title={f.ratio_basis || ''}>{ratio(f.ratio)}</td>
-                      <td className="text-right font-mono text-text-secondary">{f.orders}</td>
-                      <td className={`text-right font-mono font-bold ${
+                      <td className="px-3 text-right font-mono text-text-secondary" title={f.ratio_basis || ''}>{ratio(f.ratio)}</td>
+                      <td className="px-3 text-right font-mono text-text-secondary">{f.orders}</td>
+                      <td className={`px-3 text-right font-mono font-bold ${
                         f.match_rate_pct === null ? 'text-text-muted'
                           : f.match_rate_pct >= 100 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {f.match_rate_pct === null ? '—' : `${f.match_rate_pct}%`}
                       </td>
-                      <td className={`text-right font-mono font-bold ${f.errors ? 'text-rose-400' : 'text-emerald-400'}`}>{f.errors}</td>
-                      <td className="text-right font-mono text-text-secondary">{ms(f.median_time_diff_ms)}</td>
-                      <td className="text-right font-mono text-text-secondary">{ms(f.avg_time_diff_ms)}</td>
-                      <td className="text-right font-mono text-text-secondary">{ms(f.max_time_diff_ms)}</td>
-                      <td className="pl-4">
+                      <td className={`px-3 text-right font-mono font-bold ${f.errors ? 'text-rose-400' : 'text-emerald-400'}`}>{f.errors}</td>
+                      <td className="px-3 text-right font-mono text-text-secondary whitespace-nowrap">{ms(f.median_time_diff_ms)}</td>
+                      <td className="px-3 text-right font-mono text-text-secondary whitespace-nowrap">{ms(f.avg_time_diff_ms)}</td>
+                      <td className="px-3 text-right font-mono text-text-secondary whitespace-nowrap">{ms(f.max_time_diff_ms)}</td>
+                      <td className="px-3">
                         <div className="flex flex-wrap gap-1">
                           {Object.entries(f.by_verdict || {}).map(([v, n]) => (
                             <span key={v} className="inline-flex items-center gap-1">
@@ -363,18 +363,19 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px] select-none">
-                    <th className="py-2.5">Time (IST)</th>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th className="text-right">Master</th>
-                    <th>Follower</th>
-                    <th className="text-center">Verdict</th>
-                    <th className="text-right">Ratio</th>
-                    <th className="text-right" title="What the follower should have punched / what it actually punched">
+                    <th className="py-2.5 px-3 whitespace-nowrap">Time (IST)</th>
+                    <th className="px-3 whitespace-nowrap">Symbol</th>
+                    <th className="px-3 whitespace-nowrap">Side</th>
+                    <th className="px-3 text-right whitespace-nowrap">Master</th>
+                    <th className="px-3 whitespace-nowrap">Follower</th>
+                    <th className="px-3 text-center whitespace-nowrap">Verdict</th>
+                    <th className="px-3 text-right whitespace-nowrap">Ratio</th>
+                    <th className="px-3 text-right whitespace-nowrap"
+                      title="What the follower should have punched / what it actually punched">
                       Target / Punched
                     </th>
-                    <th className="text-right">Time diff</th>
-                    <th className="pl-3">Reason</th>
+                    <th className="px-3 text-right whitespace-nowrap">Time diff</th>
+                    <th className="px-3 min-w-[220px]">Reason</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/[0.04] font-medium">
@@ -391,39 +392,39 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                         className={bad
                           ? 'bg-red-500/[0.09] hover:bg-red-500/[0.14] border-l-2 border-l-rose-500'
                           : 'hover:bg-bg-panel/40'}>
-                        <td className="py-2.5 font-mono text-text-secondary">{clock(r.placed_at)}</td>
-                        <td className="font-mono font-semibold text-text-primary">{r.symbol}</td>
-                        <td>
+                        <td className="py-2.5 px-3 font-mono text-text-secondary whitespace-nowrap">{clock(r.placed_at)}</td>
+                        <td className="px-3 font-mono font-semibold text-text-primary whitespace-nowrap">{r.symbol}</td>
+                        <td className="px-3">
                           <span className={`inline-flex items-center gap-1 font-bold ${buy ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {buy ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
                             {(r.side || '').toUpperCase()}
                           </span>
                         </td>
                         {/* master lots with its order state underneath */}
-                        <td className="text-right font-mono text-text-primary leading-tight">
+                        <td className="px-3 text-right font-mono text-text-primary leading-tight whitespace-nowrap">
                           {lots(r.master_lots)}
                           <span className="block text-[10px] text-text-muted font-sans">{r.master_state}</span>
                         </td>
-                        <td className="text-text-primary">{l.account_name}</td>
-                        <td className="text-center"><VerdictBadge v={l.verdict} /></td>
-                        <td className="text-right font-mono text-text-secondary"
+                        <td className="px-3 text-text-primary whitespace-nowrap">{l.account_name}</td>
+                        <td className="px-3 text-center"><VerdictBadge v={l.verdict} /></td>
+                        <td className="px-3 text-right font-mono text-text-secondary whitespace-nowrap"
                           title={`target ratio ${ratio(l.ratio_target)}`}>
                           {ratio(l.ratio_actual)}
                         </td>
                         {/* target / punched — the comparison, side by side */}
-                        <td className="text-right font-mono whitespace-nowrap">
+                        <td className="px-3 text-right font-mono whitespace-nowrap">
                           <span className="text-text-muted" title={l.target_basis || ''}>{lots(l.target_lots)}</span>
-                          <span className="text-text-muted mx-1">/</span>
+                          <span className="text-text-muted mx-1.5">/</span>
                           <span className={bad ? 'text-rose-400 font-bold' : 'text-text-primary font-semibold'}>
                             {lots(l.placed_lots)}
                           </span>
                         </td>
-                        <td className={`text-right font-mono ${
+                        <td className={`px-3 text-right font-mono whitespace-nowrap ${
                           l.time_diff_ms !== null && Math.abs(l.time_diff_ms) > 30_000 ? 'text-amber-400' : 'text-text-secondary'}`}>
                           {ms(l.time_diff_ms)}
                         </td>
                         {/* reason only where something is actually wrong */}
-                        <td className="pl-3 text-rose-300/90">{bad ? (l.note || l.leg_reason || '') : ''}</td>
+                        <td className="px-3 text-rose-300/90 leading-snug">{bad ? (l.note || l.leg_reason || '') : ''}</td>
                       </tr>
                     );
                   })}
@@ -445,24 +446,25 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                 <table className="w-full text-left text-xs border-collapse">
                   <thead>
                     <tr className="text-text-muted border-b border-bg-border uppercase font-bold text-[10px]">
-                      <th className="py-2.5">Time (IST)</th><th>Follower</th><th>Symbol</th><th>Side</th>
-                      <th className="text-right">Lots</th><th className="text-right">Filled</th>
-                      <th>State</th><th>Order id</th>
+                      <th className="py-2.5 px-3">Time (IST)</th><th className="px-3">Follower</th>
+                      <th className="px-3">Symbol</th><th className="px-3">Side</th>
+                      <th className="px-3 text-right">Lots</th><th className="px-3 text-right">Filled</th>
+                      <th className="px-3">State</th><th className="px-3">Order id</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/[0.04] font-medium">
                     {data.extra_follower_orders.map((e: any) => (
                       <tr key={`${e.account_id}-${e.follower_order_id}`} className="hover:bg-bg-panel/40">
-                        <td className="py-2.5 font-mono text-text-secondary">{clock(e.placed_at)}</td>
-                        <td className="font-semibold text-text-primary">{e.account_name}</td>
-                        <td className="font-mono text-text-primary">{e.symbol}</td>
-                        <td className={`font-bold ${e.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        <td className="py-2.5 px-3 font-mono text-text-secondary whitespace-nowrap">{clock(e.placed_at)}</td>
+                        <td className="px-3 font-semibold text-text-primary whitespace-nowrap">{e.account_name}</td>
+                        <td className="px-3 font-mono text-text-primary whitespace-nowrap">{e.symbol}</td>
+                        <td className={`px-3 font-bold ${e.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}`}>
                           {(e.side || '').toUpperCase()}
                         </td>
-                        <td className="text-right font-mono text-text-primary">{lots(e.lots)}</td>
-                        <td className="text-right font-mono text-text-secondary">{lots(e.filled)}</td>
-                        <td className="text-text-muted">{e.state}</td>
-                        <td className="font-mono text-text-muted">{e.follower_order_id}</td>
+                        <td className="px-3 text-right font-mono text-text-primary">{lots(e.lots)}</td>
+                        <td className="px-3 text-right font-mono text-text-secondary">{lots(e.filled)}</td>
+                        <td className="px-3 text-text-muted">{e.state}</td>
+                        <td className="px-3 font-mono text-text-muted">{e.follower_order_id}</td>
                       </tr>
                     ))}
                   </tbody>
