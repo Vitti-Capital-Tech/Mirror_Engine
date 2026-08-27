@@ -2049,24 +2049,46 @@ class CopyEngine:
             # BUT verify the mapped follower order still exists: we only listen to
             # the master's WS, so a mirrored order that already filled/cancelled
             # leaves a stale map that would otherwise block re-placing forever.
-            if not is_update:
-                mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
-                if mapped:
-                    # Cheapest check first: if we already concluded this mirror is
-                    # done, skip without touching the exchange at all. The master
-                    # re-sends the same order on every WS update and reconcile pass,
-                    # and same-symbol events are serialised — so a REST call here
-                    # lengthens the queue for every event behind it (a 20s tail spike
-                    # on P-BTC-62800-040826, 2026-08-04, came from exactly that).
-                    done_key = f"mirrordone:{master_order_id}:{follower['id']}"
-                    if await self.redis.get(done_key):
+            # This guard runs for EVERY event kind, updates included.
+            #
+            # It used to be wrapped in `if not is_update:`, on the theory that an
+            # edit should reach the edit path below. But an edit whose mirror has
+            # already FILLED has nothing to edit, and skipping the guard sent it
+            # to edit_order() -> HTTP 400 -> the except branch -> a fresh order.
+            # Observed 2026-08-26 on C-BTC-81600-270826: master order 1499233790
+            # mirrored to 1499233859 (26 lots), that mirror filled at 21:12:45, an
+            # `action=update` for the same master order arrived at 21:12:47, and a
+            # duplicate 26-lot sell (1499234168) went out at 21:12:53. The follower
+            # held 52 against a 26 target until the reconciler bought it back —
+            # right position eventually, two round trips of fees to get there, and
+            # ~3x the necessary turnover across the day.
+            #
+            # Same class as the 2026-08-04 double-exit (P-BTC-63200-040826); that
+            # fix guarded this path only for non-updates, leaving the update door
+            # open.
+            mapped = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
+            if mapped:
+                # Cheapest check first: if we already concluded this mirror is
+                # done, skip without touching the exchange at all. The master
+                # re-sends the same order on every WS update and reconcile pass,
+                # and same-symbol events are serialised — so a REST call here
+                # lengthens the queue for every event behind it (a 20s tail spike
+                # on P-BTC-62800-040826, 2026-08-04, came from exactly that).
+                done_key = f"mirrordone:{master_order_id}:{follower['id']}"
+                if await self.redis.get(done_key):
+                    _hist_leg(follower, once=True, status="pending",
+                              follower_order_id=mapped)
+                    continue
+
+                if await self._order_is_live(client, mapped, follower["id"]):
+                    # Still resting. A plain re-send has nothing to do; an EDIT
+                    # falls through to the edit path below, which is the one case
+                    # that may legitimately act on an already-mirrored order.
+                    if not is_update:
                         _hist_leg(follower, once=True, status="pending",
                                   follower_order_id=mapped)
                         continue
-                    if await self._order_is_live(client, mapped, follower["id"]):
-                        _hist_leg(follower, once=True, status="pending",
-                                  follower_order_id=mapped)
-                        continue
+                else:
                     # Not resting any more — but WHY matters. A mirror that FILLED
                     # has done its job and must never be re-placed; only one that was
                     # cancelled without filling leaves work outstanding.
@@ -2077,12 +2099,36 @@ class CopyEngine:
                     # 1-lot sell went out (2026-08-04, P-BTC-63200-040826 — the master
                     # exited once, the follower twice, booking the same P&L twice).
                     prev = await self._safe_get_order(client, mapped)
+                    if not prev:
+                        # _safe_get_order returns {} on ANY read failure, and an
+                        # empty dict scores as "not filled" — so a hiccuped status
+                        # check used to fall straight through to re-placing. Same
+                        # asymmetry as _order_is_live: never risk a duplicate
+                        # because a read failed. The reconciler covers a genuine
+                        # gap 15s later.
+                        logger.warning(
+                            f"Could not read mirror {mapped} for {follower['name']} — "
+                            f"not re-placing {master_order_id} on an unreadable status."
+                        )
+                        continue
                     if self._filled_size(prev) > 0 or self._order_done(prev):
                         logger.info(
                             f"Skipping re-mirror of {master_order_id} to {follower['name']}: "
                             f"mirror {mapped} already filled — nothing outstanding"
                         )
                         await self.redis.set(done_key, "1", ex=7 * 24 * 3600)
+                        continue
+                    if is_update:
+                        # An edit for a mirror that is gone but never filled: there
+                        # is nothing to edit, and this event describes a price
+                        # change, not new exposure. Placing here is the other route
+                        # by which an update becomes a duplicate position.
+                        logger.info(
+                            f"Update for {master_order_id}: {follower['name']}'s mirror "
+                            f"{mapped} is gone without filling — nothing to edit, "
+                            f"leaving it to the reconciler."
+                        )
+                        await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
                         continue
                     # cancelled without filling — clear and re-place
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
@@ -2327,8 +2373,30 @@ class CopyEngine:
                     continue
                 except Exception as e:
                     body = getattr(getattr(e, "response", None), "text", "")
+                    # A REJECTED EDIT IS NOT PROOF THE ORDER IS GONE. The old
+                    # comment here assumed it was ("the mapped one was gone") and
+                    # re-placed unconditionally — but Delta also rejects an edit of
+                    # an order that already FILLED, and re-placing then books the
+                    # trade twice. Observed 2026-08-26, C-BTC-81600-270826:
+                    # PUT /v2/orders -> 400 at 21:12:52, duplicate 26-lot sell at
+                    # 21:12:53. The guard above now catches this earlier; this is
+                    # the second line of defence, because the cost of guessing
+                    # wrong here is a real unwanted position.
+                    prev = await self._safe_get_order(client, existing_foid)
+                    if not prev or self._filled_size(prev) > 0 or self._order_done(prev):
+                        logger.warning(
+                            f"Order edit failed for {follower['name']} ({e} {body}); mirror "
+                            f"{existing_foid} has already filled or is unreadable — NOT "
+                            f"re-placing."
+                        )
+                        if prev:
+                            await self.redis.set(
+                                f"mirrordone:{master_order_id}:{follower['id']}",
+                                "1", ex=7 * 24 * 3600,
+                            )
+                        continue
                     logger.warning(f"Order edit failed for {follower['name']} ({e} {body}); re-placing so the update reflects on the first try.")
-                    # fall through to place a fresh order (the mapped one was gone)
+                    # fall through to place a fresh order (the mapped one really was gone)
 
             try:
                 resp = await self._place_order_with_retry(
