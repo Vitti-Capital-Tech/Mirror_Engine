@@ -243,7 +243,8 @@ th { text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing
 td { padding:8px 10px; border-bottom:1px solid #f0f2f5; vertical-align:top; }
 tr:last-child td { border-bottom:none; }
 td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
-tr.bad td { background:#fff5f5; }
+tr.bad td { background:#fef2f2; }
+tr.bad td:first-child { box-shadow: inset 3px 0 0 #b91c1c; }
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; }
 .pill { display:inline-block; padding:1px 7px; border-radius:20px; font-size:10.5px;
         font-weight:650; border:1px solid currentColor; white-space:nowrap; }
@@ -331,13 +332,12 @@ def render_html(cmp: dict, *, label: str = "") -> str:
               "it records what the engine did at the moment it did it, which is what a "
               "position check cannot show once the reconciler has tidied up.</p>",
               "<div class='scroll'><table><thead><tr><th>Time (IST)</th><th>Symbol</th>",
-              "<th>Side</th><th>Type</th><th class='n'>Master lots</th><th>State</th>",
-              "<th>Follower</th><th>Verdict</th><th class='n'>Punched</th>",
-              "<th class='n'>Target</th><th class='n'>Ratio</th><th class='n'>Time diff</th>",
-              "<th>Reason</th></tr></thead><tbody>"]
+              "<th>Side</th><th class='n'>Master</th><th>Follower</th><th>Verdict</th>",
+              "<th class='n'>Ratio</th><th class='n'>Target / Punched</th>",
+              "<th class='n'>Time diff</th><th>Reason</th></tr></thead><tbody>"]
     rows = cmp.get("rows") or []
     if not rows:
-        parts.append("<tr><td colspan='13' class='muted'>No master orders in this window.</td></tr>")
+        parts.append("<tr><td colspan='10' class='muted'>No master orders in this window.</td></tr>")
     for r in rows:
         span = max(1, len(r["legs"]))
         side_cls = "side-buy" if r["side"] == "buy" else "side-sell"
@@ -345,26 +345,35 @@ def render_html(cmp: dict, *, label: str = "") -> str:
             bad = bool(l and l["verdict"] in oc.MISMATCH_VERDICTS)
             cells = ""
             if i == 0:
+                # Master lots carries its order state underneath rather than
+                # spending a whole column on one word.
                 cells = (
                     f"<td rowspan='{span}' class='mono'>{_clock(r['placed_at'])}</td>"
                     f"<td rowspan='{span}' class='mono'>{escape(str(r['symbol']))}</td>"
                     f"<td rowspan='{span}' class='{side_cls}'>{escape(str(r['side'] or '').upper())}</td>"
-                    f"<td rowspan='{span}' class='muted'>{escape(str(r.get('order_type') or ''))}</td>"
-                    f"<td rowspan='{span}' class='n'>{_lots(r['master_lots'])}</td>"
-                    f"<td rowspan='{span}' class='muted'>{escape(str(r.get('master_state') or ''))}</td>"
+                    f"<td rowspan='{span}' class='n'>{_lots(r['master_lots'])}"
+                    f"<div class='muted' style='font-size:10px'>"
+                    f"{escape(str(r.get('master_state') or ''))}</div></td>"
                 )
             if l is None:
-                parts.append(f"<tr>{cells}<td colspan='7' class='muted'>No active followers.</td></tr>")
+                parts.append(f"<tr>{cells}<td colspan='6' class='muted'>No active followers.</td></tr>")
                 continue
+            punched = _lots(l.get("placed_lots"))
+            punched_html = (f"<strong style='color:#b91c1c'>{punched}</strong>" if bad
+                            else f"<strong>{punched}</strong>")
             parts.append(
                 f"<tr class='{'bad' if bad else ''}'>{cells}"
                 f"<td>{escape(str(l['account_name']))}</td>"
                 f"<td>{_pill(l['verdict'])}</td>"
-                f"<td class='n'>{_lots(l.get('placed_lots'))}</td>"
-                f"<td class='n' title=\"{escape(str(l.get('target_basis') or ''))}\">{_lots(l.get('target_lots'))}</td>"
-                f"<td class='n mono'>{_ratio(l.get('ratio_actual'))}</td>"
+                f"<td class='n mono' title=\"target ratio {_ratio(l.get('ratio_target'))}\">"
+                f"{_ratio(l.get('ratio_actual'))}</td>"
+                f"<td class='n mono' title=\"{escape(str(l.get('target_basis') or ''))}\">"
+                f"<span class='muted'>{_lots(l.get('target_lots'))}</span> / {punched_html}</td>"
                 f"<td class='n'>{_ms(l.get('time_diff_ms'))}</td>"
-                f"<td class='muted'>{escape(l.get('note') or l.get('leg_reason') or '')}</td></tr>"
+                # Reason only where something is actually wrong — on a clean row
+                # it is noise that makes the real ones harder to spot.
+                f"<td class='muted'>"
+                f"{escape(l.get('note') or l.get('leg_reason') or '') if bad else ''}</td></tr>"
             )
     parts.append("</tbody></table></div>")
 

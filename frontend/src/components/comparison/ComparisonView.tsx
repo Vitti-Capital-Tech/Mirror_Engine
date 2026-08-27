@@ -2,7 +2,7 @@
 import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle, ArrowDownRight, ArrowUpRight, CheckCircle2, Clock, Download,
-  FileText, Send, XCircle, RefreshCw, Link2, HelpCircle,
+  FileText, Send, XCircle, RefreshCw,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { api, saveBlob } from '@/lib/api';
@@ -367,20 +367,19 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                     <th>Symbol</th>
                     <th>Side</th>
                     <th className="text-right">Master</th>
-                    <th>State</th>
                     <th>Follower</th>
                     <th className="text-center">Verdict</th>
-                    <th className="text-right">Punched</th>
-                    <th className="text-right">Target</th>
                     <th className="text-right">Ratio</th>
+                    <th className="text-right" title="What the follower should have punched / what it actually punched">
+                      Target / Punched
+                    </th>
                     <th className="text-right">Time diff</th>
-                    <th className="text-center">Link</th>
                     <th className="pl-3">Reason</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/[0.04] font-medium">
                   {lines.length === 0 && (
-                    <tr><td colSpan={13} className="py-12 text-center text-text-muted">
+                    <tr><td colSpan={10} className="py-12 text-center text-text-muted">
                       {counts.total === 0 ? 'No master orders on this day.' : 'Nothing matches this filter.'}
                     </td></tr>
                   )}
@@ -389,7 +388,9 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                     const bad = MISMATCH.has(l.verdict);
                     return (
                       <tr key={`${r.master_order_id}-${l.account_id}-${i}`}
-                        className={bad ? 'bg-red-500/[0.05] hover:bg-red-500/[0.08]' : 'hover:bg-bg-panel/40'}>
+                        className={bad
+                          ? 'bg-red-500/[0.09] hover:bg-red-500/[0.14] border-l-2 border-l-rose-500'
+                          : 'hover:bg-bg-panel/40'}>
                         <td className="py-2.5 font-mono text-text-secondary">{clock(r.placed_at)}</td>
                         <td className="font-mono font-semibold text-text-primary">{r.symbol}</td>
                         <td>
@@ -398,33 +399,31 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
                             {(r.side || '').toUpperCase()}
                           </span>
                         </td>
-                        <td className="text-right font-mono text-text-primary">{lots(r.master_lots)}</td>
-                        <td className="text-text-muted">{r.master_state}</td>
+                        {/* master lots with its order state underneath */}
+                        <td className="text-right font-mono text-text-primary leading-tight">
+                          {lots(r.master_lots)}
+                          <span className="block text-[10px] text-text-muted font-sans">{r.master_state}</span>
+                        </td>
                         <td className="text-text-primary">{l.account_name}</td>
                         <td className="text-center"><VerdictBadge v={l.verdict} /></td>
-                        <td className={`text-right font-mono font-semibold ${bad ? 'text-rose-400' : 'text-text-primary'}`}>
-                          {lots(l.placed_lots)}
-                        </td>
-                        <td className="text-right font-mono text-text-secondary" title={l.target_basis || ''}>
-                          {lots(l.target_lots)}
-                        </td>
-                        <td className="text-right font-mono text-text-muted" title={`target ratio ${ratio(l.ratio_target)}`}>
+                        <td className="text-right font-mono text-text-secondary"
+                          title={`target ratio ${ratio(l.ratio_target)}`}>
                           {ratio(l.ratio_actual)}
+                        </td>
+                        {/* target / punched — the comparison, side by side */}
+                        <td className="text-right font-mono whitespace-nowrap">
+                          <span className="text-text-muted" title={l.target_basis || ''}>{lots(l.target_lots)}</span>
+                          <span className="text-text-muted mx-1">/</span>
+                          <span className={bad ? 'text-rose-400 font-bold' : 'text-text-primary font-semibold'}>
+                            {lots(l.placed_lots)}
+                          </span>
                         </td>
                         <td className={`text-right font-mono ${
                           l.time_diff_ms !== null && Math.abs(l.time_diff_ms) > 30_000 ? 'text-amber-400' : 'text-text-secondary'}`}>
                           {ms(l.time_diff_ms)}
                         </td>
-                        <td className="text-center">
-                          {l.link === 'linked' ? (
-                            <span title="A recorded copy ties the master order to this follower order."
-                              className="inline-flex items-center gap-1 text-emerald-400/80"><Link2 className="w-3 h-3" /></span>
-                          ) : l.link === 'inferred' ? (
-                            <span title="No copy record linked these — matched on symbol, side and timing."
-                              className="inline-flex items-center gap-1 text-amber-400/90"><HelpCircle className="w-3 h-3" /></span>
-                          ) : <span className="text-text-muted">—</span>}
-                        </td>
-                        <td className="pl-3 text-text-muted">{l.note || l.leg_reason || '—'}</td>
+                        {/* reason only where something is actually wrong */}
+                        <td className="pl-3 text-rose-300/90">{bad ? (l.note || l.leg_reason || '') : ''}</td>
                       </tr>
                     );
                   })}
