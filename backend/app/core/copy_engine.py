@@ -2355,8 +2355,48 @@ class CopyEngine:
                     _hist_leg(follower, status="failed",
                               reason="master position unreadable — deferred to reconciler")
                     continue
-                rungs = await self._master_resting_exits(master_row, symbol)
-                if rungs is None:
+                # The master's exit order has ALREADY FILLED — there is no ladder
+                # left to allocate across, so don't try.
+                #
+                # coverage_target() proportions the follower's lots against the
+                # master's RESTING exit book. When the master's limit crosses the
+                # spread and fills instantly (taker), that book is empty by the
+                # time we process the event, so resting_total is 0 and
+                # coverage_target correctly returns 0 — "no lots allocated to this
+                # rung" — and the live copy does nothing at all. The exit then
+                # falls entirely to the 15s reconciler.
+                #
+                # Measured 2026-08-27: five such exits in 95 minutes, and the one
+                # on C-BTC-79800 at 04:32:55 was not covered until the reconciler
+                # trimmed it at 04:34:14 — 80 seconds holding a leg the master had
+                # already reduced.
+                #
+                # A filled exit needs no ladder maths: master_now is the position
+                # AFTER the fill, so the follower simply belongs at its
+                # proportional share of it. This is deliberately the same
+                # calculation the reconciler runs, so the two cannot disagree
+                # about the target and undo each other — it just runs now instead
+                # of a minute later.
+                filled_exit = await self._master_order_filled(master_order_id)
+                rungs = None if filled_exit else await self._master_resting_exits(master_row, symbol)
+
+                if filled_exit:
+                    # No ladder maths: master_now is the position AFTER the fill,
+                    # so the follower simply belongs at its proportional share of
+                    # it. Deliberately the SAME calculation the reconciler runs, so
+                    # the two cannot disagree about the target and undo each other
+                    # — this just runs now instead of a minute later.
+                    target = self.risk_engine.calculate_follower_quantity(
+                        abs(float(master_now)), ref_price, follower,
+                        round_up=True, min_one=False,
+                    )
+                    qty = max(0, follower_held - int(target))
+                    logger.info(
+                        f"Filled-exit close for {follower['name']} on {symbol}: master's exit "
+                        f"already filled (master now {master_now:+.0f}), follower holds "
+                        f"{follower_held} -> target {int(target)}, closing {qty}"
+                    )
+                elif rungs is None:
                     # Order book unreadable. Fall back to the old per-order rebalance
                     # rather than guessing at a ladder we cannot see — under-covering
                     # is recoverable by the reconciler, over-resting is not.
@@ -2372,12 +2412,10 @@ class CopyEngine:
                 else:
                     # The arriving event is authoritative that this order is resting,
                     # even when the snapshot predates it (3s cache, or the REST listing
-                    # lagging the WS event).
-                    # Same rule as the entry ladder: a stale event must not add an
-                    # order that has already filled to the master's resting book.
-                    if not await self._master_order_filled(master_order_id):
-                        if not any(rid == str(master_order_id) for rid, _ in rungs):
-                            rungs = list(rungs) + [(str(master_order_id), float(master_qty))]
+                    # lagging the WS event). A FILLED order never reaches here — that
+                    # is the branch above — so this can inject unconditionally.
+                    if not any(rid == str(master_order_id) for rid, _ in rungs):
+                        rungs = list(rungs) + [(str(master_order_id), float(master_qty))]
                     resting_total = sum(sz for _, sz in rungs)
                     cover = ladder.coverage_target(follower_held, resting_total, master_now)
                     alloc = ladder.allocate(rungs, cover)
@@ -2393,16 +2431,24 @@ class CopyEngine:
                 # this replaced: every rung's fair share on a small follower is ~1 lot,
                 # so a deadband would skip them all again.
                 if int(qty) < 1:
+                    # Two different reasons for zero, and conflating them made the
+                    # logs unreadable: a ladder rung that legitimately claimed none
+                    # of the cover, versus a follower already sitting at its target
+                    # after the master's exit filled. Say which.
+                    why_zero = (
+                        f"already at target {int(target)} (holds {follower_held})"
+                        if filled_exit else
+                        f"no lots allocated to this rung (holds {follower_held})"
+                    )
                     logger.info(
-                        f"Reduce-only close for {follower['name']} on {symbol}: no lots allocated "
-                        f"to this rung (holds {follower_held}, master holds {master_now:.0f})"
+                        f"Reduce-only close for {follower['name']} on {symbol}: {why_zero}, "
+                        f"master holds {master_now:.0f}"
                     )
                     await ledger.record_follower_leg(
                         self.redis, master_order_id, follower["id"], status="skipped",
-                        reason=f"no lots allocated to this rung (holds {follower_held})",
+                        reason=why_zero,
                     )
-                    _hist_leg(follower, status="skipped",
-                              reason=f"no lots allocated to this rung (holds {follower_held})")
+                    _hist_leg(follower, status="skipped", reason=why_zero)
                     continue
 
             # Plain limit order: if the master EDITED it, edit the follower's
