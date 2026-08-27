@@ -5,6 +5,7 @@ from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core import order_ledger as ledger
+from app.core.account_cache import account_cache
 
 logger = logging.getLogger(__name__)
 
@@ -197,11 +198,12 @@ class PositionMonitor:
         Returns 'synced' or 'out_of_sync'.
         """
         try:
-            # 1. Fetch master account
-            master_res = self.db.table("accounts").select("id").eq("is_master", True).execute()
-            if not master_res.data:
+            # 1. Fetch master account (cached — this ran ~1.1x/second against a
+            #    synchronous client, and the master's id changes only on a promote).
+            master_account = account_cache.master(self.db)
+            if not master_account:
                 return "unknown"
-            master_id = master_res.data[0]["id"]
+            master_id = master_account["id"]
 
             if account_id == master_id:
                 return "synced"
@@ -217,21 +219,24 @@ class PositionMonitor:
                 return "unknown"
             master_qty = float(master_pos_res.data[0]["quantity"])
 
-            # 3. Fetch follower account settings
-            follower_acc_res = self.db.table("accounts").select("*").eq("id", account_id).execute()
-            if not follower_acc_res.data:
+            # 3. Fetch follower account settings (cached)
+            follower_account = account_cache.get(self.db, account_id)
+            if not follower_account:
                 return "unknown"
-            follower_account = follower_acc_res.data[0]
+            # Copied because master_balance is injected below for the sizing call,
+            # and the cached row is shared with every other caller this tick.
+            follower_account = dict(follower_account)
 
-            # Fetch master balance for expected quantity calculation
-            master_balance = 0.0
-            try:
-                master_balance_res = self.db.table("accounts").select("*").eq("is_master", True).execute()
-                if master_balance_res.data:
-                    master_balance = float(master_balance_res.data[0].get("allocated_balance") or master_balance_res.data[0].get("balance") or master_balance_res.data[0].get("available_margin") or 0.0)
-            except Exception as e:
-                logger.error(f"Failed to fetch master balance for expected sync calculation: {e}")
-            
+            # Master balance for the expected-quantity calculation. This is the
+            # SAME row fetched in step 1 — it used to be a second round trip a few
+            # lines later, selecting the full row the first query had thrown away.
+            master_balance = float(
+                master_account.get("allocated_balance")
+                or master_account.get("balance")
+                or master_account.get("available_margin")
+                or 0.0
+            )
+
             follower_account["master_balance"] = master_balance
 
             # 4. Calculate expected qty (ceil, to match how orders are actually
@@ -330,9 +335,9 @@ class PositionMonitor:
         try:
             account_ids = [account_id]
             try:
-                mr = self.db.table("accounts").select("id").eq("is_master", True).execute()
-                if mr.data:
-                    account_ids.append(mr.data[0]["id"])
+                mid = account_cache.master_id(self.db)
+                if mid:
+                    account_ids.append(mid)
             except Exception:
                 pass
 

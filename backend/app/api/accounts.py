@@ -8,6 +8,7 @@ from app.core.trade_listener import listener_manager
 from app.core.position_monitor import position_monitor
 from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_account_or_404
 from app.services.delta_client import DeltaClient
+from app.core.account_cache import account_cache
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
             raise HTTPException(status_code=500, detail="Failed to create account in database.")
         
         new_account = res.data[0]
+        account_cache.invalidate()
         
         # Start WebSocket if status is active
         if new_account.get("status") == "active":
@@ -137,6 +139,7 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
             raise HTTPException(status_code=500, detail="Failed to update account in database.")
             
         updated = update_res.data[0]
+        account_cache.invalidate(id)
         
         # Disconnect old feed (routes master->listener, follower->connection_manager)
         await stop_account_ws(updated)
@@ -161,6 +164,7 @@ async def delete_account(id: str, user: CurrentUser = Depends(get_current_user))
         await stop_account_ws(acc)
 
         res = db.table("accounts").delete().eq("id", id).execute()
+        account_cache.invalidate(id)
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
             
@@ -177,6 +181,7 @@ async def pause_account(id: str, user: CurrentUser = Depends(get_current_user)):
     try:
         owned_account_or_404(id, user)
         res = db.table("accounts").update({"status": "paused"}).eq("id", id).execute()
+        account_cache.invalidate(id)
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
 
@@ -196,6 +201,7 @@ async def resume_account(id: str, user: CurrentUser = Depends(get_current_user))
     try:
         owned_account_or_404(id, user)
         res = db.table("accounts").update({"status": "active"}).eq("id", id).execute()
+        account_cache.invalidate(id)
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
             
@@ -215,6 +221,7 @@ async def reset_account(id: str, user: CurrentUser = Depends(get_current_user)):
     try:
         owned_account_or_404(id, user)
         res = db.table("accounts").update({"consecutive_failures": 0, "status": "active"}).eq("id", id).execute()
+        account_cache.invalidate(id)
         if not res.data:
             raise HTTPException(status_code=404, detail="Account not found.")
             
@@ -260,6 +267,8 @@ async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)
         if not upd.data:
             raise HTTPException(status_code=500, detail="Failed to promote account.")
         new_master = upd.data[0]
+        # Role change: drop everything, not just this row.
+        account_cache.invalidate()
 
         # Rewire WebSocket feeds for the new roles
         await start_account_ws(new_master)  # master -> on_fill callback
