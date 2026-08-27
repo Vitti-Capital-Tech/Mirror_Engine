@@ -53,6 +53,18 @@ MIRRORED_STATUSES = ("placed", "filled")
 ACCOUNTED_STATUSES = MIRRORED_STATUSES + ("skipped", "cancelled")
 
 
+def master_filled_key(master_order_id) -> str:
+    """Redis key marking that a MASTER order id has been seen to fill.
+
+    The WS feed lags during bursts, so a stale "state=open" event for an order
+    that has already filled can still arrive. Anything that treats an arriving
+    event as proof the order is resting must consult this first, or it will count
+    the same lots twice — once as the position they became, once as an order
+    still waiting to fill.
+    """
+    return f"masterfilled:{master_order_id}"
+
+
 def _key(master_order_id) -> str:
     return f"oledger:{master_order_id}"
 

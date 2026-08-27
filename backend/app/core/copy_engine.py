@@ -1987,8 +1987,23 @@ class CopyEngine:
                 entry_rungs = await self._master_resting_entries(master_row, symbol)
                 m_pos = await self._master_position_size(master_row, symbol)
                 if entry_rungs is not None and m_pos is not None:
-                    if not any(rid == str(master_order_id) for rid, _ in entry_rungs):
-                        entry_rungs = list(entry_rungs) + [(str(master_order_id), float(master_qty))]
+                    # Inject this order as a rung ONLY if it is genuinely still
+                    # resting. The arriving event is normally authoritative on
+                    # that — the REST snapshot can lag the WS — but a STALE event
+                    # describes a world that has moved on, and `m_pos` already
+                    # contains the lots of an order that has since filled. Adding
+                    # it again counts the same lots twice: once as the position
+                    # they became, once as an order still waiting to fill.
+                    #
+                    # Observed 2026-08-27, P-BTC-74500-280826: the master's 2750
+                    # sell filled at 02:18:46, a 7.14s-stale "open" event arrived
+                    # at 02:18:49, would_hold came out at 5500 instead of 2750,
+                    # and the follower opened 62 lots against a target of 31. The
+                    # reconciler trimmed it back a minute later, so the position
+                    # ended right and only the round-trip cost showed.
+                    if not await self._master_order_filled(master_order_id):
+                        if not any(rid == str(master_order_id) for rid, _ in entry_rungs):
+                            entry_rungs = list(entry_rungs) + [(str(master_order_id), float(master_qty))]
                     would_hold = float(m_pos) + sum(sz for _, sz in entry_rungs)
                     target_total = self.risk_engine.calculate_follower_quantity(
                         would_hold, ref_price, follower, round_up=True, min_one=False
@@ -2330,8 +2345,11 @@ class CopyEngine:
                     # The arriving event is authoritative that this order is resting,
                     # even when the snapshot predates it (3s cache, or the REST listing
                     # lagging the WS event).
-                    if not any(rid == str(master_order_id) for rid, _ in rungs):
-                        rungs = list(rungs) + [(str(master_order_id), float(master_qty))]
+                    # Same rule as the entry ladder: a stale event must not add an
+                    # order that has already filled to the master's resting book.
+                    if not await self._master_order_filled(master_order_id):
+                        if not any(rid == str(master_order_id) for rid, _ in rungs):
+                            rungs = list(rungs) + [(str(master_order_id), float(master_qty))]
                     resting_total = sum(sz for _, sz in rungs)
                     cover = ladder.coverage_target(follower_held, resting_total, master_now)
                     alloc = ladder.allocate(rungs, cover)
@@ -2490,6 +2508,26 @@ class CopyEngine:
         if fs is not None:
             return int(float(fs))
         return int(float(od.get("size") or 0) - float(od.get("unfilled_size") or 0))
+
+    async def _master_order_filled(self, master_order_id) -> bool:
+        """Have we SEEN this master order fill?
+
+        Set by the listener the moment a fill event arrives, so this costs a
+        Redis GET rather than an exchange round trip — which matters because it
+        sits on the sizing path for every order event.
+
+        Answers False when Redis is unreachable: that restores the previous
+        behaviour (trust the event) rather than silently refusing to size, and an
+        over-size is trimmed by the reconciler while a refusal leaves the follower
+        with no position at all.
+        """
+        if not master_order_id or not self.redis:
+            return False
+        try:
+            return bool(await self.redis.get(ledger.master_filled_key(master_order_id)))
+        except Exception as e:
+            logger.warning(f"Could not read master-filled marker for {master_order_id}: {e}")
+            return False
 
     async def _safe_get_order(self, client, order_id) -> dict:
         try:

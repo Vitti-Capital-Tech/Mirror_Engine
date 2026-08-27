@@ -5,6 +5,7 @@ import time
 from typing import Optional
 from app.services.delta_client import DeltaClient
 from app.models.trade import TradeEvent, TradeSide, TradeType
+from app.core.order_ledger import master_filled_key
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,23 @@ class TradeListener:
 
             # ---- 1. Fills ----
             if reason == "fill" or state == "filled":
+                # Remember, by ORDER ID, that this master order is done.
+                #
+                # The WS feed runs seconds behind during bursts, so a stale
+                # "state=open" event for THIS id can still arrive after the fill.
+                # The sizing path treats an arriving event as authoritative that
+                # the order is resting, and adds it to the master's resting book
+                # on top of the position it has already become — counting the same
+                # lots twice. Observed 2026-08-27 on P-BTC-74500-280826: the order
+                # filled at 02:18:46, a 7.14s-stale "open" arrived at 02:18:49, and
+                # the follower was sized on 5500 lots (2750 position + 2750 phantom
+                # resting) instead of 2750 — 62 lots against a target of 31, which
+                # the reconciler then had to trim back.
+                #
+                # The existing staleness guard re-checks the exchange only above
+                # STALE_EVENT_RECHECK_SEC (10s); this event was under that bar. An
+                # id we have SEEN fill needs no exchange call to be trusted.
+                await self._mark_master_order_filled(order.get("id"))
                 if order_type == "market_order" and not is_stop:
                     # Plain market fill -> copy as a market order (entry/close).
                     await self._push_fill_event(order)
@@ -330,6 +348,20 @@ class TradeListener:
         payload["owner_id"] = (self.master_account or {}).get("owner_id")
         payload["ts"] = time.time()  # detection time, for latency measurement
         await self.redis.lpush("trade_events", json.dumps(payload))
+
+    async def _mark_master_order_filled(self, order_id) -> None:
+        """Record that a master order id has filled.
+
+        Keyed on the order id and kept for a day — long enough to outlive any
+        stale event still in flight, short enough not to accumulate. Best effort:
+        a Redis hiccup must never stop a fill from being processed.
+        """
+        if not order_id or not self.redis:
+            return
+        try:
+            await self.redis.set(master_filled_key(order_id), "1", ex=24 * 3600)
+        except Exception as e:
+            logger.warning("Could not mark master order %s as filled: %s", order_id, e)
 
     async def _push_order_event(self, order: dict, action: str) -> None:
         """Push a resting-order place/cancel event to Redis for the copy engine."""
