@@ -128,8 +128,19 @@ def _num(v) -> str:
         return str(v)
 
 
+# ---------------------------------------------------------------------------
+# notify_open / notify_close are NO LONGER CALLED.
+#
+# They fired on every mirrored fill, which turned this channel into a running
+# trade log. A channel that is mostly routine is one nobody reads closely enough
+# to catch the messages that matter, and the messages that matter are failures
+# and reconciler corrections. Kept — not deleted — because the reconciler paths
+# were rewired onto notify_correction and turning plain trade notifications back
+# on should stay a one-line change rather than an archaeology exercise.
+# ---------------------------------------------------------------------------
+
 async def notify_open(account: str, symbol: str, side: str, lots, price=None) -> None:
-    """Follower opened / added to a position."""
+    """Follower opened / added to a position. UNUSED — see the note above."""
     if not telegram_enabled():
         return
     # Collapse identical repeats within a short window. A genuine second open of
@@ -147,7 +158,7 @@ async def notify_open(account: str, symbol: str, side: str, lots, price=None) ->
 
 
 async def notify_close(account: str, symbol: str, lots, price=None) -> None:
-    """Follower closed / reduced a position."""
+    """Follower closed / reduced a position. UNUSED — see the note above."""
     if not telegram_enabled():
         return
     if not await _should_send(f"close:{account}:{symbol}:{_num(lots)}", DUP_EVENT_WINDOW):
@@ -181,6 +192,63 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
                 f"<code>{symbol}</code>\n"
                 f"{str(side).title()}{lot_str} — {reason}")
     await send_message(text)
+
+
+async def notify_correction(
+    account: str,
+    symbol: str,
+    action: str,
+    lots,
+    *,
+    held=None,
+    target=None,
+    master=None,
+    why: str = "",
+) -> None:
+    """The RECONCILER had to correct a follower.
+
+    This is the notification that matters most, and it did not exist. Routine
+    open/close messages report the engine working; a reconciler correction reports
+    the engine having got it WRONG and the safety net cleaning up — which is the
+    only outward sign of a whole class of bug.
+
+    Concretely: on 2026-08-27 the engine punched 62 lots against a target of 31
+    and the reconciler trimmed 31 back a minute later. Positions ended correct, so
+    nothing alerted and nothing looked wrong, while every affected order paid a
+    round trip in fees. Had this message existed it would have read:
+
+        Reconciler corrected Mini Prathav — TRIMMED 31 lots
+        P-BTC-74500-280826 · held 62 -> 31 (master 2750)
+
+    ...which names the bug on the first occurrence rather than the hundredth.
+
+    held/target/master are the whole point: "trimmed 31" alone says the reconciler
+    did something, "62 -> 31" says what the engine got wrong.
+    """
+    if not telegram_enabled():
+        return
+    # A correction that repeats identically is the same episode being re-detected
+    # (the sweep runs every 15s), not a new one.
+    key = f"fix:{account}:{symbol}:{action}:{_num(lots)}:{_num(held)}"
+    if not await _should_send(key, DUP_EVENT_WINDOW):
+        return
+
+    detail = ""
+    if held is not None and target is not None:
+        detail = f"held {_num(held)} → {_num(target)}"
+        if master is not None:
+            detail += f" (master {_num(master)})"
+    elif master is not None:
+        detail = f"master {_num(master)}"
+
+    lines = [
+        f"🔧 <b>Reconciler corrected</b> · {account}",
+        f"<code>{symbol}</code>",
+        f"<b>{action}</b> {_num(lots)} lot(s)" + (f" — {detail}" if detail else ""),
+    ]
+    if why:
+        lines.append(f"<i>{why}</i>")
+    await send_message("\n".join(lines))
 
 
 async def send_alert(alert: dict) -> None:

@@ -506,16 +506,17 @@ class CopyEngine:
                     reason=r.get("failure_reason"),
                 )
             if st in ("filled", "partial"):
-                lots = r.get("filled_quantity")
-                px = r.get("execution_price")
-                if is_exit:
-                    asyncio.create_task(tg.notify_close(acct, symbol, lots, px))
-                else:
-                    asyncio.create_task(tg.notify_open(acct, symbol, side, lots, px))
+                # A successful mirror is deliberately NOT notified. It fired on
+                # every copy, so Telegram became a running trade log — and a
+                # channel that is mostly routine is one nobody reads closely
+                # enough to catch the messages that matter. What goes out now is
+                # failures, and RECONCILER CORRECTIONS (notify_correction), which
+                # are the outward sign that the engine got something wrong.
                 if st == "partial":
-                    # Sent as a failure notification on purpose: an out-of-proportion
-                    # follower is the thing the desk needs told about, and the
-                    # notify_open/close above only says what DID fill.
+                    # Sent as a failure notification on purpose: an
+                    # out-of-proportion follower is the thing the desk needs told
+                    # about, and it is the only thing this branch reports now that
+                    # successful mirrors are silent.
                     key = f"partial:{r.get('account_id')}:{symbol}:{side}:{'exit' if is_exit else 'entry'}"
                     asyncio.create_task(tg.notify_fail(
                         acct, symbol, side, None,
@@ -1429,8 +1430,11 @@ class CopyEngine:
                                     f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
                                     f"({held} -> {int(target)}, master {msz:+.0f}, drift {drift:.1f}%)"
                                 )
-                                asyncio.create_task(tg.notify_open(
-                                    fol.get("name"), sym, side, int(short_by), mark or None))
+                                asyncio.create_task(tg.notify_correction(
+                                    fol.get("name"), sym, "TOPPED UP", int(short_by),
+                                    held=held, target=int(target), master=int(msz),
+                                    why="the live copy left this leg short — a mirror "
+                                        "was missed, skipped or under-filled"))
                             except Exception as e:
                                 body = getattr(getattr(e, "response", None), "text", "")
                                 logger.warning(f"reconcile top-up failed for {fol.get('name')} {sym}: {e} {body}")
@@ -1470,7 +1474,12 @@ class CopyEngine:
                                 f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
                                 f"exit order(s): {missed or 'none recorded in ledger'}"
                             )
-                            asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(excess)))
+                            asyncio.create_task(tg.notify_correction(
+                                fol.get("name"), sym, "TRIMMED", int(excess),
+                                held=held, target=int(target), master=int(msz),
+                                why=("the follower was over-exposed — an over-sized punch, "
+                                     "a duplicate order, or a master exit that never "
+                                     f"mirrored (missed: {missed or 'none in ledger'})")))
                         except Exception as e:
                             body = getattr(getattr(e, "response", None), "text", "")
                             logger.warning(f"reconcile trim failed for {fol.get('name')} {sym}: {e} {body}")
@@ -1533,7 +1542,11 @@ class CopyEngine:
                             f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) "
                             f"— {why}; missed master exit order(s): {missed or 'none recorded in ledger'}"
                         )
-                        asyncio.create_task(tg.notify_close(fol.get("name"), sym, int(abs(fsz))))
+                        asyncio.create_task(tg.notify_correction(
+                            fol.get("name"), sym, "CLOSED", int(abs(fsz)),
+                            held=int(fsz), target=0, master=int(msz),
+                            why=f"{why}; missed master exit order(s): "
+                                f"{missed or 'none recorded in ledger'}"))
                         # Master-flat close leaves the follower's own SL/TP resting
                         # on a now-flat leg — nothing else cancels it once the
                         # master's gone, so clear it here.
@@ -1608,7 +1621,11 @@ class CopyEngine:
                             order_type="market_order", reduce_only=False,
                         )
                         logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
-                        asyncio.create_task(tg.notify_open(fol.get("name"), sym, side, int(target), price or None))
+                        asyncio.create_task(tg.notify_correction(
+                            fol.get("name"), sym, "OPENED", int(target),
+                            held=0, target=int(target), master=int(msz),
+                            why="the follower had no leg at all — the live copy "
+                                "never reached the exchange"))
                         # Episode over — let a future drift/failure on this leg
                         # alert again instead of being silently suppressed.
                         asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
@@ -2660,11 +2677,8 @@ class CopyEngine:
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 logger.info(f"Escalated unfilled limit -> MARKET for {follower['name']} {symbol} qty {market_qty} (order {oid})")
-                acct = follower.get("name") or "Follower"
-                if reduce_only:
-                    asyncio.create_task(tg.notify_close(acct, symbol, int(market_qty)))
-                else:
-                    asyncio.create_task(tg.notify_open(acct, symbol, side, int(market_qty)))
+                # Escalating a resting limit to market is the engine doing its
+                # job, not a fault; not notified, same reason as a plain fill.
             except Exception as e:
                 resp_obj = getattr(e, "response", None)
                 body = ""
@@ -2782,7 +2796,7 @@ class CopyEngine:
                 f"{name} ({held} -> {int(target)}, master now {master_now:+.0f}) — the master "
                 f"abandoned its exit price but the follower had not exited"
             )
-            asyncio.create_task(tg.notify_close(name, symbol, int(close_qty)))
+            # Routine exit settle — the engine working; not notified.
         except Exception as e:
             body = getattr(getattr(e, "response", None), "text", "")
             logger.warning(f"Exit settle after cancel failed for {name} {symbol}: {e} {body}")
