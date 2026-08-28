@@ -414,6 +414,115 @@ async def test_no_master_row_does_not_crash():
     check("no order placed on an unknown ratio", follower.placed, [])
 
 
+# ---------------------------------------------------------------------------
+# The partition itself. Moving a filter out of SQL and into Python is only safe
+# if it selects the same rows, so pin each filter the old queries used.
+# ---------------------------------------------------------------------------
+
+PAUSED = dict(FOLLOWER_ROW, id="f2", name="Paused", status="paused")
+OTHER = dict(FOLLOWER_ROW, id="f3", name="Other owner", owner_id="o2")
+ROWS = [MASTER_ROW, FOLLOWER_ROW, PAUSED, OTHER]
+
+
+async def test_split_picks_the_master():
+    print("SPLIT: is_master=True")
+    m, f, bal = CopyEngine._split_accounts(ROWS)
+    check("master found", m["id"], MASTER_ID)
+    check("balance from allocated_balance", bal, 100000.0)
+
+
+async def test_split_excludes_paused():
+    print("SPLIT: a follower must be is_master=False AND status=active")
+    _m, f, _b = CopyEngine._split_accounts(ROWS)
+    ids = sorted(x["id"] for x in f)
+    check("paused excluded", "f2" in ids, False)
+    check("master not counted as a follower", MASTER_ID in ids, False)
+
+
+async def test_split_owner_scope_is_opt_in():
+    print("SPLIT: owner scoping applies only where the old query had it")
+    _m, unscoped, _b = CopyEngine._split_accounts(ROWS)
+    _m2, scoped, _b2 = CopyEngine._split_accounts(ROWS, owner_id="o1")
+    check("unscoped keeps the other owner", "f3" in [x["id"] for x in unscoped], True)
+    check("scoped drops the other owner", "f3" in [x["id"] for x in scoped], False)
+    check("scoped keeps our own", [x["id"] for x in scoped], ["f1"])
+
+
+async def test_split_balance_fallback_order():
+    print("SPLIT: allocated_balance -> balance -> available_margin")
+    only_bal = dict(MASTER_ROW); only_bal.pop("allocated_balance"); only_bal["balance"] = 42.0
+    only_marg = dict(MASTER_ROW); only_marg.pop("allocated_balance"); only_marg["available_margin"] = 7.0
+    check("falls back to balance", CopyEngine._split_accounts([only_bal])[2], 42.0)
+    check("then to available_margin", CopyEngine._split_accounts([only_marg])[2], 7.0)
+
+
+async def test_split_no_master_is_zero_not_a_crash():
+    print("SPLIT: no master at all")
+    m, f, bal = CopyEngine._split_accounts([FOLLOWER_ROW])
+    check("no master row", m, None)
+    check("balance 0.0, as an empty master query gave", bal, 0.0)
+    check("followers still found", len(f), 1)
+
+
+async def test_split_handles_empty_and_none():
+    print("SPLIT: empty and None inputs")
+    check("None", CopyEngine._split_accounts(None), (None, [], 0.0))
+    check("empty", CopyEngine._split_accounts([]), (None, [], 0.0))
+
+
+# ---------------------------------------------------------------------------
+# _escalate_after_master_fill used to read the master, then EVERY follower in
+# the ordermap one query at a time. With two followers that was three blocking
+# round trips; it must now be one, and still resolve both.
+# ---------------------------------------------------------------------------
+
+async def test_escalation_setup_reads_accounts_once_for_many_followers():
+    print("ESCALATE: one accounts read no matter how many followers")
+    seen_orders = []
+
+    class Cl:
+        async def get_order(self, oid):
+            seen_orders.append(str(oid))
+            # 'open' with lots left, so the loop proceeds past _order_done
+            return {"result": {"id": oid, "state": "open", "size": 5,
+                               "unfilled_size": 5, "product_id": 1}}
+        async def get_positions(self):
+            return []
+
+    f2 = dict(FOLLOWER_ROW, id="fB", name="Second follower")
+    eng = build_engine(CountingClient(name="master"), Cl())
+    eng.db = FakeDB([MASTER_ROW, FOLLOWER_ROW, f2])
+    eng._get_follower_client = _async_return(Cl())
+    await eng.redis.hset(f"ordermap:{MASTER_ORDER_ID}", "f1", "o1")
+    await eng.redis.hset(f"ordermap:{MASTER_ORDER_ID}", "fB", "o2")
+
+    await eng._escalate_after_master_fill(
+        {"symbol": SYMBOL, "owner_id": "o1", "product_id": 1, "side": "buy"},
+        MASTER_ORDER_ID)
+    await drain()
+
+    check("ONE accounts read, not three", eng.db.account_reads, 1)
+    check("both followers still resolved", sorted(set(seen_orders)), ["o1", "o2"])
+
+
+async def test_escalation_setup_survives_a_follower_not_in_the_table():
+    print("ESCALATE: an ordermap entry with no account row is skipped, not fatal")
+    class Cl:
+        async def get_order(self, oid):
+            return {"result": {"id": oid, "state": "closed", "unfilled_size": 0}}
+        async def get_positions(self):
+            return []
+
+    eng = build_engine(CountingClient(name="master"), Cl())
+    eng.db = FakeDB([MASTER_ROW, FOLLOWER_ROW])
+    eng._get_follower_client = _async_return(Cl())
+    await eng.redis.hset(f"ordermap:{MASTER_ORDER_ID}", "ghost", "o9")
+    await eng._escalate_after_master_fill(
+        {"symbol": SYMBOL, "owner_id": "o1"}, MASTER_ORDER_ID)
+    await drain()
+    check("did not raise, one read", eng.db.account_reads, 1)
+
+
 async def main():
     print("=" * 74)
     print("mirror latency — a no-op must not pay for sizing it will not use")
@@ -427,6 +536,14 @@ async def main():
         test_done_cache_is_per_follower_and_per_order,
         test_partition_excludes_paused_and_other_owners,
         test_no_master_row_does_not_crash,
+        test_split_picks_the_master,
+        test_split_excludes_paused,
+        test_split_owner_scope_is_opt_in,
+        test_split_balance_fallback_order,
+        test_split_no_master_is_zero_not_a_crash,
+        test_split_handles_empty_and_none,
+        test_escalation_setup_reads_accounts_once_for_many_followers,
+        test_escalation_setup_survives_a_follower_not_in_the_table,
     ):
         await fn()
     print("\n" + "=" * 74)

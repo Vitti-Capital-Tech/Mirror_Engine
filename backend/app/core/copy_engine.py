@@ -313,16 +313,13 @@ class CopyEngine:
             return
 
         # 2. Get active follower accounts (scoped to the master's owner)
-        try:
-            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
-            if owner_id:
-                fq = fq.eq("owner_id", owner_id)
-            followers_res = fq.execute()
-            followers = followers_res.data or []
-        except Exception as e:
-            logger.error(f"Failed to query follower accounts: {e}")
+        # One read for the followers AND the master (whose balance the ratio needs
+        # a few lines below) — see _read_accounts for why the round trip matters.
+        accounts = await self._read_accounts(owner_id)
+        if accounts is None:
             self.db.table("trades").update({"status": "failed"}).eq("id", trade_uuid).execute()
             return
+        master_row, followers, master_balance = self._split_accounts(accounts)
 
         if not followers:
             logger.info("No active follower accounts found.")
@@ -343,17 +340,12 @@ class CopyEngine:
             })
             return
 
-        # 3. Create execution tasks for each follower
-        master_balance = 0.0
-        try:
-            mq = self.db.table("accounts").select("*").eq("is_master", True)
-            if owner_id:
-                mq = mq.eq("owner_id", owner_id)
-            master_acc = mq.execute()
-            if master_acc.data:
-                master_balance = float(master_acc.data[0].get("allocated_balance") or master_acc.data[0].get("balance") or master_acc.data[0].get("available_margin") or 0.0)
-        except Exception as e:
-            logger.error(f"Failed to fetch master balance for ratio calculation: {e}")
+        # 3. Create execution tasks for each follower.
+        # master_balance came from the same read as the followers above. A master
+        # that is missing leaves it 0.0, exactly as a failed or empty master query
+        # used to.
+        if not master_row:
+            logger.error("No master account found for ratio calculation.")
 
         # Opens: floor (never over-expose).
         # Closes: rebalance each follower to floor(master_remaining × ratio) —
@@ -363,7 +355,6 @@ class CopyEngine:
         # (the old ceil(master_close × ratio) rounded every tiny trim up to a
         # full follower lot).
         is_exit = trade_type in ("exit", "sl")
-        master_row = master_acc.data[0] if master_acc.data else None
 
         master_remaining = None
         master_signed_now = None
@@ -1115,15 +1106,21 @@ class CopyEngine:
         if not mapping:
             return  # nothing mirrored for this order (or already cleaned up)
 
-        master_row = None
-        try:
-            mq = self.db.table("accounts").select("*").eq("is_master", True)
-            if event.get("owner_id"):
-                mq = mq.eq("owner_id", event["owner_id"])
-            m = mq.execute()
-            master_row = m.data[0] if m.data else None
-        except Exception:
-            pass
+        # ONE read for the master AND every follower in the mapping. The loop
+        # below used to issue a query PER FOLLOWER on top of this one, all of them
+        # blocking the event loop — see _read_accounts.
+        #
+        # Read unscoped and filtered here because the two original queries scoped
+        # differently: the master was owner-scoped, the per-follower lookup was by
+        # id with no scope at all. Reading everything reproduces both exactly.
+        accounts = await self._read_accounts()
+        by_id = {a.get("id"): a for a in (accounts or []) if a.get("id")}
+        _oid = event.get("owner_id")
+        master_row = next(
+            (a for a in (accounts or [])
+             if a.get("is_master") and (not _oid or a.get("owner_id") == _oid)),
+            None,
+        )
         # The follower rows below are read FRESH from the DB, so they carry no
         # master_balance — and auto_ratio divides by it. Without this the ratio was
         # unreadable in the escalation path, _follower_close_qty returned None, and
@@ -1138,10 +1135,10 @@ class CopyEngine:
 
         for follower_id, follower_order_id in mapping.items():
             try:
-                acc = self.db.table("accounts").select("*").eq("id", follower_id).execute()
-                if not acc.data:
+                follower = by_id.get(follower_id)
+                if not follower:
                     continue
-                follower = acc.data[0]
+                follower = dict(follower)   # per-follower master_balance, not shared
                 follower["master_balance"] = master_balance
                 client = await self._get_follower_client(follower)
                 if not client:
@@ -1209,27 +1206,14 @@ class CopyEngine:
 
         # Master balance for proportional sizing of any recovery open, and the
         # master row itself so we can classify how the master closed a symbol.
-        master_balance = 0.0
-        master_row = None
-        try:
-            mq = self.db.table("accounts").select("*").eq("is_master", True)
-            if owner_id:
-                mq = mq.eq("owner_id", owner_id)
-            m = mq.execute()
-            if m.data:
-                master_row = m.data[0]
-                master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
-        except Exception:
-            pass
-
-        try:
-            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
-            if owner_id:
-                fq = fq.eq("owner_id", owner_id)
-            followers = fq.execute().data or []
-        except Exception as e:
-            logger.error(f"reconcile_positions: failed to load followers: {e}")
+        # Both roles from ONE read. This runs every 15s per master, so it was two
+        # blocking round trips on a timer forever — see _read_accounts.
+        accounts = await self._read_accounts(owner_id)
+        if accounts is None:
+            # Was the followers-query behaviour: an unreadable accounts table
+            # leaves nothing safe to reconcile against.
             return
+        master_row, followers, master_balance = self._split_accounts(accounts)
 
         now = time.time()
 
@@ -1878,28 +1862,15 @@ class CopyEngine:
         # asyncio.to_thread is NOT the answer either: it was shipped and reverted
         # because the Supabase client is shared process-wide and driving it from
         # pool threads corrupts it (see the order_history module docstring).
-        try:
-            aq = self.db.table("accounts").select("*")
-            if owner_id:
-                aq = aq.eq("owner_id", owner_id)
-            accounts = aq.execute().data or []
-        except Exception as e:
-            # Matches the old followers-query behaviour: without the accounts we
-            # cannot size or address anyone, so there is nothing safe to do. The
-            # 15s reconciler covers the gap.
-            logger.error(f"Failed to query accounts for order mirror: {e}")
+        accounts = await self._read_accounts(owner_id)
+        if accounts is None:
+            # Matches the old followers-query behaviour, which was the stricter of
+            # the two: without the accounts we can neither size nor address
+            # anyone, so there is nothing safe to do. The 15s reconciler covers it.
             return
-
-        followers = [a for a in accounts
-                     if not a.get("is_master") and a.get("status") == "active"]
+        master_row, followers, master_balance = self._split_accounts(accounts)
         if not followers:
             return
-
-        # Master balance for the ratio
-        master_balance = 0.0
-        master_row = next((a for a in accounts if a.get("is_master")), None)
-        if master_row:
-            master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
 
         # A STALE event describes a world that may no longer exist. It was valid when
         # detected (only open/pending orders are pushed), but if it sat in the queue
@@ -2785,6 +2756,60 @@ class CopyEngine:
         except Exception:
             return {}
 
+    async def _read_accounts(self, owner_id=None):
+        """Every account row in ONE read, optionally scoped to an owner.
+
+        Returns the rows, or None if the read FAILED — several callers must tell
+        "there are no accounts" from "we could not look", and collapsing the two
+        would make an unreadable database look like an empty one.
+
+        Why this exists: the Supabase client is SYNCHRONOUS, so each call blocks
+        the whole event loop for its round trip, and the WebSocket reader shares
+        that loop. Measured on the live backend 2026-08-28: ~5.5 Supabase calls
+        per second sustained, ~170ms each — roughly 0.94s of blocked loop per
+        second of wall clock. Order events were then arriving up to 6.7s "stale",
+        which read like exchange lag and was not: the network round trip to Delta
+        from the same host is 20ms, the clock is NTP-synced and CPU load is 0.06.
+        The feed was fine; we were not reading it.
+
+        So the callers below fetch once and partition in Python rather than
+        issuing a query per role — and, where they looped, per follower.
+
+        Deliberately a READ-THROUGH, not account_cache: sizing an order is the one
+        place a few seconds of balance staleness costs money, which is exactly why
+        account_cache's docstring excludes this path. Same rows, same freshness,
+        fewer round trips.
+        """
+        try:
+            q = self.db.table("accounts").select("*")
+            if owner_id:
+                q = q.eq("owner_id", owner_id)
+            return q.execute().data or []
+        except Exception as e:
+            logger.error(f"Failed to read accounts (owner {owner_id or '<all>'}): {e}")
+            return None
+
+    @staticmethod
+    def _split_accounts(accounts, owner_id=None):
+        """(master_row, active_followers, master_balance) from one account list.
+
+        Applies exactly the filters the separate queries used — master is
+        is_master=True, a follower is is_master=False AND status='active' — so
+        moving them from SQL into Python cannot select a different set. Pass
+        owner_id only where the original query was owner-scoped.
+        """
+        rows = accounts or []
+        if owner_id:
+            rows = [a for a in rows if a.get("owner_id") == owner_id]
+        master = next((a for a in rows if a.get("is_master")), None)
+        followers = [a for a in rows
+                     if not a.get("is_master") and a.get("status") == "active"]
+        balance = 0.0
+        if master:
+            balance = float(master.get("allocated_balance") or master.get("balance")
+                            or master.get("available_margin") or 0.0)
+        return master, followers, balance
+
     async def _claim_escalation(self, order_id) -> bool:
         """Claim the right to escalate ONE follower order. True if we won it.
 
@@ -3134,16 +3159,25 @@ class CopyEngine:
         )
         # Master row is needed both for the protective check below and for the
         # post-cancel exit settle further down, so resolve it once.
+        # ONE read serves the master here, the self-heal follower list further
+        # down, and the per-follower lookup inside the loop after it — three
+        # separate queries before, the last of them once per follower.
+        #
+        # Read unscoped and filtered here because those three scoped differently:
+        # the master was owner-scoped, the self-heal list had NO owner filter, and
+        # the per-follower lookup was by id alone. Reading everything reproduces
+        # each of them exactly; narrowing the read would quietly change the
+        # self-heal set.
+        _accounts = await self._read_accounts() or []
+        _by_id = {a.get("id"): a for a in _accounts if a.get("id")}
         master_row = None
         if symbol and event:
-            try:
-                mq = self.db.table("accounts").select("*").eq("is_master", True)
-                if event.get("owner_id"):
-                    mq = mq.eq("owner_id", event["owner_id"])
-                mrow = mq.execute()
-                master_row = mrow.data[0] if mrow.data else None
-            except Exception:
-                master_row = None
+            _oid = event.get("owner_id")
+            master_row = next(
+                (a for a in _accounts
+                 if a.get("is_master") and (not _oid or a.get("owner_id") == _oid)),
+                None,
+            )
         if is_protective and symbol and event:
             # Did the master CANCEL this stop, or did it FIRE?
             #
@@ -3196,11 +3230,9 @@ class CopyEngine:
         # self-heal) all active followers if we have no mapping.
         targets = dict(mapping) if mapping else {}
         if not targets and event:
-            try:
-                fols = self.db.table("accounts").select("id").eq("is_master", False).eq("status", "active").execute().data or []
-                targets = {f["id"]: None for f in fols}
-            except Exception:
-                targets = {}
+            # Deliberately NOT owner-scoped, matching the query this replaces.
+            targets = {a["id"]: None for a in _accounts
+                       if not a.get("is_master") and a.get("status") == "active"}
 
         # auto_ratio divides by the master's balance, and these follower rows come
         # straight from the DB without it — so the settle below saw an unreadable
@@ -3214,11 +3246,12 @@ class CopyEngine:
             )
 
         for follower_id, follower_order_id in targets.items():
-            acc_res = self.db.table("accounts").select("*").eq("id", follower_id).execute()
-            if not acc_res.data:
+            follower_row = _by_id.get(follower_id)
+            if not follower_row:
                 continue
-            acc_res.data[0]["master_balance"] = cancel_master_balance
-            client = await self._get_follower_client(acc_res.data[0])
+            follower_row = dict(follower_row)  # per-follower, not shared state
+            follower_row["master_balance"] = cancel_master_balance
+            client = await self._get_follower_client(follower_row)
             if not client:
                 continue
 
@@ -3249,7 +3282,7 @@ class CopyEngine:
             # on top of the market close (which would over-close the follower).
             if not is_protective and symbol and master_row:
                 await self._settle_exit_after_cancel(
-                    acc_res.data[0], client, symbol, master_row,
+                    follower_row, client, symbol, master_row,
                     ref_price=float((event or {}).get("limit_price") or 0.0),
                 )
         # The ordermap entry goes away below, but the ledger keeps the audit trail:
