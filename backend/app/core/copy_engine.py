@@ -2029,24 +2029,33 @@ class CopyEngine:
                     # and the follower opened 62 lots against a target of 31. The
                     # reconciler trimmed it back a minute later, so the position
                     # ended right and only the round-trip cost showed.
-                    if not await self._master_order_filled(master_order_id):
-                        if not any(rid == str(master_order_id) for rid, _ in entry_rungs):
-                            entry_rungs = list(entry_rungs) + [(str(master_order_id), float(master_qty))]
-                    would_hold = float(m_pos) + sum(sz for _, sz in entry_rungs)
-                    target_total = self.risk_engine.calculate_follower_quantity(
-                        would_hold, ref_price, follower, round_up=True, min_one=False
-                    )
+                    filled_entry = await self._master_order_filled(master_order_id)
                     held_now = await self._follower_held(
                         await self._get_follower_client(follower), follower["id"], symbol)
-                    to_open = max(0, int(target_total) - held_now)
-                    alloc = ladder.allocate(entry_rungs, to_open)
-                    laddered = int(alloc.get(str(master_order_id), 0))
-                    logger.info(
-                        f"Ladder open for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
-                        f"{sum(sz for _, sz in entry_rungs):.0f} resting (master holds {m_pos:.0f}), "
-                        f"follower holds {held_now} -> target {int(target_total)}, to open {to_open}, "
-                        f"this rung {laddered} (per-rung ceil would have been {qty})"
+                    laddered, target_total, to_open, entry_rungs = self._entry_open_qty(
+                        filled_entry=filled_entry,
+                        entry_rungs=entry_rungs,
+                        m_pos=float(m_pos),
+                        held_now=held_now,
+                        master_order_id=master_order_id,
+                        master_qty=float(master_qty),
+                        target_fn=lambda lots: self.risk_engine.calculate_follower_quantity(
+                            lots, ref_price, follower, round_up=True, min_one=False
+                        ),
                     )
+                    if filled_entry:
+                        logger.info(
+                            f"Filled-entry open for {follower['name']} on {symbol}: master's entry "
+                            f"already filled (master holds {m_pos:.0f}), follower holds {held_now} "
+                            f"-> target {target_total}, opening {laddered}"
+                        )
+                    else:
+                        logger.info(
+                            f"Ladder open for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
+                            f"{sum(sz for _, sz in entry_rungs):.0f} resting (master holds {m_pos:.0f}), "
+                            f"follower holds {held_now} -> target {target_total}, to open {to_open}, "
+                            f"this rung {laddered} (per-rung ceil would have been {qty})"
+                        )
                     qty = laddered
                     if laddered < 1:
                         # A legitimate zero — the follower is already where the
@@ -2582,6 +2591,69 @@ class CopyEngine:
         if fs is not None:
             return int(float(fs))
         return int(float(od.get("size") or 0) - float(od.get("unfilled_size") or 0))
+
+    @staticmethod
+    def _entry_open_qty(*, filled_entry: bool, entry_rungs, m_pos: float, held_now: int,
+                        master_order_id, master_qty: float, target_fn):
+        """How many lots this ENTRY order should open on one follower.
+
+        Returns (qty, target_total, to_open, rungs) — rungs is the master's
+        resting book as it was actually reasoned about, for the log line.
+
+        Two regimes, and conflating them is what broke the live copy:
+
+        STILL RESTING — size the whole ladder at once. Ceiling each rung on its
+        own over-buys (30 rungs of 100 lots is 30 x ceil(1.14) = 60 follower lots
+        against a proportional target of 34), so we ask where the master will BE
+        if every resting entry fills, scale that to the follower, subtract what it
+        already holds, and split the remainder across the rungs by largest
+        remainder. The arriving order is injected into that book because the REST
+        snapshot lags the WS and the event is authoritative that it rests.
+
+        ALREADY FILLED — there is no ladder to allocate across, so don't try. Its
+        lots are already IN `m_pos`; injecting it as a rung as well would count
+        the same lots twice (39f154e), but simply NOT injecting it leaves
+        `entry_rungs` holding only what still rests — which for a taker fill is
+        nothing. `ladder.allocate([], to_open)` then returns {}, this rung scores
+        0, and the caller reads that as "already at target" and places NOTHING.
+        The entry falls to the 15s position reconciler, which opens at MARKET.
+
+        That is the regression seen 2026-08-27/28 — 11 times in 7.5 hours, every
+        taker entry reaching the follower ~20-30s late, at market, with no resting
+        order ever shown. C-BTC-83000-280826:
+
+            22:37:55  master's 3000 sell FILLS
+            22:37:56  the "open" event for the SAME id arrives
+            22:37:59  "rung 3000 of 0 resting ... to open 34, this rung 0"
+            22:38:22  reconciler opens 34 at market          <- 26s late
+
+        And when the reconciler then declines, the leg never recovers at all:
+        C-BTC-84000-280826 sat at 12 lots against a target of 23 for the rest of
+        the session, because the price had drifted past its top-up guard.
+
+        So a filled entry is sized on the POSITION, not on `would_hold`: the
+        follower belongs at its proportional share of what now exists. That is
+        deliberately the same calculation the reconciler runs, so the two cannot
+        disagree about the target and undo each other — it just runs now instead
+        of half a minute later. Sizing on `m_pos` also leaves any rung still
+        resting where it is: we open what actually filled, never more.
+
+        Exact mirror of the exit-side `filled_exit` branch (0e1c7e5), which
+        repaired this same hole for reduce-only closes and left the entry half
+        open.
+        """
+        rungs = list(entry_rungs)
+        if not filled_entry and not any(rid == str(master_order_id) for rid, _ in rungs):
+            rungs = rungs + [(str(master_order_id), float(master_qty))]
+
+        basis = float(m_pos) if filled_entry else float(m_pos) + sum(sz for _, sz in rungs)
+        target_total = int(target_fn(basis))
+        to_open = max(0, target_total - int(held_now))
+
+        if filled_entry:
+            return to_open, target_total, to_open, rungs
+        alloc = ladder.allocate(rungs, to_open)
+        return int(alloc.get(str(master_order_id), 0)), target_total, to_open, rungs
 
     async def _master_order_filled(self, master_order_id) -> bool:
         """Have we SEEN this master order fill?
