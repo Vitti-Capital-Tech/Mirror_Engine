@@ -1997,95 +1997,28 @@ class CopyEngine:
 
         for follower in followers:
             follower["master_balance"] = master_balance
-            # Floor so the mirrored order quantity matches the follower's position
-            # (which was also floored on open). reduce_only caps it anyway.
-            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
-            # An ENTRY ladder has the mirror image of the exit-ladder bug: ceiling
-            # each rung on its own OVER-buys. 30 rungs of 100 lots is 30 x ceil(1.14)
-            # = 60 follower lots against a proportional target of 34 — 76% over. It
-            # has been invisible because the position reconciler trims it back
-            # afterwards, so the cost shows up as round-trip fees and slippage
-            # rather than as lasting exposure.
+            # ORDER MATTERS HERE, and it used to be the wrong way round.
             #
-            # Size it as one ladder: where the master will BE if every resting entry
-            # fills (position + all resting entries), scaled to the follower, minus
-            # what the follower already holds — then split across the rungs.
-            if (not reduce_only) and (not is_protective_order) and (not is_update) and master_row:
-                entry_rungs = await self._master_resting_entries(master_row, symbol)
-                m_pos = await self._master_position_size(master_row, symbol)
-                if entry_rungs is not None and m_pos is not None:
-                    # Inject this order as a rung ONLY if it is genuinely still
-                    # resting. The arriving event is normally authoritative on
-                    # that — the REST snapshot can lag the WS — but a STALE event
-                    # describes a world that has moved on, and `m_pos` already
-                    # contains the lots of an order that has since filled. Adding
-                    # it again counts the same lots twice: once as the position
-                    # they became, once as an order still waiting to fill.
-                    #
-                    # Observed 2026-08-27, P-BTC-74500-280826: the master's 2750
-                    # sell filled at 02:18:46, a 7.14s-stale "open" event arrived
-                    # at 02:18:49, would_hold came out at 5500 instead of 2750,
-                    # and the follower opened 62 lots against a target of 31. The
-                    # reconciler trimmed it back a minute later, so the position
-                    # ended right and only the round-trip cost showed.
-                    filled_entry = await self._master_order_filled(master_order_id)
-                    held_now = await self._follower_held(
-                        await self._get_follower_client(follower), follower["id"], symbol)
-                    laddered, target_total, to_open, entry_rungs = self._entry_open_qty(
-                        filled_entry=filled_entry,
-                        entry_rungs=entry_rungs,
-                        m_pos=float(m_pos),
-                        held_now=held_now,
-                        master_order_id=master_order_id,
-                        master_qty=float(master_qty),
-                        target_fn=lambda lots: self.risk_engine.calculate_follower_quantity(
-                            lots, ref_price, follower, round_up=True, min_one=False
-                        ),
-                    )
-                    if filled_entry:
-                        logger.info(
-                            f"Filled-entry open for {follower['name']} on {symbol}: master's entry "
-                            f"already filled (master holds {m_pos:.0f}), follower holds {held_now} "
-                            f"-> target {target_total}, opening {laddered}"
-                        )
-                    else:
-                        logger.info(
-                            f"Ladder open for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
-                            f"{sum(sz for _, sz in entry_rungs):.0f} resting (master holds {m_pos:.0f}), "
-                            f"follower holds {held_now} -> target {target_total}, to open {to_open}, "
-                            f"this rung {laddered} (per-rung ceil would have been {qty})"
-                        )
-                    qty = laddered
-                    if laddered < 1:
-                        # A legitimate zero — the follower is already where the
-                        # master's book would put it. Distinguish it from the
-                        # "sizing unavailable" zero below, which is a failure.
-                        logger.info(
-                            f"No open needed for {follower['name']} on {symbol}: holds "
-                            f"{held_now} of target {int(target_total)}"
-                        )
-                        await ledger.record_follower_leg(
-                            self.redis, master_order_id, follower["id"], status="skipped",
-                            reason=f"already at target {int(target_total)} (holds {held_now})",
-                        )
-                        _hist_leg(follower, status="skipped", requested=0,
-                                  reason=f"already at target {int(target_total)} (holds {held_now})")
-                        continue
-            if qty < 1:
-                # Sizing unavailable (e.g. the master's balance read as 0, so the
-                # ratio can't be computed). Skip rather than guess — the reconciler
-                # picks this leg up once balances read again.
-                logger.warning(
-                    f"Skipping mirror to {follower.get('name')} on {symbol}: "
-                    f"sizing unavailable for master qty {master_qty}"
-                )
-                await ledger.record_follower_leg(
-                    self.redis, master_order_id, follower["id"], status="skipped",
-                    reason="sizing unavailable (balance ratio could not be computed)",
-                )
-                _hist_leg(follower, status="skipped",
-                          reason="sizing unavailable (balance ratio could not be computed)")
-                continue
+            # The sizing below reads the master's resting book, the master's
+            # position and the follower's holdings — three exchange round trips.
+            # The guard underneath then answers, from a single Redis GET, whether
+            # this order is already mirrored and there is nothing to do at all.
+            # Running the expensive half first meant we paid for those calls on
+            # every no-op: the 30s reconcile re-pushes EVERY resting order the
+            # master has, so ~8 orders x 3 calls fired every half minute purely to
+            # conclude "already done".
+            #
+            # Those calls are not free to the events behind them. Same-symbol
+            # events are serialised, Delta's rate limit is shared, and a genuinely
+            # new order lands at the back of that queue. Measured 2026-08-28 on
+            # C-BTC-81000-280826: the WS delivered the master's order in 0.00s and
+            # the follower was still not filled for 8-10s, ~5.7s of it spent
+            # inside this loop before any sizing decision was reached, while a
+            # reconcile burst drained (latency climbing 0.00 -> 6.94s across one
+            # burst in the same log).
+            #
+            # So: cheap, conclusive checks first. Nothing about WHAT gets decided
+            # changes — only how much work happens before deciding it.
             place_stop_price = stop_price  # per-follower (jittered for protection)
             client = await self._get_follower_client(follower)
             if not client:
@@ -2184,6 +2117,94 @@ class CopyEngine:
                     # cancelled without filling — clear and re-place
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
 
+            # Floor so the mirrored order quantity matches the follower's position
+            # (which was also floored on open). reduce_only caps it anyway.
+            qty = self.risk_engine.calculate_follower_quantity(master_qty, ref_price, follower, round_up=True)
+            # An ENTRY ladder has the mirror image of the exit-ladder bug: ceiling
+            # each rung on its own OVER-buys. 30 rungs of 100 lots is 30 x ceil(1.14)
+            # = 60 follower lots against a proportional target of 34 — 76% over. It
+            # has been invisible because the position reconciler trims it back
+            # afterwards, so the cost shows up as round-trip fees and slippage
+            # rather than as lasting exposure.
+            #
+            # Size it as one ladder: where the master will BE if every resting entry
+            # fills (position + all resting entries), scaled to the follower, minus
+            # what the follower already holds — then split across the rungs.
+            if (not reduce_only) and (not is_protective_order) and (not is_update) and master_row:
+                entry_rungs = await self._master_resting_entries(master_row, symbol)
+                m_pos = await self._master_position_size(master_row, symbol)
+                if entry_rungs is not None and m_pos is not None:
+                    # Inject this order as a rung ONLY if it is genuinely still
+                    # resting. The arriving event is normally authoritative on
+                    # that — the REST snapshot can lag the WS — but a STALE event
+                    # describes a world that has moved on, and `m_pos` already
+                    # contains the lots of an order that has since filled. Adding
+                    # it again counts the same lots twice: once as the position
+                    # they became, once as an order still waiting to fill.
+                    #
+                    # Observed 2026-08-27, P-BTC-74500-280826: the master's 2750
+                    # sell filled at 02:18:46, a 7.14s-stale "open" event arrived
+                    # at 02:18:49, would_hold came out at 5500 instead of 2750,
+                    # and the follower opened 62 lots against a target of 31. The
+                    # reconciler trimmed it back a minute later, so the position
+                    # ended right and only the round-trip cost showed.
+                    filled_entry = await self._master_order_filled(master_order_id)
+                    held_now = await self._follower_held(client, follower["id"], symbol)
+                    laddered, target_total, to_open, entry_rungs = self._entry_open_qty(
+                        filled_entry=filled_entry,
+                        entry_rungs=entry_rungs,
+                        m_pos=float(m_pos),
+                        held_now=held_now,
+                        master_order_id=master_order_id,
+                        master_qty=float(master_qty),
+                        target_fn=lambda lots: self.risk_engine.calculate_follower_quantity(
+                            lots, ref_price, follower, round_up=True, min_one=False
+                        ),
+                    )
+                    if filled_entry:
+                        logger.info(
+                            f"Filled-entry open for {follower['name']} on {symbol}: master's entry "
+                            f"already filled (master holds {m_pos:.0f}), follower holds {held_now} "
+                            f"-> target {target_total}, opening {laddered}"
+                        )
+                    else:
+                        logger.info(
+                            f"Ladder open for {follower['name']} on {symbol}: rung {master_qty:.0f} of "
+                            f"{sum(sz for _, sz in entry_rungs):.0f} resting (master holds {m_pos:.0f}), "
+                            f"follower holds {held_now} -> target {target_total}, to open {to_open}, "
+                            f"this rung {laddered} (per-rung ceil would have been {qty})"
+                        )
+                    qty = laddered
+                    if laddered < 1:
+                        # A legitimate zero — the follower is already where the
+                        # master's book would put it. Distinguish it from the
+                        # "sizing unavailable" zero below, which is a failure.
+                        logger.info(
+                            f"No open needed for {follower['name']} on {symbol}: holds "
+                            f"{held_now} of target {int(target_total)}"
+                        )
+                        await ledger.record_follower_leg(
+                            self.redis, master_order_id, follower["id"], status="skipped",
+                            reason=f"already at target {int(target_total)} (holds {held_now})",
+                        )
+                        _hist_leg(follower, status="skipped", requested=0,
+                                  reason=f"already at target {int(target_total)} (holds {held_now})")
+                        continue
+            if qty < 1:
+                # Sizing unavailable (e.g. the master's balance read as 0, so the
+                # ratio can't be computed). Skip rather than guess — the reconciler
+                # picks this leg up once balances read again.
+                logger.warning(
+                    f"Skipping mirror to {follower.get('name')} on {symbol}: "
+                    f"sizing unavailable for master qty {master_qty}"
+                )
+                await ledger.record_follower_leg(
+                    self.redis, master_order_id, follower["id"], status="skipped",
+                    reason="sizing unavailable (balance ratio could not be computed)",
+                )
+                _hist_leg(follower, status="skipped",
+                          reason="sizing unavailable (balance ratio could not be computed)")
+                continue
             # Bracket SL/TP attached to a position -> use the bracket endpoint.
             if is_bracket and product_id and stop_price is not None:
                 existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
