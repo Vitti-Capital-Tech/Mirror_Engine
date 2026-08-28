@@ -40,6 +40,12 @@ def _short_reason(exc, body: str = "") -> str:
 # wait, then retry-wait), escalate it to a full-or-nothing market order.
 ESCALATE_WAIT_SEC = 5
 
+# How long one escalation's claim on a follower order lives. Comfortably longer
+# than an escalation takes (a sleep plus a few REST calls) so a task killed
+# mid-flight cannot leave the claim held, and short enough that it never
+# outlives the order it guards.
+ESCALATION_CLAIM_TTL = int(os.getenv("ESCALATION_CLAIM_TTL", "120"))
+
 # A copied ENTRY is only "fresh" if the master's entry happened within this
 # window. After downtime the master may still hold hours-old positions (the
 # reconciler would otherwise re-enter the follower at today's drifted price),
@@ -2779,6 +2785,33 @@ class CopyEngine:
         except Exception:
             return {}
 
+    async def _claim_escalation(self, order_id) -> bool:
+        """Claim the right to escalate ONE follower order. True if we won it.
+
+        Two escalation tasks can target the same order — see the block in
+        _escalate_unfilled_limit that calls this. The claim is atomic (SET NX) so
+        exactly one wins, and it is taken only once every "should we act?" check
+        has passed: a task that returns early never claims, so a later legitimate
+        escalation of the same order is not blocked by it.
+
+        TTL well past the escalation's own lifetime, so a task killed mid-flight
+        cannot hold the claim for long.
+
+        Answers True when Redis is unreachable. Refusing would disable escalation
+        entirely during a Redis outage and strand the follower's limit, while the
+        cancel-is-the-claim rule below still prevents the double-market on its
+        own — this claim exists to make the exclusivity explicit and to save the
+        loser a wasted cancel attempt, not as the only line of defence.
+        """
+        if not order_id or not self.redis:
+            return True
+        try:
+            return bool(await self.redis.set(
+                f"escalating:{order_id}", "1", nx=True, ex=ESCALATION_CLAIM_TTL))
+        except Exception as e:
+            logger.warning(f"Could not claim escalation for {order_id}: {e}")
+            return True
+
     async def _safe_cancel(self, client, order_id, product_id) -> bool:
         """Cancel; return True only if it actually cancelled (order was open)."""
         try:
@@ -2867,11 +2900,55 @@ class CopyEngine:
                     logger.info(f"Escalation: master not in {symbol} yet — leaving {follower['name']} limit resting to wait.")
                     return
 
-            # Cancel, then CONFIRM it didn't fill during the race before marketing.
+            # TWO escalations can legitimately target the SAME follower order.
+            # One is spawned when the mirror is placed; another when the master's
+            # own limit fills (_escalate_after_master_fill), because the first one
+            # returns without acting while the master is still resting. Both then
+            # sleep ESCALATE_WAIT_SEC and wake up wanting to cancel-and-market the
+            # same lots.
+            #
+            # Observed live 2026-08-28, C-BTC-82000-280826:
+            #   04:01:25.307  Escalated unfilled limit -> MARKET qty 20 (1501921046)
+            #   04:01:25.307  WARN  Escalation cancel failed for 1501920742: 400
+            #   04:01:28.100  ERROR Escalation market order failed [sell qty=20]: 400
+            # Two tasks, one order. The follower ended correct at 20 only because
+            # Delta rejected the second market order. Nothing in the code stopped
+            # it: the old guard asked `if not cancelled and _order_done(od)`, and a
+            # CANCELLED-but-unfilled order is not "done" (state 'cancelled',
+            # unfilled_size still 20), so the loser of the race fell straight
+            # through and marketed the full 20 a second time. Had Delta accepted
+            # it, the follower would have been short 40 against a target of 20.
+            #
+            # The same guard had a second hole: if the cancel merely FAILED while
+            # the limit was still resting, we marketed on top of a live order.
+            #
+            # Both close the same way — CANCELLING IS THE CLAIM. Only one caller
+            # can successfully cancel a live order, so a successful cancel is the
+            # licence to market, and nothing else is. The Redis claim above it
+            # makes that exclusivity explicit rather than leaning on Delta's error
+            # semantics; neither is load-bearing alone.
+            if not await self._claim_escalation(order_id):
+                logger.info(
+                    f"Escalation skipped for {follower['name']} {symbol}: another "
+                    f"escalation already owns mirror {order_id}"
+                )
+                return
+
             cancelled = await self._safe_cancel(client, order_id, product_id)
             od = await self._safe_get_order(client, order_id)
-            if not cancelled and self._order_done(od):
-                logger.info(f"Escalation aborted for {follower['name']} {symbol}: limit filled during cancel (no double-order).")
+            if not cancelled:
+                state = (od.get("state") or "").lower() if od else ""
+                why = (
+                    "unreadable" if not od
+                    else "already filled" if self._order_done(od)
+                    else "still resting" if state in ("open", "pending")
+                    else f"already {state or 'gone'}"
+                )
+                logger.info(
+                    f"Escalation aborted for {follower['name']} {symbol}: could not cancel "
+                    f"mirror {order_id} ({why}) — not marketing on top of an order we do "
+                    f"not own. The 15s reconciler covers the position if one is owed."
+                )
                 return
 
             # Market only the UNFILLED remainder, never more than intended.
