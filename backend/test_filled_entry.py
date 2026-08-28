@@ -1,4 +1,8 @@
-"""Regression: a master ENTRY that has already filled must still be copied NOW.
+"""Regression: a master order that has already FILLED must still be copied NOW.
+
+Two bugs, same shape — a decision made from "the world now" for an order that
+describes "the world then". The entry half is below; the exit half is at the
+bottom of the file (C-BTC-81000-280826, the 388s leg).
 
 Run:  venv/Scripts/python.exe test_filled_entry.py
 No network, no Redis, no Supabase.
@@ -159,9 +163,76 @@ async def test_resting_ladder_respects_what_the_follower_holds():
     check("nothing left to open", qty, 0)
 
 
+
+
+# ---------------------------------------------------------------------------
+# The same class of bug on the EXIT side: a master exit that has already filled
+# leaves no position for the reduce-only test to read, so a close was
+# classified as an entry and the follower kept the leg.
+#
+#   2026-08-28, C-BTC-81000-280826
+#     01:02:21  master's 650 sell FILLS -> master flat
+#     01:02:29  the "open" event for the SAME id arrives
+#     01:02:33  "Ladder open ... master holds 0, follower holds 8 -> target 0"
+#     01:08:51  reconciler closes the follower's 8            <- 388s later
+# ---------------------------------------------------------------------------
+
+def infer(side, msigned, filled):
+    return CopyEngine._infer_reduce_only(side, msigned, master_order_filled=filled)
+
+
+async def test_flat_master_after_a_filled_sell_is_a_close():
+    print("\nTHE 388s LEG: master's exit filled and took it flat")
+    why = infer("sell", 0.0, True)
+    check("classified as a close", bool(why), True)
+    check("says why", "FLAT" in (why or ""), True)
+
+
+async def test_flat_master_after_a_filled_buy_is_a_close():
+    print("\nthe short side of the same case")
+    check("a buy that flattened a short is a close", bool(infer("buy", 0.0, True)), True)
+
+
+async def test_flat_master_without_a_fill_is_not_a_close():
+    print("\na flat master with NO fill seen is an ENTRY, not a close")
+    # The master is flat and resting an opening order — the ordinary way a new
+    # position starts. Treating this as reduce-only would skip every fresh entry
+    # on a symbol the master does not hold yet.
+    check("still an entry", infer("sell", 0.0, False), None)
+    check("still an entry (buy)", infer("buy", 0.0, False), None)
+
+
+async def test_partial_exit_unchanged():
+    print("\nunchanged: a partial exit still reads off the position it leaves")
+    check("sell against a long", bool(infer("sell", 700.0, True)), True)
+    check("buy against a short", bool(infer("buy", -700.0, True)), True)
+    check("and without a fill marker too", bool(infer("sell", 700.0, False)), True)
+
+
+async def test_plain_entry_unchanged():
+    print("\nunchanged: an entry that grew the position is still an entry")
+    # C-BTC-83000: master sold 3000 from flat, now holds -3000. A sell that
+    # OPENED a short must not be read as reducing one.
+    check("sell that opened a short", infer("sell", -3000.0, True), None)
+    # C-BTC-84000: master bought 500 on top of 1500, now holds +2000.
+    check("buy that added to a long", infer("buy", 2000.0, True), None)
+
+
+async def test_reversal_unchanged():
+    print("\nunchanged: a reversal is left alone (msigned is not zero)")
+    # +200 sold 500 -> now -300. Neither test fires; the entry path handles it
+    # exactly as it did before, rather than this fix guessing at a flip.
+    check("sell that flipped long to short", infer("sell", -300.0, True), None)
+
+
+async def test_unreadable_position_is_not_guessed():
+    print("\nan unreadable master position must not be guessed at")
+    check("None in, None out", infer("sell", None, True), None)
+
+
 async def main():
     print("=" * 74)
-    print("filled entry — a master entry that already filled must still copy NOW")
+    print("filled entry/exit — an order that already filled must still copy NOW")
     print("=" * 74)
     for fn in (
         test_the_incident,
@@ -173,6 +244,13 @@ async def main():
         test_real_ladder_still_splits_by_largest_remainder,
         test_snapshot_already_listing_the_order_does_not_double_add,
         test_resting_ladder_respects_what_the_follower_holds,
+        test_flat_master_after_a_filled_sell_is_a_close,
+        test_flat_master_after_a_filled_buy_is_a_close,
+        test_flat_master_without_a_fill_is_not_a_close,
+        test_partial_exit_unchanged,
+        test_plain_entry_unchanged,
+        test_reversal_unchanged,
+        test_unreadable_position_is_not_guessed,
     ):
         await fn()
     print("\n" + "=" * 74)

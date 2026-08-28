@@ -1906,13 +1906,12 @@ class CopyEngine:
         # only reduce their matching position (and do nothing if they hold none).
         if not reduce_only and not is_bracket and stop_price is None and master_row:
             msigned = await self._master_position_signed(master_row, symbol)
-            if msigned is not None and (
-                (side == "sell" and msigned > 0) or (side == "buy" and msigned < 0)
-            ):
-                logger.info(
-                    f"Inferred reduce-only for {symbol} {side}: master holds {msigned:+.0f} "
-                    f"(order reduces it, reduce_only flag was not set)"
-                )
+            why = self._infer_reduce_only(
+                side, msigned,
+                master_order_filled=await self._master_order_filled(master_order_id),
+            )
+            if why:
+                logger.info(f"Inferred reduce-only for {symbol} {side}: {why}")
                 reduce_only = True
 
         ref_price = limit_price or stop_price or 0.0
@@ -2591,6 +2590,56 @@ class CopyEngine:
         if fs is not None:
             return int(float(fs))
         return int(float(od.get("size") or 0) - float(od.get("unfilled_size") or 0))
+
+    @staticmethod
+    def _infer_reduce_only(side: str, msigned, master_order_filled: bool):
+        """Should this order be treated as a CLOSE, even though the master did
+        not set reduce_only? Returns the reason to log, or None.
+
+        Two readings, because one of them is destroyed by the very fill it
+        describes.
+
+        AGAINST THE POSITION THE MASTER HOLDS. A sell while the master is long,
+        or a buy while it is short, reduces the master — so it must never open a
+        fresh follower position. This is the normal case and covers every partial
+        exit.
+
+        THE POSITION IS ALREADY GONE. An exit that has ALREADY FILLED has taken
+        the master to zero, so there is nothing left for the first test to read
+        and a plain close gets classified as an ENTRY. The entry path cannot
+        express "close": it sizes the follower at its share of a flat master,
+        gets 0, and leaves the follower holding.
+
+        Observed 2026-08-28, C-BTC-81000-280826:
+
+            01:02:21  master's 650 sell FILLS -> master flat
+            01:02:29  the "open" event for the SAME id arrives
+            01:02:33  "Ladder open ... master holds 0, follower holds 8
+                       -> target 0, to open 0"          <- read as an ENTRY
+            01:08:51  reconciler closes the follower's 8    <- 388s later
+
+        The follower sat in a position the master had left for six and a half
+        minutes — the worst delay of the day by a factor of five, and the only
+        one that left real directional risk on the book.
+
+        If the master has filled this order AND is now flat, the order closed the
+        position; whatever it was, the follower belongs at its share of zero.
+        Routing it to the exit path gets exactly that, immediately, from the
+        filled_exit branch.
+
+        Deliberately narrow. A partial exit still leaves a position for the first
+        test to read, and a reversal (a sell that flips long to short) leaves
+        msigned non-zero — so neither is touched by the second.
+        """
+        if msigned is None:
+            return None
+        if (side == "sell" and msigned > 0) or (side == "buy" and msigned < 0):
+            return (f"master holds {msigned:+.0f} (order reduces it, reduce_only "
+                    f"flag was not set)")
+        if msigned == 0 and master_order_filled:
+            return ("master's order has filled and the master is now FLAT — "
+                    "this order closed the position")
+        return None
 
     @staticmethod
     def _entry_open_qty(*, filled_entry: bool, entry_rungs, m_pos: float, held_now: int,
