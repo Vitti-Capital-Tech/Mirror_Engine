@@ -1935,9 +1935,17 @@ class CopyEngine:
         # not, and the history is what anyone actually looks at.
         #
         # Fired as a task and never awaited on the hot path: the ORDER has to reach
-        # the exchange fast, the row can land a moment later. Every write inside
-        # goes through asyncio.to_thread because the Supabase client is synchronous
-        # and would otherwise block the loop behind the per-symbol lock.
+        # the exchange fast, the row can land a moment later.
+        #
+        # The writes inside are made DIRECTLY from the loop, NOT via
+        # asyncio.to_thread — this comment used to claim the opposite and was
+        # wrong. to_thread was shipped for exactly that reason and reverted: the
+        # Supabase client is shared process-wide, and driving it from pool threads
+        # alongside the loop's own calls corrupts it, landing Cloudflare 400s on
+        # unrelated callers (3 occurrences in five weeks became 11 in the first
+        # hour). See the order_history module docstring. create_task is what keeps
+        # this off the critical path; the brief loop block during the write is the
+        # same cost every other Supabase call in this codebase pays.
         _hist_trade = asyncio.create_task(oh.record_order_stage(
             self.db, master_order_id, symbol=symbol, side=side, size=master_qty,
             price=ref_price or limit_price or stop_price or 0, kind=_kind,
