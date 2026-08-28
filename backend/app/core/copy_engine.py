@@ -1849,31 +1849,51 @@ class CopyEngine:
             logger.info(f"[LATENCY] {symbol} order-mirror: {(time.time() - ts):.2f}s from master order detection to mirror start")
 
 
-        # Active followers (scoped to the master's owner)
+        # The active followers AND the master, in ONE read.
+        #
+        # These were two Supabase queries issued four lines apart — same table,
+        # same owner scope, differing only in the is_master/status filter that
+        # Python can apply just as well. The Supabase client is SYNCHRONOUS, so
+        # every call blocks the whole event loop for its round trip (~170ms), not
+        # just this event: the order consumer is one loop, so a burst of events
+        # queues behind every blocking call any of them makes.
+        #
+        # That is what the 30s order-reconcile burst runs into. Measured live on
+        # 2026-08-28, one 11-second burst issued 24 reads of `accounts`, and
+        # mirror latency inside the burst climbed from 0.00s on the first event to
+        # 7.64s on the last. Halving the reads halves that queue.
+        #
+        # Deliberately still a READ-THROUGH, not account_cache: sizing an order is
+        # the one place a few seconds of balance staleness costs money, which is
+        # exactly why account_cache excludes this path (see its module docstring).
+        # Same rows, same freshness, same decisions — one round trip instead of
+        # two. Nothing here may become a cache without solving that separately.
+        #
+        # asyncio.to_thread is NOT the answer either: it was shipped and reverted
+        # because the Supabase client is shared process-wide and driving it from
+        # pool threads corrupts it (see the order_history module docstring).
         try:
-            fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
+            aq = self.db.table("accounts").select("*")
             if owner_id:
-                fq = fq.eq("owner_id", owner_id)
-            followers = fq.execute().data or []
+                aq = aq.eq("owner_id", owner_id)
+            accounts = aq.execute().data or []
         except Exception as e:
-            logger.error(f"Failed to query followers for order mirror: {e}")
+            # Matches the old followers-query behaviour: without the accounts we
+            # cannot size or address anyone, so there is nothing safe to do. The
+            # 15s reconciler covers the gap.
+            logger.error(f"Failed to query accounts for order mirror: {e}")
             return
+
+        followers = [a for a in accounts
+                     if not a.get("is_master") and a.get("status") == "active"]
         if not followers:
             return
 
         # Master balance for the ratio
         master_balance = 0.0
-        master_row = None
-        try:
-            mq = self.db.table("accounts").select("*").eq("is_master", True)
-            if owner_id:
-                mq = mq.eq("owner_id", owner_id)
-            m = mq.execute()
-            if m.data:
-                master_row = m.data[0]
-                master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
-        except Exception:
-            pass
+        master_row = next((a for a in accounts if a.get("is_master")), None)
+        if master_row:
+            master_balance = float(master_row.get("allocated_balance") or master_row.get("balance") or master_row.get("available_margin") or 0.0)
 
         # A STALE event describes a world that may no longer exist. It was valid when
         # detected (only open/pending orders are pushed), but if it sat in the queue

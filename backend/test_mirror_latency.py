@@ -161,11 +161,22 @@ class FakeTable:
 
 
 class FakeDB:
+    """Counts reads of `accounts`, which is the whole point of the count checks.
+
+    The Supabase client is synchronous, so each of these blocks the event loop
+    for its round trip — not just for its own event, but for every event queued
+    behind it on the single order consumer.
+    """
+
     def __init__(self, accounts):
         self.accounts = accounts
+        self.account_reads = 0
 
     def table(self, name):
-        return FakeTable(self.accounts if name == "accounts" else [])
+        if name == "accounts":
+            self.account_reads += 1
+            return FakeTable(self.accounts)
+        return FakeTable([])
 
 
 MASTER_ROW = {
@@ -231,7 +242,7 @@ async def drain():
 # --------------------------------------------------------------------- checks
 
 async def test_already_done_mirror_costs_nothing():
-    print("\nTHE FIX: a mirror we already know is done must touch no exchange")
+    print("\nTHE FIX: a mirror already known done costs no per-follower calls")
     master = CountingClient(positions=[{"product_symbol": SYMBOL, "size": 900}],
                             name="master")
     follower = CountingClient(name="follower")
@@ -257,6 +268,10 @@ async def test_already_done_mirror_costs_nothing():
     check("exactly one master position read (the reduce-only inference)",
           master.calls, ["get_positions"])
     check("nothing placed", follower.placed, [])
+    # One accounts read, not two: the followers and the master used to be
+    # fetched by separate queries four lines apart. Same rows, same freshness —
+    # this is a round-trip count, not a caching change.
+    check("one accounts read, not two", eng.db.account_reads, 1)
 
 
 async def test_new_order_still_places_the_right_size():
@@ -298,6 +313,7 @@ async def test_new_order_pays_for_its_lookups():
 
     check("master position was read", "get_positions" in master.calls, True)
     check("an order went out", "place_order" in follower.calls, True)
+    check("still exactly one accounts read", eng.db.account_reads, 1)
 
 
 async def test_mapped_but_still_resting_is_a_noop_without_sizing():
@@ -323,6 +339,7 @@ async def test_mapped_but_still_resting_is_a_noop_without_sizing():
           master.calls, ["get_positions"])
     check("only the liveness read on the follower",
           [c for c in follower.calls if not c.startswith("get_open_orders")], [])
+    check("one accounts read, not two", eng.db.account_reads, 1)
 
 
 async def test_unmapped_order_is_not_short_circuited():
@@ -360,6 +377,43 @@ async def test_done_cache_is_per_follower_and_per_order():
     check("this order still placed", len(follower.placed), 1)
 
 
+async def test_partition_excludes_paused_and_other_owners():
+    print("\nthe Python partition must exclude exactly what the SQL filters did")
+    # The two queries filtered on is_master/status/owner_id in the database.
+    # Now Python does it, so prove the same rows are selected: a paused follower
+    # and another owner's follower must both stay out.
+    paused = dict(FOLLOWER_ROW, id="f2", name="Paused", status="paused")
+    other = dict(FOLLOWER_ROW, id="f3", name="Other owner", owner_id="o2")
+    master = CountingClient(positions=[{"product_symbol": SYMBOL, "size": 900}],
+                            name="master")
+    follower = CountingClient(positions=[{"product_symbol": SYMBOL, "size": 0}],
+                              name="follower")
+    eng = build_engine(master, follower)
+    eng.db = FakeDB([MASTER_ROW, FOLLOWER_ROW, paused, other])
+    await eng.redis.set(f"masterfilled:{MASTER_ORDER_ID}", "1")
+
+    await eng._mirror_place(event(), MASTER_ORDER_ID)
+    await drain()
+
+    # Only the one active follower of owner o1 is mirrored to. If `paused` or
+    # `other` leaked in, there would be more than one order.
+    check("exactly one follower acted on", len(follower.placed), 1)
+    check("one accounts read", eng.db.account_reads, 1)
+
+
+async def test_no_master_row_does_not_crash():
+    print("\nan accounts table with no master must not raise")
+    # master_row used to come from its own query whose failure was swallowed;
+    # now it is a lookup in the shared list, so prove the empty case is handled.
+    master = CountingClient(name="master")
+    follower = CountingClient(name="follower")
+    eng = build_engine(master, follower)
+    eng.db = FakeDB([FOLLOWER_ROW])          # no master at all
+    await eng._mirror_place(event(), MASTER_ORDER_ID)
+    await drain()
+    check("no order placed on an unknown ratio", follower.placed, [])
+
+
 async def main():
     print("=" * 74)
     print("mirror latency — a no-op must not pay for sizing it will not use")
@@ -371,6 +425,8 @@ async def main():
         test_mapped_but_still_resting_is_a_noop_without_sizing,
         test_unmapped_order_is_not_short_circuited,
         test_done_cache_is_per_follower_and_per_order,
+        test_partition_excludes_paused_and_other_owners,
+        test_no_master_row_does_not_crash,
     ):
         await fn()
     print("\n" + "=" * 74)
