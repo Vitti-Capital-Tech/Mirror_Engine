@@ -907,15 +907,16 @@ class CopyEngine:
         self._follower_pos_cache[key] = (held, time.time())
         return held
 
-    async def _master_resting_exits(self, master_row: dict, symbol: str):
+    async def _master_resting_exits(self, master_row: dict, symbol: str, fresh: bool = False):
         """The master's resting plain reduce-only limits (its EXIT ladder)."""
-        return await self._master_resting_orders(master_row, symbol, reduce_only=True)
+        return await self._master_resting_orders(master_row, symbol, reduce_only=True, fresh=fresh)
 
-    async def _master_resting_entries(self, master_row: dict, symbol: str):
+    async def _master_resting_entries(self, master_row: dict, symbol: str, fresh: bool = False):
         """The master's resting plain non-reduce-only limits (its ENTRY ladder)."""
-        return await self._master_resting_orders(master_row, symbol, reduce_only=False)
+        return await self._master_resting_orders(master_row, symbol, reduce_only=False, fresh=fresh)
 
-    async def _master_resting_orders(self, master_row: dict, symbol: str, reduce_only: bool):
+    async def _master_resting_orders(self, master_row: dict, symbol: str, reduce_only: bool,
+                                     fresh: bool = False):
         """The master's resting plain limits on `symbol`, as [(order_id, size)],
         filtered to reduce-only (exits) or not (entries). Cached ~3s so a ladder
         placed as a burst is allocated off one consistent snapshot.
@@ -936,7 +937,7 @@ class CopyEngine:
             return None
         ck = (symbol, bool(reduce_only))
         cached = self._master_exits_cache.get(ck)
-        if cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
+        if not fresh and cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
             return cached[0]
         client = self._get_master_client(master_row)
         if client is None:
@@ -2136,7 +2137,10 @@ class CopyEngine:
             # fills (position + all resting entries), scaled to the follower, minus
             # what the follower already holds — then split across the rungs.
             if (not reduce_only) and (not is_protective_order) and (not is_update) and master_row:
-                entry_rungs = await self._master_resting_entries(master_row, symbol)
+                # FRESH, not the 3s cache. A stale book is half of the
+                # double-count: the arriving order had already filled into m_pos
+                # while the cached snapshot still listed it as resting.
+                entry_rungs = await self._master_resting_entries(master_row, symbol, fresh=True)
                 m_pos = await self._master_position_size(master_row, symbol)
                 if entry_rungs is not None and m_pos is not None:
                     # Inject this order as a rung ONLY if it is genuinely still
@@ -2153,7 +2157,10 @@ class CopyEngine:
                     # and the follower opened 62 lots against a target of 31. The
                     # reconciler trimmed it back a minute later, so the position
                     # ended right and only the round-trip cost showed.
-                    filled_entry = await self._master_order_filled(master_order_id)
+                    filled_entry = await self._master_order_settled(
+                        master_row, master_order_id,
+                        any(rid == str(master_order_id) for rid, _ in entry_rungs),
+                    )
                     held_now = await self._follower_held(client, follower["id"], symbol)
                     laddered, target_total, to_open, entry_rungs = self._entry_open_qty(
                         filled_entry=filled_entry,
@@ -2411,8 +2418,16 @@ class CopyEngine:
                 # calculation the reconciler runs, so the two cannot disagree
                 # about the target and undo each other — it just runs now instead
                 # of a minute later.
-                filled_exit = await self._master_order_filled(master_order_id)
-                rungs = None if filled_exit else await self._master_resting_exits(master_row, symbol)
+                # Same evidence test as the entry path, and the same FRESH read:
+                # a cached book that still lists an order which has already filled
+                # is what let coverage_target see a flat master and allocate 0.
+                rungs = await self._master_resting_exits(master_row, symbol, fresh=True)
+                filled_exit = await self._master_order_settled(
+                    master_row, master_order_id,
+                    rungs is not None and any(rid == str(master_order_id) for rid, _ in rungs),
+                )
+                if filled_exit:
+                    rungs = None
 
                 if filled_exit:
                     # No ladder maths: master_now is the position AFTER the fill,
@@ -2729,6 +2744,46 @@ class CopyEngine:
             return to_open, target_total, to_open, rungs
         alloc = ladder.allocate(rungs, to_open)
         return int(alloc.get(str(master_order_id), 0)), target_total, to_open, rungs
+
+    async def _master_order_settled(self, master_row, master_order_id, in_fresh_book) -> bool:
+        """Has this master order stopped resting? Decided on EVIDENCE, in order.
+
+        The old test was "did the listener see a fill event yet?" — one Redis
+        marker. That makes the answer depend on which of two events describing the
+        SAME order happens to be processed first, and the engine then races
+        itself. Both anomalies of 2026-08-28 evening are that race:
+
+          13:00:26.405  master's buy created   -> place event queued
+          13:00:27.501  it FILLS               -> master holds 300
+          13:00:27.700  Ladder open ... rung 300 of 300 resting (master holds 300)
+                        -> target 7            <- counted the same 300 TWICE
+          13:01:40      reconciler TRIMMED by 3
+
+          16:06:35.352  master's sell created  -> place event queued
+          16:06:36.036  it FILLS               -> master flat
+          16:06:36.081  Ladder close ... master holds 0 -> cover 0, nothing placed
+          16:07:03      reconciler closed the follower's 3   <- 27s late
+
+        Three signals, strongest first, and only the ambiguous case costs a call:
+
+        1. The fill marker is POSITIVE evidence of a fill. If it is set, the order
+           is done — no call.
+        2. Appearing in a FRESH read of the master's resting book is positive
+           evidence it still rests. If it is there, it is not done — no call.
+        3. Neither says anything, which is exactly the window the race lives in.
+           Ask the exchange about this one order. Definitive, and rare.
+
+        An unreadable answer at step 3 reports "still resting", preserving the
+        previous behaviour rather than inventing a fill.
+        """
+        if await self._master_order_filled(master_order_id):
+            return True
+        if in_fresh_book:
+            return False
+        od = await self._safe_get_order(self._get_master_client(master_row), master_order_id)
+        if not od:
+            return False
+        return self._order_done(od) or self._filled_size(od) > 0
 
     async def _master_order_filled(self, master_order_id) -> bool:
         """Have we SEEN this master order fill?
