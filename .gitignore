@@ -110,3 +110,6 @@ temp/
 tmp/
 .temp/
 .tmp/
+
+# TypeScript incremental build cache — machine-local, regenerated on every build
+*.tsbuildinfo
