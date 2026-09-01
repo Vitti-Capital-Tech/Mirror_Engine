@@ -810,21 +810,6 @@ class CopyEngine:
         drift = abs(m - e) / e * 100.0
         return drift <= SYNC_PRICE_TOLERANCE_PCT, drift
 
-    @staticmethod
-    def _topup_despite_drift(last_fill, now: float) -> bool:
-        """Has the master traded this symbol recently enough that a drifted price
-        should NOT block topping the follower up?
-
-        _price_drift_ok guards STALE recoveries. A leg the master entered a minute
-        ago is not stale, and there the drift IS the move he just caught — see the
-        call site for the 2026-09-01 P-BTC-75200-020926 incident, where refusing
-        left the follower 19 lots short of target 23 for 2m21s.
-
-        Unknown last_fill returns False: without a timestamp we cannot claim the
-        leg is fresh, and the drift guard is the safer default.
-        """
-        return last_fill is not None and (now - float(last_fill)) < FRESH_ENTRY_SEC
-
     async def _missed_exit_ids(self, follower: dict, symbol: str) -> str:
         """Master EXIT order ids on `symbol` that never reached this follower, per
         the order-ID ledger — comma-joined for logging.
@@ -1411,37 +1396,6 @@ class CopyEngine:
                                 )
                                 continue
                             ok, drift = self._price_drift_ok(mark, mentry)
-                            # The drift guard exists for STALE legs — see
-                            # SYNC_PRICE_TOLERANCE_PCT: "recovering a leg the master
-                            # entered a long time ago". Judging on price instead of
-                            # age is right there. It is wrong for a leg the master
-                            # entered a minute ago, where the drift IS the move he
-                            # just caught: refusing then means the follower simply
-                            # never gets the trade it exists to copy.
-                            #
-                            # 2026-09-01 20:24 on P-BTC-75200-020926: the master's
-                            # 2000-lot short filled in pieces; the live copy sized on
-                            # the 324 that had filled at that instant and opened 4.
-                            # When the rest filled the completion arrived as an
-                            # `is_update` event, whose handler defers to the
-                            # reconciler — which then refused for 5 passes at
-                            # 23.6-27.8% drift and only alerted. The follower sat 19
-                            # lots short of target 23 for 2m21s, recovering only when
-                            # the master's NEXT order re-sized it correctly.
-                            #
-                            # TRIM_SETTLE_SEC already blocks any action for the first
-                            # 45s, so this only opens the 45s-FRESH_ENTRY_SEC window:
-                            # long enough for the master's fill to have settled, short
-                            # enough that we are still copying the same trade.
-                            if not ok and self._topup_despite_drift(last_fill, now):
-                                logger.info(
-                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
-                                    f"({held} vs target {int(target)}) and price drifted "
-                                    f"{drift:.1f}% from master entry {mentry}, but the master "
-                                    f"filled this symbol {now - last_fill:.0f}s ago — same trade, "
-                                    f"topping up anyway"
-                                )
-                                ok = True
                             if not ok:
                                 logger.info(
                                     f"reconcile: {fol.get('name')} under-exposed on {sym} "
