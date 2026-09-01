@@ -69,7 +69,7 @@ TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "45"))
 # master's last fill on that symbol is older than this, a follower's own jittered
 # stop was never going to fire alongside it either — so treat it as an orphan and
 # close. Generous vs FRESH_ENTRY_SEC because a real SL/TP mirror fires in seconds.
-STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "360"))  # 6 minutes
+STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "60"))  # 1 minute (desk call 2026-09-01)
 
 # Recovering a leg the master entered a long time ago used to be refused outright:
 # the reconciler logged "SKIP stale entry ... leaving follower flat" every 15s,
@@ -773,7 +773,17 @@ class CopyEngine:
         for o in sorted(history, key=_created, reverse=True):
             if (o.get("product_symbol") or o.get("symbol")) != symbol:
                 continue
-            if float(o.get("filled_size") or 0) <= 0:
+            # size - unfilled_size, NOT filled_size: /v2/orders/history does not
+            # return a filled_size field at all. Verified against live Delta
+            # 2026-09-01 — 0 of 50 rows carried the key, so this test read every
+            # order as unexecuted and the function returned "unknown" for EVERY
+            # exit since it was written (11h of logs: zero successful
+            # classifications, zero REST errors). Every master exit therefore fell
+            # through to the STALE_ORPHAN_SEC timeout instead of being identified
+            # in seconds. _filled_size() already handles this and is used by five
+            # other call sites; order_executor notes the same ("Delta exposes
+            # unfilled_size, not filled_size").
+            if self._filled_size(o) <= 0:
                 continue  # never executed (e.g. a cancelled resting order)
             result = "sl_tp" if o.get("stop_order_type") else "manual"
             break
@@ -1904,9 +1914,33 @@ class CopyEngine:
         # only reduce their matching position (and do nothing if they hold none).
         if not reduce_only and not is_bracket and stop_price is None and master_row:
             msigned = await self._master_position_signed(master_row, symbol)
+            # _infer_reduce_only only consults master_order_filled on its SECOND
+            # test (master reads flat), so only that branch pays for the answer.
+            #
+            # It used to ask _master_order_filled — the single Redis marker that
+            # 5ebba63 replaced precisely because it makes the answer depend on
+            # which of two events describing the same order is processed first.
+            # The routing decision was left on the old test, so the two disagreed:
+            # 2026-09-01 01:27:41 on P-BTC-78200-010926 the position read 0 while
+            # the marker was not yet visible, both tests returned None, the
+            # master's CLOSE was routed to the ENTRY path — which can only open —
+            # and 12 follower lots sat in a position the master had left until the
+            # reconciler swept them 6m30s later. The entry path's own log said
+            # "master's entry already filled" in the same breath, because IT asks
+            # _master_order_settled and got the opposite answer.
+            #
+            # in_fresh_book=False: we have no fresh resting-book read here, so the
+            # ambiguous case falls through to a single get_order on this one id.
+            # Gated on msigned == 0 (never None) so the normal path — master still
+            # holding — pays nothing.
+            if msigned == 0:
+                _settled = await self._master_order_settled(
+                    master_row, master_order_id, False,
+                )
+            else:
+                _settled = False
             why = self._infer_reduce_only(
-                side, msigned,
-                master_order_filled=await self._master_order_filled(master_order_id),
+                side, msigned, master_order_filled=_settled,
             )
             if why:
                 logger.info(f"Inferred reduce-only for {symbol} {side}: {why}")
@@ -2188,6 +2222,46 @@ class CopyEngine:
                         )
                     qty = laddered
                     if laddered < 1:
+                        # SAFETY NET for a misrouted CLOSE. This is the "place
+                        # opening orders" path — it can only open, so when it works
+                        # out that nothing needs opening it returns. But a master
+                        # CLOSE that gets routed here (its position already read 0
+                        # by the time we evaluated, so the order looked like a fresh
+                        # entry) lands in exactly this branch: master flat, target 0,
+                        # follower still holding. It logged the mismatch out loud and
+                        # walked away, because closing is not this path's job —
+                        # 2026-09-01 01:27:41 on P-BTC-78200-010926: "follower holds
+                        # 12 -> target 0, opening 0", then 12 lots sat in an
+                        # abandoned position for 6m30s.
+                        #
+                        # The routing fix in _mirror_place should stop most of these
+                        # arriving. This catches the rest. It must NOT close blindly:
+                        # if the master's SL/TP fired, the follower's own jittered
+                        # stop closes that leg and force-closing churns it (Prathav,
+                        # 2026-09-01). So ask, and act only on positive evidence of a
+                        # manual close; sl_tp and unknown are both left alone.
+                        if (filled_entry and held_now > 0 and int(target_total) == 0
+                                and float(m_pos) == 0 and master_row):
+                            _ek = await self._classify_master_exit(master_row, symbol)
+                            if _ek == "manual":
+                                logger.info(
+                                    f"Misrouted master close on {symbol} for "
+                                    f"{follower['name']}: reached the open path with "
+                                    f"master flat and follower holding {held_now} of "
+                                    f"target 0 — exit reads 'manual', closing now "
+                                    f"instead of waiting for the reconciler."
+                                )
+                                await self._close_follower_position(
+                                    client, symbol, follower.get("name", ""),
+                                )
+                                continue
+                            logger.info(
+                                f"Misrouted master close on {symbol} for "
+                                f"{follower['name']}: master flat, follower holds "
+                                f"{held_now} of target 0, but exit reads '{_ek}' — "
+                                f"not force-closing; its own stop or the reconciler "
+                                f"handles it."
+                            )
                         # A legitimate zero — the follower is already where the
                         # master's book would put it. Distinguish it from the
                         # "sizing unavailable" zero below, which is a failure.
@@ -2942,16 +3016,18 @@ class CopyEngine:
 
             # ---- Point 3 exceptions: leave the GTC limit RESTING (no market, no
             # cancel) and let it wait, when: ----
-            # (a) cheap tail ENTRIES (limit < 2): a market order gives an awful fill
-            #     on a sub-$2 premium, and not getting in is a free option — so wait.
-            #     EXITS are deliberately exempt: staying in a position the master has
-            #     already left is open-ended risk, while the slippage is bounded, so
-            #     relative position wins over fill price. This exemption is the whole
-            #     reason 67200 (a 1.2 option) sat unexited for 2.5h — the guard fired
-            #     and the follower was left holding. (desk call, 2026-07-30)
-            if not reduce_only and limit_price is not None and float(limit_price) < 2:
-                logger.info(f"Escalation: {follower['name']} {symbol} ENTRY limit {limit_price} < 2 — leaving it resting (no market).")
-                return
+            # (a) REMOVED 2026-09-01 (desk call, Prathav): cheap tail ENTRIES
+            #     (limit < 2) used to be left resting rather than marketed, on the
+            #     grounds that a market order gives an awful fill on a sub-$2
+            #     premium and not getting in is a free option. Exits were always
+            #     exempt from it. Observed cost 2026-09-01 on P-BTC-75600-010926:
+            #     the master took 10 lots at 1.6 as maker, our 12-lot mirror sat
+            #     behind it in the queue, this guard declined to market at 5s, and
+            #     the follower sat the trade out entirely. Cheap entries are now
+            #     escalated like any other. If the slippage proves too expensive,
+            #     bring it back as a PERCENTAGE (don't chase if the market is >X%
+            #     worse than our limit) rather than a flat premium cutoff, which
+            #     treated a 1.9 option and a 0.1 option identically.
 
             # Is forcing still warranted?
             if reduce_only:
@@ -3155,8 +3231,21 @@ class CopyEngine:
             # to size this position, and the same the reconciler's trim uses. Using
             # the floor-based _follower_close_qty here would close one lot more than
             # the reconciler considers correct, and the two would disagree forever.
+            #
+            # min_one=False because this asks what the follower should still HOLD,
+            # not what to place. min_one exists so a fractional share on an ORDER
+            # (0.4 lots) punches 1 instead of being dropped to nothing — applied to
+            # a target it means "never reach 0", so a fully-exited master can never
+            # take the follower flat. Observed 2026-09-01 on P-BTC-77000-010926:
+            # master closed its whole -2470, target came back 1 instead of 0, this
+            # path closed 27 of the follower's 28 and the last lot sat until the
+            # reconciler's stale-orphan sweep took it 6m31s later. Matches the five
+            # sibling target calls (incl. the filled_exit path that closed P-BTC-
+            # 77200 correctly in the same second) and the guard below, whose
+            # `master_now and` already expects a legitimate 0 here.
             target = self.risk_engine.calculate_follower_quantity(
-                abs(float(master_now)), ref_price or 0.0, follower, round_up=True
+                abs(float(master_now)), ref_price or 0.0, follower,
+                round_up=True, min_one=False,
             )
             if master_now and int(target) < 1:
                 logger.warning(
@@ -3271,13 +3360,60 @@ class CopyEngine:
                 return
             master_sz = await self._master_position_size(master_row, symbol, fresh=True)
             if master_sz is not None and master_sz == 0:
-                # Master EXITED this symbol (its SL/TP hit / it closed). By strategy
-                # decision we do NOT force-close followers and we do NOT strip their
-                # protection: each follower has its own mirrored (jittered) SL/TP
-                # that closes its position at ~the same level. Forcing a market
-                # close caused wasteful sell-then-buyback round-trips with bad fills
-                # in fast moves. Leave the follower's brackets to do the work.
-                logger.info(f"Master exited {symbol} — leaving followers to their own jittered SL/TP (no forced close).")
+                # Master EXITED this symbol. By strategy decision we do NOT
+                # force-close followers when the master's own SL/TP HIT: each
+                # follower has its own mirrored (jittered) SL/TP that closes at
+                # ~the same level, and forcing a market close caused wasteful
+                # sell-then-buyback round-trips with bad fills in fast moves.
+                #
+                # But "the master is flat and a protective order vanished" does NOT
+                # by itself mean the SL/TP fired. The exchange cancels the leftover
+                # bracket (reason=stop_cancel) whenever a position closes, however
+                # it closed — including a manual limit/market close. Treating that
+                # cleanup as a trigger left the follower waiting on a stop that was
+                # never going to fire: 2026-09-01 01:27:40 on P-BTC-78200-010926 the
+                # master closed 1000 lots with a plain limit at 205, the exchange
+                # tidied away his stop, this branch read it as "his SL/TP hit", and
+                # 12 follower lots sat in an abandoned position for 6m30s.
+                #
+                # So ASK, don't assume. The block above already holds itself to this
+                # standard (it demands reason == "stop_trigger" as positive evidence
+                # before marking hands-off); this one now does too.
+                #   manual  -> the follower's stop is far from price and will never
+                #              fire. It is an orphan. Close it now.
+                #   sl_tp   -> strategy: leave it, its own jittered stop does the job.
+                #   unknown -> never force-close on a guess. Leave it; the reconciler
+                #              retries and falls back to STALE_ORPHAN_SEC.
+                exit_kind = await self._classify_master_exit(master_row, symbol)
+                if exit_kind != "manual":
+                    logger.info(
+                        f"Master exited {symbol} (exit reads '{exit_kind}') — leaving "
+                        f"followers to their own jittered SL/TP (no forced close)."
+                    )
+                    return
+                logger.info(
+                    f"Master exited {symbol} MANUALLY — followers' jittered stops sit "
+                    f"away from price and will not fire; closing their legs now."
+                )
+                try:
+                    fq = (self.db.table("accounts").select("*")
+                          .eq("is_master", False).eq("status", "active"))
+                    if (event or {}).get("owner_id"):
+                        fq = fq.eq("owner_id", event["owner_id"])
+                    _followers = fq.execute().data or []
+                except Exception as e:
+                    logger.warning(
+                        f"manual-exit close: could not load followers for {symbol}: {e} "
+                        f"— leaving it to the reconciler"
+                    )
+                    return
+                for _f in _followers:
+                    _c = await self._get_follower_client(_f)
+                    if _c is None:
+                        continue
+                    # No-op if that follower is already flat (its own bracket may
+                    # have closed it), so this cannot double-close.
+                    await self._close_follower_position(_c, symbol, _f.get("name", ""))
                 return
             # else: master still holds it (or size unknown) -> genuine cancel, propagate.
 
