@@ -16,7 +16,11 @@ RECONCILE_INTERVAL_SEC = 30
 # How often to reconcile follower POSITIONS against the master's — recovers a
 # leg the live copy missed (e.g. a WS-dropped entry) and closes any follower leg
 # the master no longer holds. Faster than the order reconcile (per desk: 10s).
-POSITION_RECONCILE_SEC = 15
+# 15s was paced for the 13-21s order latency of 2026-07-30. Measured 2026-09-02:
+# p90 0.05s, p99 0.41s over 6224 mirrors. At 5s a two-pass confirmation completes
+# in ~10s instead of ~30s, so a genuine shortfall is corrected far sooner while
+# still requiring two independent observations.
+POSITION_RECONCILE_SEC = 5
 
 
 class TradeListener:

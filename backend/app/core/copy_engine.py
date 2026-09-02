@@ -59,7 +59,10 @@ FRESH_ENTRY_SEC = float(os.getenv("FRESH_ENTRY_SEC", "180"))  # 3 minutes
 # still working (order in flight, escalation pending). Only trim over-exposure
 # that has survived this long since the master's last fill on the symbol, so we
 # never race a close that's about to land.
-TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "45"))
+# 45s when a mirrored close could take 13-21s to reach the exchange. Measured
+# 2026-09-02 over 6224 mirrors: p50 0.02s, p90 0.05s, p99 0.41s, max 1.89s, and
+# fills land 1-2s behind the master. 10s is still ~5x the worst observed.
+TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "10"))
 
 # When the master is FLAT, the follower still holds, and we CAN'T tell how the
 # master exited (`_classify_master_exit` -> "unknown", e.g. the master's close
@@ -71,17 +74,6 @@ TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "45"))
 # close. Generous vs FRESH_ENTRY_SEC because a real SL/TP mirror fires in seconds.
 STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "60"))  # 1 minute (desk call 2026-09-01)
 
-# Recovering a leg the master entered a long time ago used to be refused outright:
-# the reconciler logged "SKIP stale entry ... leaving follower flat" every 15s,
-# forever. Safe against price drift, but it meant ANY entry a follower missed was
-# never recovered — the follower silently diverged further from the master all day
-# (2026-07-30 audit: 5 missing legs, one 3.8h old and still being skipped).
-#
-# Instead of refusing on AGE, judge on PRICE: recover the leg if the current mark
-# is still within this much of the master's own entry price. A leg the master got
-# at a similar price is worth having; one that has run away is not, and that case
-# alerts instead of silently doing nothing. Percent, e.g. 15 = ±15%.
-SYNC_PRICE_TOLERANCE_PCT = float(os.getenv("SYNC_PRICE_TOLERANCE_PCT", "15"))
 
 # Deadband before the reconciler will resize a follower that is on the correct
 # side. The target is derived from a LIVE balance ratio (auto_ratio divides the
@@ -102,7 +94,7 @@ RECON_SIZE_TOLERANCE_PCT = float(os.getenv("RECON_SIZE_TOLERANCE_PCT", "5"))
 # have filled or been cancelled, and mirroring a resting order for one that is no
 # longer resting duplicates the leg. Deliberately above normal processing latency
 # (sub-second, p95 ~8s) so the hot path never pays the extra call.
-STALE_EVENT_RECHECK_SEC = float(os.getenv("STALE_EVENT_RECHECK_SEC", "10"))
+STALE_EVENT_RECHECK_SEC = float(os.getenv("STALE_EVENT_RECHECK_SEC", "3"))
 
 
 def _size_deadband(target: float) -> float:
@@ -168,7 +160,10 @@ class CopyEngine:
         # (avoids spamming a margin-rejected open every cycle, and gives a fill
         # time to reflect before we'd consider re-opening).
         self._recon_open_ts: dict = {}
-        self._RECON_OPEN_DEBOUNCE = 30.0  # seconds
+        # Was 30s so a margin-rejected open was not spammed and a fill had time to
+        # reflect in get_positions. A fill now reflects in 1-2s (see
+        # TRIM_SETTLE_SEC), so 30s only delayed a real recovery.
+        self._RECON_OPEN_DEBOUNCE = 10.0  # seconds
         # A mismatch must persist across TWO consecutive 10s reconcile passes
         # before we act — so a transient race (a just-filled mirror whose position
         # hasn't shown in get_positions yet) can never trigger a duplicate.
@@ -792,24 +787,6 @@ class CopyEngine:
             logger.info(f"classify_master_exit: {symbol} -> {result}")
         return result
 
-    @staticmethod
-    def _price_drift_ok(mark, entry) -> tuple:
-        """Is the current price still close enough to the master's entry to make
-        recovering/topping-up a stale leg worthwhile?
-
-        Returns (ok, drift_pct). Unknown prices return ok=True: the alternative is
-        the old behaviour of never recovering anything, and a missing leg is a
-        certain divergence while price drift is only a possible cost."""
-        try:
-            e = float(entry or 0)
-            m = float(mark or 0)
-        except (TypeError, ValueError):
-            return True, 0.0
-        if e <= 0 or m <= 0:
-            return True, 0.0
-        drift = abs(m - e) / e * 100.0
-        return drift <= SYNC_PRICE_TOLERANCE_PCT, drift
-
     async def _missed_exit_ids(self, follower: dict, symbol: str) -> str:
         """Master EXIT order ids on `symbol` that never reached this follower, per
         the order-ID ledger — comma-joined for logging.
@@ -1249,7 +1226,7 @@ class CopyEngine:
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
         current_trim: set = set()   # (follower_id, sym, excess) over-exposed THIS pass
-        current_topup: set = set()  # (follower_id, sym, short_by) under-exposed THIS pass
+        current_topup: dict = {}    # {(follower_id, sym): short_by} under-exposed THIS pass
         # Lazily fetched once per pass (shared across followers): {sym: last master
         # fill epoch}. Gates recovery-opens so we never re-enter a stale leg.
         master_fresh_ts = None
@@ -1395,28 +1372,69 @@ class CopyEngine:
                                     f"not adding. Live copy still mirrors any real re-entry."
                                 )
                                 continue
-                            ok, drift = self._price_drift_ok(mark, mentry)
-                            if not ok:
+                            # RECENCY, not price. We copy recent entries and sit out
+                            # stale ones; a late entry at a moved price is worse than
+                            # not having the trade (the same rule FRESH_ENTRY_SEC
+                            # already states for the live copy path). This replaced a
+                            # price-drift test that decided it on abs(mark - entry),
+                            # which refused a move in our FAVOUR exactly as hard as
+                            # one against us: 2026-09-01 20:24 on P-BTC-75200-020926
+                            # the master was SHORT at 18.0162, the mark ran to 22.8,
+                            # and five passes refused at 23.6-27.8% — the follower
+                            # would have opened that short ~25% BETTER than the master
+                            # got, and instead sat 19 lots short of target 23 for
+                            # 2m21s. (desk call, Prathav 2026-09-02: drop drift, copy
+                            # recent trades only, no stale entries.)
+                            #
+                            # Still alerts when it declines, so an abandoned leg is
+                            # visible rather than silent — the failure mode of the
+                            # age-only gate this restores (2026-07-30: 5 missing legs,
+                            # the oldest 3.8h, skipped every 15s forever).
+                            fresh = (last_fill is not None
+                                     and (now - last_fill) <= FRESH_ENTRY_SEC)
+                            if not fresh:
+                                age_txt = (f"{now - last_fill:.0f}s ago" if last_fill
+                                           else "no recent fill")
                                 logger.info(
                                     f"reconcile: {fol.get('name')} under-exposed on {sym} "
-                                    f"({held} vs target {int(target)}) but price drifted "
-                                    f"{drift:.1f}% from master entry {mentry} — NOT topping up"
+                                    f"({held} vs target {int(target)}) but the master last "
+                                    f"filled it {age_txt} — stale, NOT topping up"
                                 )
                                 asyncio.create_task(tg.notify_fail(
                                     fol.get("name"), sym, "topup", short_by,
-                                    f"price drifted {drift:.0f}% from master entry",
-                                    key=f"drift:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                                    f"master's entry is stale ({age_txt}) — left short",
+                                    key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
                                 ))
                                 self._recon_open_ts[(fid, sym)] = now
                                 continue
-                            ukey = (fid, sym, short_by)
-                            current_topup.add(ukey)
-                            if ukey not in self._recon_topup_prev:
+                            # TWO independent observations before adding exposure —
+                            # kept deliberately: a just-filled mirror whose position
+                            # has not shown in get_positions yet looks exactly like a
+                            # shortfall, and acting on one pass is how this engine
+                            # produced duplicate positions.
+                            #
+                            # But the key used to include short_by, so the shortfall
+                            # had to be byte-identical on both passes. The target
+                            # comes from a LIVE balance ratio that wobbles a lot or
+                            # two between passes (2026-08-03: the same unchanged
+                            # positions read "expected 22" then "expected 30"), so a
+                            # real miss could restart confirmation indefinitely — and
+                            # the faster the loop, the more often that happens. Keyed
+                            # on (follower, symbol) it latches reliably, and we act on
+                            # the SMALLER of the two observed shortfalls so a wobble
+                            # can only ever under-open, never overshoot.
+                            ukey = (fid, sym)
+                            current_topup[ukey] = short_by
+                            prev_short = self._recon_topup_prev.get(ukey)
+                            if prev_short is None:
                                 logger.info(
                                     f"reconcile: {fol.get('name')} under-exposed on {sym} — holds "
                                     f"{held}, target {int(target)} (short {short_by}) — confirming "
                                     f"next pass before topping up"
                                 )
+                                continue
+                            short_by = min(int(short_by), int(prev_short))
+                            if short_by < 1:
                                 continue
                             if now - self._recon_open_ts.get((fid, sym), 0) < self._RECON_OPEN_DEBOUNCE:
                                 continue
@@ -1429,13 +1447,14 @@ class CopyEngine:
                                 )
                                 logger.info(
                                     f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
-                                    f"({held} -> {int(target)}, master {msz:+.0f}, drift {drift:.1f}%)"
+                                    f"({held} -> {int(target)}, master {msz:+.0f}, master "
+                                    f"filled {now - last_fill:.0f}s ago)"
                                 )
                                 # Episode over: re-arm both keys so the NEXT
                                 # shortfall on this leg alerts instead of being
                                 # swallowed by the once-per-episode window.
                                 asyncio.create_task(tg.clear_alert(f"topup:{fid}:{sym}"))
-                                asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
+                                asyncio.create_task(tg.clear_alert(f"stale:{fid}:{sym}"))
                                 asyncio.create_task(tg.notify_correction(
                                     fol.get("name"), sym, "TOPPED UP", int(short_by),
                                     held=held, target=int(target), master=int(msz),
@@ -1597,29 +1616,34 @@ class CopyEngine:
                     last_fill = master_fresh_ts.get(sym)
                     is_fresh = last_fill is not None and (now - last_fill) <= FRESH_ENTRY_SEC
                     if not is_fresh:
-                        ok, drift = self._price_drift_ok(mark, mentry)
+                        # A stale entry is NOT recovered. The price test that used to
+                        # let one through — recover if the mark is still within
+                        # SYNC_PRICE_TOLERANCE_PCT of the master's entry — is gone:
+                        # it judged abs(mark - entry), so it refused favourable moves
+                        # as hard as adverse ones and never priced the crossing at
+                        # all. We copy recent entries and sit out the rest.
+                        # (desk call, Prathav 2026-09-02: no stale entries.)
+                        #
+                        # This restores an age-only gate, whose known failure mode is
+                        # a leg abandoned for good (2026-07-30: 5 missing legs, oldest
+                        # 3.8h). So it still ALERTS every episode — the follower's
+                        # book now differs from the master's and that must be visible,
+                        # not silent.
                         age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "no recent fill"
-                        if not ok:
-                            logger.info(
-                                f"reconcile: NOT recovering {fol.get('name')} {sym} — price drifted "
-                                f"{drift:.1f}% from master entry {mentry} (mark {mark}, master last "
-                                f"fill {age_txt}, tolerance {SYNC_PRICE_TOLERANCE_PCT:.0f}%)"
-                            )
-                            # ONE message per episode, not one per 15s pass. Cleared
-                            # below when the leg is finally recovered, so a fresh
-                            # occurrence later still alerts.
-                            asyncio.create_task(tg.notify_fail(
-                                fol.get("name"), sym, "recover", int(target),
-                                f"price drifted {drift:.0f}% from master entry — follower left flat",
-                                key=f"drift:{fid}:{sym}", window=tg.ONCE_WINDOW,
-                            ))
-                            self._recon_open_ts[key] = now
-                            continue
                         logger.info(
-                            f"reconcile: recovering stale leg {fol.get('name')} {sym} "
-                            f"(master last fill {age_txt}) — price within {drift:.1f}% of master "
-                            f"entry {mentry}, inside the {SYNC_PRICE_TOLERANCE_PCT:.0f}% tolerance"
+                            f"reconcile: NOT recovering {fol.get('name')} {sym} — master's entry "
+                            f"is stale (last fill {age_txt}, fresh window "
+                            f"{FRESH_ENTRY_SEC:.0f}s); leaving the follower flat on this leg"
                         )
+                        # ONE message per episode, not one per pass. Cleared when the
+                        # leg is finally recovered, so a later occurrence still alerts.
+                        asyncio.create_task(tg.notify_fail(
+                            fol.get("name"), sym, "recover", int(target),
+                            f"master's entry is stale ({age_txt}) — follower left flat",
+                            key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                        ))
+                        self._recon_open_ts[key] = now
+                        continue
                     self._recon_open_ts[key] = now
                     side = "buy" if msz > 0 else "sell"
                     try:

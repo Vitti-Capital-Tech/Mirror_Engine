@@ -344,11 +344,18 @@ async def main():
     ok &= check("settle is a no-op when the follower is flat", client.placed == [],
                 f"placed={client.placed}")
 
+    # RECENCY, not price (desk call, Prathav 2026-09-02: drop the drift test, copy
+    # recent trades only, no stale entries). Sections 8-9 below used to turn on
+    # whether the mark had wandered from the master's entry; they now turn on how
+    # long ago the master filled. FRESH = 30s, which clears TRIM_SETTLE_SEC (10s)
+    # and is inside FRESH_ENTRY_SEC (180s). The build() default of 600s is STALE.
+    FRESH = 30.0
+
     # ---- 8. UNDER-exposed top-up. The 2026-07-30 audit found 4 symbols where the
     #         follower sat below target with nothing to correct it: the trim only
     #         handles over-exposure and the open path only fires when FLAT.
     #         (C-BTC-64800: master 500 long, follower 3, target 5.)
-    eng, client, event = build(3, 500, mark=1.2, entry=1.2)
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
     await eng._reconcile_positions(event)
     ok &= check("top-up pass 1 does NOT act", client.placed == [], f"placed={client.placed}")
     await eng._reconcile_positions(event)
@@ -361,40 +368,82 @@ async def main():
                     str(o))
 
     # ---- 8b. Same, short side: master -3050, follower -29, target 31 -> sell 2.
-    eng, client, event = build(-29, -3050, mark=1.2, entry=1.2)
+    eng, client, event = build(-29, -3050, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
     await passes(eng, event)
     ok &= check("top-up on a short sells to increase the short",
                 len(client.placed) == 1 and client.placed[0]["side"] == "sell"
                 and client.placed[0]["size"] == 2, f"placed={client.placed}")
 
-    # ---- 8c. Price guard blocks a top-up when the market has run away from the
-    #          master's entry (default tolerance 15%; 1.2 -> 2.0 is +67%).
-    eng, client, event = build(3, 500, mark=2.0, entry=1.2)
-    await passes(eng, event)
-    ok &= check("top-up blocked when price drifted beyond tolerance",
+    # ---- 8b-ii. The two-pass confirmation must LATCH across a wobbling shortfall.
+    #          It is keyed on (follower, symbol) — it used to include the shortfall
+    #          itself, so the number had to be byte-identical on both passes. The
+    #          target comes from a live balance ratio that moves a lot or two between
+    #          passes (2026-08-03: the same unchanged positions read "expected 22"
+    #          then "expected 30"), so a real miss could restart confirmation
+    #          forever — and the shorter the reconcile interval, the more often that
+    #          happens. Seed a DIFFERENT previous observation and check it still acts,
+    #          on the SMALLER of the two so a wobble can only under-open.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
+    eng._recon_topup_prev = {("f1", SYM): 5}      # last pass saw a bigger shortfall
+    await eng._reconcile_positions(event)          # this pass sees 2
+    ok &= check("confirmation latches despite a changed shortfall",
+                len(client.placed) == 1, f"placed={client.placed}")
+    if client.placed:
+        ok &= check("acts on the SMALLER observation (2, not 5)",
+                    client.placed[0]["size"] == 2, str(client.placed[0]))
+
+    # A first sighting still must not act, whatever the size.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
+    eng._recon_topup_prev = {}
+    await eng._reconcile_positions(event)
+    ok &= check("a first sighting still waits for confirmation",
                 client.placed == [], f"placed={client.placed}")
 
-    # ---- 9. Stale MISSING leg. Master's last fill is 600s old (> FRESH_ENTRY_SEC),
-    #         which used to mean "SKIP stale entry" forever. With the price still
-    #         near the master's entry it must now be recovered.
-    eng, client, event = build(0, -1500, mark=1.2, entry=1.15)
+    # ---- 8c. A STALE shortfall is left alone however close the price is. This is
+    #          the cost of the policy and it is deliberate: a leg the follower missed
+    #          by more than FRESH_ENTRY_SEC is abandoned, so its book differs from the
+    #          master's until the master trades that symbol again. It alerts.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2)      # 600s old
     await passes(eng, event)
-    ok &= check("stale missing leg IS recovered when price is close",
+    ok &= check("stale shortfall is NOT topped up, even at the master's price",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 8d. And a drifted price no longer blocks a FRESH one. Live 2026-09-01
+    #          20:24 P-BTC-75200-020926: master short at 18.0162, mark ran to 22.8,
+    #          the old guard refused five passes at 23.6-27.8% — yet opening that
+    #          short at 22.8 was ~25% BETTER than the master's own entry. Follower
+    #          sat 19 lots short of target 23 for 2m21s.
+    eng, client, event = build(3, 500, mark=2.0, entry=1.2, last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("drift no longer blocks a fresh top-up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # ---- 9. A STALE missing leg is NOT recovered. Price is irrelevant now.
+    eng, client, event = build(0, -1500, mark=1.2, entry=1.15)   # 600s old
+    await passes(eng, event)
+    ok &= check("stale missing leg is NOT recovered (price close)",
+                client.placed == [], f"placed={client.placed}")
+
+    eng, client, event = build(0, -1500, mark=3.0, entry=1.15)   # 600s old
+    await passes(eng, event)
+    ok &= check("stale missing leg is NOT recovered (price far)",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 9b. A FRESH missing leg IS recovered, and the price does not gate it.
+    eng, client, event = build(0, -1500, mark=3.0, entry=1.15,
+                               last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("fresh missing leg IS recovered regardless of price",
                 len(client.placed) == 1 and client.placed[0]["side"] == "sell"
                 and client.placed[0]["reduce_only"] is False, f"placed={client.placed}")
 
-    # ---- 9b. ...but not when the price has run away.
-    eng, client, event = build(0, -1500, mark=3.0, entry=1.15)
+    # ---- 9c. An unknown entry price is no longer consulted at all.
+    eng, client, event = build(0, -1500, mark=1.2, entry=None,
+                               last_master_fill_age=FRESH)
     await passes(eng, event)
-    ok &= check("stale missing leg is NOT recovered when price drifted",
-                client.placed == [], f"placed={client.placed}")
-
-    # ---- 9c. Unknown entry price must not block recovery (a missing leg is a
-    #          certain divergence; unknown drift is only a possible cost).
-    eng, client, event = build(0, -1500, mark=1.2, entry=None)
-    await passes(eng, event)
-    ok &= check("unknown master entry still recovers the leg", len(client.placed) == 1,
-                f"placed={client.placed}")
+    ok &= check("unknown master entry is irrelevant to a fresh recovery",
+                len(client.placed) == 1, f"placed={client.placed}")
 
     # ---- 10. ROOT CAUSE of the missing TP/SL. A master SL/TP is reduce_only but is
     #          NOT a close-now order. It used to fall into the close-rebalance branch,
@@ -445,7 +494,8 @@ async def main():
                 client.placed == [], f"placed={client.placed}")
 
     # ...but a genuine miss still clears the deadband comfortably.
-    eng, client, event = build(-15, -3000, mark=1.2, entry=1.2)
+    eng, client, event = build(-15, -3000, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
     await passes(eng, event)
     ok &= check("a real 15-lot shortfall still tops up", len(client.placed) == 1,
                 f"placed={client.placed}")
@@ -589,7 +639,8 @@ async def main():
                 client.placed == [], f"placed={client.placed}")
 
     # Same shortfall, but the master is holding steady -> top-up is correct.
-    eng, client, event = build(5, 560, mark=1.2, entry=1.2)
+    eng, client, event = build(5, 560, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
     await ledger.bump_peak(eng.redis, "u1", SYM, 560)
     await passes(eng, event)
     ok &= check("master steady -> shortfall IS topped up",
@@ -753,7 +804,8 @@ async def main():
                 client.placed == [], f"placed={client.placed}")
 
     # A genuinely new/growing position (at its peak) may still be topped up.
-    eng, client, event = build(3, 480, mark=1.2, entry=1.2)
+    eng, client, event = build(3, 480, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
     await ledger.bump_peak(eng.redis, "u1", SYM, 480)   # at the high-water mark
     await passes(eng, event)
     ok &= check("at peak -> shortfall IS still topped up", len(client.placed) == 1,
