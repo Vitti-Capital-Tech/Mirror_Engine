@@ -95,19 +95,25 @@ class FakeRedis:
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, live_ids=()):
         self.placed = []
+        self.live = set(str(i) for i in live_ids)
 
     async def place_order(self, **kw):
         self.placed.append(kw)
         return {"id": "new-1"}
 
+    async def get_open_orders(self, state="open"):
+        return [{"id": i} for i in self.live] if state == "open" else []
 
-def engine(follower_held, master_pos, legs=None):
+
+def engine(follower_held, master_pos, legs=None, live_ids=()):
     eng = CopyEngine.__new__(CopyEngine)
     eng.redis = FakeRedis()
     eng.risk_engine = RiskEngine()
-    client = FakeClient()
+    eng._open_orders_cache = {}
+    eng._OPEN_ORDERS_TTL = 0.0
+    client = FakeClient(live_ids)
 
     async def _accounts():
         return [MASTER, FOLLOWER]
@@ -223,6 +229,21 @@ async def test_partial_completion_is_not_dispatched():
           dispatches({"state": "open", "unfilled_size": 0}), True)
 
 
+async def test_defers_while_the_mirror_is_still_resting():
+    print("\n10. ESCALATION OWNS A LIVE MIRROR - do not top up on top of it")
+    # If the mirror still rests, the 5s escalation is about to cancel it and market
+    # the remainder. Buying the whole position gap here as well would stack: the
+    # shortfall twice over.
+    eng, client = engine(follower_held=-4, master_pos=-2000,
+                         live_ids=("1510240261",))
+    await eng._confirm_order_copied(event(), MOID)
+    check("nothing placed while escalation owns it", client.placed, [])
+    # And deferring must NOT burn the once-per-order marker - the leg has to stay
+    # confirmable on a later pass, once the mirror is settled.
+    check("marker not consumed",
+          await eng.redis.get(f"confirmed:{MOID}:{FID}"), None)
+
+
 async def main():
     print("=" * 74)
     print("confirm-copy - reconfirm the OUTCOME, not just that each step ran")
@@ -237,6 +258,7 @@ async def main():
         test_an_unfilled_order_is_not_confirmed,
         test_deadband,
         test_partial_completion_is_not_dispatched,
+        test_defers_while_the_mirror_is_still_resting,
     ):
         await fn()
     print("\n" + "=" * 74)

@@ -1115,6 +1115,26 @@ class CopyEngine:
             # that was attempted and came up short.
             if (legs.get(fid) or {}).get("status") == "skipped":
                 continue
+            # ESCALATION OWNS A LIVE MIRROR. If the follower's mirrored order is
+            # still resting, the 5s escalation is about to cancel it and market the
+            # remainder. Topping up the position gap here as well would stack:
+            # confirm-copy buys the whole shortfall, then escalation markets the
+            # mirror's unfilled lots on top of it. Defer — and do it BEFORE the
+            # once-per-order marker below, so deferring does not burn the marker
+            # and leave the leg unconfirmable.
+            _fclient = await self._get_follower_client(follower)
+            if _fclient is None:
+                continue
+            _mapped = mapping.get(follower_id)
+            if isinstance(_mapped, bytes):
+                _mapped = _mapped.decode()
+            if _mapped and await self._order_is_live(_fclient, str(_mapped), fid):
+                logger.info(
+                    f"confirm-copy: {follower.get('name')}'s mirror {_mapped} on "
+                    f"{symbol} is still resting — leaving it to escalation, not "
+                    f"topping up on top of it"
+                )
+                continue
             # Once per (order, follower), whatever happens next.
             try:
                 if not await self.redis.set(
@@ -1127,9 +1147,7 @@ class CopyEngine:
                     master_filled, ref_price, follower, round_up=True)
                 if int(target) < 1:
                     continue
-                client = await self._get_follower_client(follower)
-                if client is None:
-                    continue
+                client = _fclient
                 held = int(abs(float(await self._position_size_signed(client, symbol))))
                 msz = await self._master_position_size(master_row, symbol, fresh=True)
                 if msz is None:
