@@ -376,6 +376,12 @@ class TradeListener:
             "product_id": order.get("product_id"),
             "side": (order.get("side") or "").lower(),
             "size": float(order.get("size") or 0),
+            # Needed to tell a PARTIAL fill from a completed order: Delta sends
+            # reason=fill on both, as state=open (more to come) then state=closed.
+            # Without these the copy engine cannot know when an order is final, so
+            # it cannot confirm what the follower ended up with for it.
+            "state": (order.get("state") or "").lower(),
+            "unfilled_size": order.get("unfilled_size"),
             "order_type": order.get("order_type") or "limit_order",
             "limit_price": order.get("limit_price"),
             "stop_price": order.get("stop_price"),

@@ -74,6 +74,11 @@ TRIM_SETTLE_SEC = float(os.getenv("TRIM_SETTLE_SEC", "10"))
 # close. Generous vs FRESH_ENTRY_SEC because a real SL/TP mirror fires in seconds.
 STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "60"))  # 1 minute (desk call 2026-09-01)
 
+# How long to let our own fills reflect in the follower's position before
+# confirming what a completed master order actually copied. Our fills land 1-2s
+# behind (measured 2026-09-02), so 3s is enough without delaying a real fix.
+ORDER_CONFIRM_SETTLE_SEC = float(os.getenv("ORDER_CONFIRM_SETTLE_SEC", "3"))
+
 
 # Deadband before the reconciler will resize a follower that is on the correct
 # side. The target is derived from a LIVE balance ratio (auto_ratio divides the
@@ -1030,10 +1035,150 @@ class CopyEngine:
             await self._mark_hands_off(event, master_order_id, "master SL/TP triggered")
         elif action == "master_filled":
             await self._escalate_after_master_fill(event, master_order_id)
+            # Delta sends reason=fill on every partial too (three in 3ms on
+            # P-BTC-75200-020926), as state=open while more is coming and
+            # state=closed when the order is done. Only the final one is worth
+            # confirming — before that the master's own number is still moving.
+            _unf = event.get("unfilled_size")
+            if event.get("state") == "closed" or (_unf is not None and float(_unf) <= 0):
+                asyncio.create_task(
+                    self._confirm_order_copied(event, master_order_id))
         elif action == "sync_protection":
             await self._sync_protection(event)
         elif action == "reconcile_positions":
             await self._reconcile_positions(event)
+
+    async def _confirm_order_copied(self, event: dict, master_order_id: str) -> None:
+        """The master's order is FINAL. Confirm each follower actually ended up with
+        its share of what the master FILLED, and close any gap.
+
+        Every step of a copy reports on its own action, not on the outcome. On
+        2026-09-01 20:24, P-BTC-75200-020926, all of them said success: the mirror
+        went out in 0.00s, escalation fired at 5s, the market order filled, the
+        ledger recorded the leg. The follower still had 4 lots against a target of
+        23, because the size had been computed while the master's 2000-lot order was
+        only 324 filled, and nothing asked the question again when the rest landed.
+        (Prathav, 2026-09-02: even when it fills, reconfirm we did it the same way.)
+
+        Keyed on the MASTER ORDER ID, so the expected number comes from the master's
+        own filled quantity rather than being inferred from a position snapshot, and
+        what the follower did is read from the order we actually placed for it.
+
+        Two things keep this from over-opening:
+
+        BOUNDED BY THE POSITION. A laddered entry deliberately gives a rung LESS
+        than that rung's own ceil share (30 rungs of 100 lots ceil to 60 follower
+        lots against a proportional target of 34), so per-order accounting alone
+        would top up every rung. The correction is capped at what the follower's
+        POSITION is short of the master's position, which a ladder never exceeds.
+
+        SETTLE FIRST. Our own escalation fill needs a moment to show in the
+        follower's position, or we would count it as missing and buy it twice.
+        """
+        symbol = event.get("symbol")
+        if not symbol or event.get("reduce_only"):
+            return  # exits are sized on the position target, not an order share
+        try:
+            mapping = await self.redis.hgetall(f"ordermap:{master_order_id}")
+        except Exception as e:
+            logger.warning(f"confirm-copy: order map unreadable for {master_order_id}: {e}")
+            return
+        if not mapping:
+            return
+
+        size = float(event.get("size") or 0)
+        unfilled = event.get("unfilled_size")
+        master_filled = size - float(unfilled or 0)
+        if master_filled < 1:
+            return
+
+        await asyncio.sleep(ORDER_CONFIRM_SETTLE_SEC)
+
+        accounts = await self._read_accounts()
+        by_id = {a.get("id"): a for a in (accounts or []) if a.get("id")}
+        _oid = event.get("owner_id")
+        master_row = next((a for a in (accounts or []) if a.get("is_master")
+                           and (not _oid or a.get("owner_id") == _oid)), None)
+        if master_row is None:
+            return
+        ref_price = event.get("limit_price") or 0.0
+        entry = await ledger.get_entry(self.redis, master_order_id) or {}
+        legs = entry.get("legs") or {}
+
+        for follower_id in list(mapping.keys()):
+            fid = follower_id.decode() if isinstance(follower_id, bytes) else str(follower_id)
+            follower = by_id.get(fid)
+            if not follower or follower.get("status") != "active":
+                continue
+            # A deliberate zero is not a miss. The engine records those as
+            # "skipped" with the reason, so they are distinguishable from a copy
+            # that was attempted and came up short.
+            if (legs.get(fid) or {}).get("status") == "skipped":
+                continue
+            # Once per (order, follower), whatever happens next.
+            try:
+                if not await self.redis.set(
+                    f"confirmed:{master_order_id}:{fid}", "1", nx=True, ex=7 * 24 * 3600):
+                    continue
+            except Exception:
+                pass
+            try:
+                target = self.risk_engine.calculate_follower_quantity(
+                    master_filled, ref_price, follower, round_up=True)
+                if int(target) < 1:
+                    continue
+                client = await self._get_follower_client(follower)
+                if client is None:
+                    continue
+                held = int(abs(float(await self._position_size_signed(client, symbol))))
+                msz = await self._master_position_size(master_row, symbol, fresh=True)
+                if msz is None:
+                    continue
+                pos_target = self.risk_engine.calculate_follower_quantity(
+                    abs(float(msz)), ref_price, follower, round_up=True, min_one=False)
+                # The gap this order left, never more than the gap the POSITION has.
+                short = min(int(target) - self._legs_filled(legs, fid),
+                            int(pos_target) - held)
+                if short < 1 or short < _size_deadband(target):
+                    continue
+                side = (event.get("side") or "").lower()
+                await client.place_order(
+                    symbol=symbol, side=side, size=int(short),
+                    order_type="market_order", reduce_only=False,
+                )
+                logger.info(
+                    f"confirm-copy: {follower.get('name')} was short {short} on {symbol} "
+                    f"for master order {master_order_id} (master filled {master_filled:.0f} "
+                    f"-> target {int(target)}, follower held {held} of position target "
+                    f"{int(pos_target)}) — corrected at market"
+                )
+                await ledger.record_follower_leg(
+                    self.redis, master_order_id, fid, status="filled", qty=int(short),
+                    reason="confirm-copy correction",
+                )
+                asyncio.create_task(tg.notify_correction(
+                    follower.get("name"), symbol, "CONFIRM-COPY", int(short),
+                    held=held, target=int(target), master=msz,
+                    why=(f"master order {master_order_id} filled "
+                         f"{master_filled:.0f}; follower was short {short}"),
+                ))
+            except Exception as e:
+                body = getattr(getattr(e, "response", None), "text", "")
+                logger.error(
+                    f"confirm-copy failed for {follower.get('name')} {symbol} "
+                    f"(master order {master_order_id}): {e} {body}"
+                )
+
+    @staticmethod
+    def _legs_filled(legs: dict, follower_id: str) -> int:
+        """Lots this follower is RECORDED as having filled for one master order."""
+        leg = legs.get(follower_id) or {}
+        if leg.get("status") != "filled":
+            return 0
+        try:
+            return int(float(leg.get("qty") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     async def _mark_hands_off(self, event: dict, master_order_id: str, reason: str) -> None:
         """Flag every active follower's leg on this symbol as DO-NOTHING.
@@ -3161,6 +3306,29 @@ class CopyEngine:
                 )
                 oid = resp.get("id") or resp.get("result", {}).get("id")
                 logger.info(f"Escalated unfilled limit -> MARKET for {follower['name']} {symbol} qty {market_qty} (order {oid})")
+                # Re-point the map and the ledger at the order that will ACTUALLY
+                # fill. Without this both still name the limit we just cancelled, so
+                # anything later asking "what did the follower do for this master
+                # order?" reads a cancelled-unfilled order and concludes nothing —
+                # 2026-09-01 20:24 on P-BTC-75200-020926 the master's completion
+                # event hit exactly that and logged "mirror ... is gone without
+                # filling - nothing to edit, leaving it to the reconciler".
+                if oid and master_order_id:
+                    try:
+                        await self.redis.hset(
+                            f"ordermap:{master_order_id}", follower["id"], str(oid))
+                        await self.redis.expire(
+                            f"ordermap:{master_order_id}", 7 * 24 * 3600)
+                        await ledger.record_follower_leg(
+                            self.redis, master_order_id, follower["id"],
+                            status="placed", follower_order_id=oid,
+                            reason=f"escalated to market ({int(market_qty)} lots)",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Escalation: could not re-point map/ledger for "
+                            f"{follower.get('name')} {symbol} -> {oid}: {e}"
+                        )
                 # Escalating a resting limit to market is the engine doing its
                 # job, not a fault; not notified, same reason as a plain fill.
             except Exception as e:
