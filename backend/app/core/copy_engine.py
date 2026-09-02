@@ -2098,6 +2098,24 @@ class CopyEngine:
             # "master's entry already filled" in the same breath, because IT asks
             # _master_order_settled and got the opposite answer.
             #
+            # A zero here is ambiguous and the cache makes it worse: it means
+            # EITHER the master really is flat (so this order closed the position)
+            # OR the order just OPENED one and the read has not caught up. Guessing
+            # "closed" sends an opening order down the reduce-only path, which finds
+            # nothing to reduce and places NOTHING — 2026-09-02 05:09 IST on
+            # C-BTC-79400-020926: the master's sell opened a 3000 short, the engine
+            # logged "now FLAT - this order closed the position" then "not reducible
+            # by a sell, skipping", and the reconciler recovered 34 lots 29s later.
+            # Pointing this test at _master_order_settled (evidence, not the Redis
+            # marker) made it fire more often and so made that worse: 0 recovered
+            # legs in the 10h before, 7 in the 31h after.
+            #
+            # So resolve the zero before acting on it. One fresh read, only in the
+            # ambiguous branch; if the master is STILL flat he genuinely is, and if
+            # he is not, the side test above answers correctly with real data.
+            if msigned == 0:
+                msigned = await self._master_position_signed(
+                    master_row, symbol, fresh=True)
             # in_fresh_book=False: we have no fresh resting-book read here, so the
             # ambiguous case falls through to a single get_order on this one id.
             # Gated on msigned == 0 (never None) so the normal path — master still

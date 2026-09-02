@@ -341,6 +341,31 @@ async def test_exit_settle_will_not_dump_a_follower_while_the_master_holds():
     check("trims the excess only", [int(o["size"]) for o in orders], [12])
 
 
+async def test_an_opening_order_must_not_read_as_a_close():
+    print("\n19. an OPENING order whose position has not landed yet")
+    # 2026-09-02 05:09 IST, C-BTC-79400-020926. The master's sell OPENED a 3000
+    # short. The cached position read 0, the order had filled, so the flat-and-
+    # filled test concluded "this order closed the position", the reduce-only path
+    # found nothing to reduce and placed NOTHING, and the reconciler recovered 34
+    # lots 29s later. Pointing this test at _master_order_settled made it fire more
+    # often and so made it worse: 0 recovered legs in the 10h before, 7 in the 31h
+    # after. The routing now resolves the zero with a FRESH read first.
+    #
+    # Sell against a SHORT is adding, not closing - whatever the fill marker says.
+    check("sell into a short is not a close",
+          CopyEngine._infer_reduce_only("sell", -3000, master_order_filled=True), None)
+    check("buy into a long is not a close",
+          CopyEngine._infer_reduce_only("buy", 3000, master_order_filled=True), None)
+    # A genuinely flat master after a fill still routes as a close.
+    check("still flat after a fresh read -> a close",
+          bool(CopyEngine._infer_reduce_only("sell", 0, master_order_filled=True)), True)
+    # And the routing must ASK fresh before trusting a zero.
+    import inspect
+    src = inspect.getsource(CopyEngine._mirror_place)
+    check("routing re-reads the position fresh on a zero",
+          "fresh=True" in src.split("if msigned == 0:")[1][:220], True)
+
+
 async def main():
     print("=" * 74)
     print("manual master exit - identify it, do not wait it out (2026-09-01)")
@@ -364,6 +389,7 @@ async def main():
         test_the_orphan_timer_is_now_a_last_resort,
         test_exit_settle_closes_the_whole_holding_when_master_is_flat,
         test_exit_settle_will_not_dump_a_follower_while_the_master_holds,
+        test_an_opening_order_must_not_read_as_a_close,
     ):
         await fn()
     print("\n" + "=" * 74)
