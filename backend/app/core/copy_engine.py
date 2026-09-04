@@ -212,6 +212,7 @@ class CopyEngine:
         # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
+        self._last_master_balance = 0.0   # see _master_balance_or_last
         self._master_exit_cache: dict = {}  # {symbol: (reason, ts)}
         self._MASTER_EXIT_TTL = 20.0  # seconds
 
@@ -320,6 +321,7 @@ class CopyEngine:
             self.db.table("trades").update({"status": "failed"}).eq("id", trade_uuid).execute()
             return
         master_row, followers, master_balance = self._split_accounts(accounts)
+        master_balance = self._master_balance_or_last(master_balance, master_row)
 
         if not followers:
             logger.info("No active follower accounts found.")
@@ -1306,6 +1308,10 @@ class CopyEngine:
                 master_row.get("allocated_balance") or master_row.get("balance")
                 or master_row.get("available_margin") or 0.0
             )
+        # Same fallback as the other three paths: a transient 0 here made the
+        # escalation size cap vanish once already (see the note above), so use the
+        # last known good balance rather than sizing on nothing.
+        master_balance = self._master_balance_or_last(master_balance, master_row)
 
         for follower_id, follower_order_id in mapping.items():
             try:
@@ -1388,6 +1394,7 @@ class CopyEngine:
             # leaves nothing safe to reconcile against.
             return
         master_row, followers, master_balance = self._split_accounts(accounts)
+        master_balance = self._master_balance_or_last(master_balance, master_row)
 
         now = time.time()
 
@@ -2090,6 +2097,7 @@ class CopyEngine:
             # anyone, so there is nothing safe to do. The 15s reconciler covers it.
             return
         master_row, followers, master_balance = self._split_accounts(accounts)
+        master_balance = self._master_balance_or_last(master_balance, master_row)
         if not followers:
             return
 
@@ -3166,6 +3174,57 @@ class CopyEngine:
             balance = float(master.get("allocated_balance") or master.get("balance")
                             or master.get("available_margin") or 0.0)
         return master, followers, balance
+
+    def _master_balance_or_last(self, balance, master_row) -> float:
+        """The master balance to size with: the fresh one, or the last good one.
+
+        auto_ratio divides by this, and risk_engine REFUSES to size when it is 0
+        rather than fall back to 1:1 — right, because that fallback once produced a
+        610-lot target on a 70 USD account (2026-08-02). But refusing drops the
+        event ENTIRELY and tells nobody: on 2026-09-04 it fired 9 times in a day
+        while the master's Supabase row read a healthy 7000+ the whole time, so
+        nine events were sized on nothing and nothing alerted.
+        (Prathav, 2026-09-04: we should have a failure mechanism.)
+
+        Substituting the last good value is safe in a way a 1:1 fallback is not —
+        it is a REAL master balance, just not this instant's. And the ratio is
+        deliberately built on TOTAL balance precisely because that barely moves
+        (2026-08-03: available_margin swung 30% on unchanged positions), so a
+        seconds-old figure is a faithful stand-in.
+        """
+        try:
+            b = float(balance or 0.0)
+        except (TypeError, ValueError):
+            b = 0.0
+        if b > 0:
+            self._last_master_balance = b
+            return b
+        # Best-effort alert: this method is SYNCHRONOUS and is called from async
+        # callers, so a loop is normally running — but a missing loop must never be
+        # the thing that breaks sizing. The log line is the guaranteed record.
+        def _alert(reason, key):
+            try:
+                asyncio.create_task(tg.notify_fail(
+                    (master_row or {}).get("name") or "master", "-", "sizing", 0,
+                    reason, key=key, window=tg.ONCE_WINDOW,
+                ))
+            except RuntimeError:
+                pass
+
+        last = float(getattr(self, "_last_master_balance", 0.0) or 0.0)
+        if last > 0:
+            logger.warning(
+                "master balance read as 0 — sizing on the last known good value "
+                "%.2f instead of dropping the event", last)
+            _alert(f"master balance read 0; used last known {last:.2f}", "mbal:stale")
+            return last
+        logger.error(
+            "master balance read as 0 and there is no cached value — sizing will "
+            "be refused for this event"
+        )
+        _alert("master balance read 0 and no cached value — events cannot be sized",
+               "mbal:none")
+        return 0.0
 
     async def _claim_escalation(self, order_id) -> bool:
         """Claim the right to escalate ONE follower order. True if we won it.
