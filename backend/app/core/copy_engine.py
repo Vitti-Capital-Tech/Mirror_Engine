@@ -1034,21 +1034,43 @@ class CopyEngine:
         elif action == "master_stop_filled":
             await self._mark_hands_off(event, master_order_id, "master SL/TP triggered")
         elif action == "master_filled":
-            await self._escalate_after_master_fill(event, master_order_id)
-            # Delta sends reason=fill on every partial too (three in 3ms on
+            # Delta sends reason=fill on every PARTIAL too (three in 3ms on
             # P-BTC-75200-020926), as state=open while more is coming and
-            # state=closed when the order is done. Only the final one is worth
-            # confirming — before that the master's own number is still moving.
+            # state=closed when the order is done.
             _unf = event.get("unfilled_size")
-            if event.get("state") == "closed" or (_unf is not None and float(_unf) <= 0):
+            _complete = (event.get("state") == "closed"
+                         or (_unf is not None and float(_unf) <= 0))
+            if _complete:
+                # The 5s "limit then market" clock starts on the master being
+                # FILLED — but only when his order is actually DONE. Starting it on
+                # a partial marketed our whole mirror against a fraction of his
+                # position, so we overshot and the reconciler trimmed us back:
+                # 2026-09-04 C-BTC-88000-040926 TRIMMED by 17 (19 -> 2, master
+                # -150) and again by 6 (19 -> 13, master -1123), and C-BTC-85000
+                # TRIMMED by 31 (56 -> 25). 89 lots of corrective trading in a day.
+                #
+                # His resting order is an open order, so ours queues alongside it
+                # and waits — that is the point of mirroring it at his price. A
+                # 5-10 lot partial must not drag the follower's full share to
+                # market. (Prathav, 2026-09-04: wait for the full fill; if he
+                # cancels after a partial, settle to what filled.)
+                await self._escalate_after_master_fill(event, master_order_id)
                 asyncio.create_task(
                     self._confirm_order_copied(event, master_order_id))
+            else:
+                logger.info(
+                    f"master_filled: {event.get('symbol')} order {master_order_id} "
+                    f"is a PARTIAL "
+                    f"({_unf} of {event.get('size')} still unfilled) — leaving our "
+                    f"mirror queued at the master's price, not starting the 5s clock"
+                )
         elif action == "sync_protection":
             await self._sync_protection(event)
         elif action == "reconcile_positions":
             await self._reconcile_positions(event)
 
-    async def _confirm_order_copied(self, event: dict, master_order_id: str) -> None:
+    async def _confirm_order_copied(self, event: dict, master_order_id: str,
+                                    mapping: dict | None = None) -> None:
         """The master's order is FINAL. Confirm each follower actually ended up with
         its share of what the master FILLED, and close any gap.
 
@@ -1078,11 +1100,12 @@ class CopyEngine:
         symbol = event.get("symbol")
         if not symbol or event.get("reduce_only"):
             return  # exits are sized on the position target, not an order share
-        try:
-            mapping = await self.redis.hgetall(f"ordermap:{master_order_id}")
-        except Exception as e:
-            logger.warning(f"confirm-copy: order map unreadable for {master_order_id}: {e}")
-            return
+        if mapping is None:
+            try:
+                mapping = await self.redis.hgetall(f"ordermap:{master_order_id}")
+            except Exception as e:
+                logger.warning(f"confirm-copy: order map unreadable for {master_order_id}: {e}")
+                return
         if not mapping:
             return
 
@@ -3704,6 +3727,29 @@ class CopyEngine:
                     follower_row, client, symbol, master_row,
                     ref_price=float((event or {}).get("limit_price") or 0.0),
                 )
+        # CANCELLED AFTER A PARTIAL FILL. Escalation no longer forces our mirror to
+        # market on a partial (see process_order_event) — our limit queues alongside
+        # the master's and waits. So when he abandons the rest, whatever he DID fill
+        # is final, and the follower belongs at its share of that. _settle_exit_after
+        # _cancel above only handles holding too MUCH; nothing topped up a partial
+        # entry, which would leave the follower permanently short of a trade the
+        # master really made. (Prathav, 2026-09-04: wait for the full fill, or settle
+        # if he cancels after a partial.)
+        #
+        # Pass the mapping explicitly: the ordermap key is deleted below, and this
+        # runs as a task that outlives that.
+        if not is_protective and symbol and master_row and mapping:
+            _sz = float((event or {}).get("size") or 0)
+            _unf = (event or {}).get("unfilled_size")
+            if _unf is not None and 0 < (_sz - float(_unf)) < _sz:
+                logger.info(
+                    f"master cancelled {master_order_id} on {symbol} after filling "
+                    f"{_sz - float(_unf):.0f} of {_sz:.0f} — settling followers to "
+                    f"their share of what actually filled"
+                )
+                asyncio.create_task(self._confirm_order_copied(
+                    event, master_order_id, mapping=dict(mapping)))
+
         # The ordermap entry goes away below, but the ledger keeps the audit trail:
         # stamp the master order cancelled so a mirrored-then-cancelled order is
         # never read back as "the follower still has this".

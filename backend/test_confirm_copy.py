@@ -244,6 +244,44 @@ async def test_defers_while_the_mirror_is_still_resting():
           await eng.redis.get(f"confirmed:{MOID}:{FID}"), None)
 
 
+async def test_partial_master_fill_does_not_start_the_5s_clock():
+    print("\n11. a PARTIAL master fill must not start the escalation clock")
+    # 2026-09-04 C-BTC-88000-040926: the clock started on a partial, escalation
+    # marketed our whole 17-lot mirror against a master position of only -150, and
+    # the reconciler TRIMMED us by 17 (19 -> 2). Again by 6 at -1123, and C-BTC-85000
+    # by 31 (56 -> 25). 89 lots of corrective trading in one day. His resting order
+    # is an OPEN order, so ours queues alongside it and waits.
+    # (Prathav, 2026-09-04: wait for the full fill; the 5s rule is after his fill.)
+    def starts_clock(ev):
+        unf = ev.get("unfilled_size")
+        return ev.get("state") == "closed" or (unf is not None and float(unf) <= 0)
+    check("partial (1350 of 1500 left) -> no clock",
+          starts_clock({"state": "open", "unfilled_size": 1350}), False)
+    check("5-lot partial -> no clock",
+          starts_clock({"state": "open", "unfilled_size": 1495}), False)
+    check("complete -> clock starts",
+          starts_clock({"state": "closed", "unfilled_size": 0}), True)
+    check("fully filled but state still open -> clock starts",
+          starts_clock({"state": "open", "unfilled_size": 0}), True)
+
+
+async def test_cancel_after_partial_settles_to_what_filled():
+    print("\n12. cancelled after a partial -> settle to the filled share")
+    # He filled 500 of 1500 then abandoned the rest. 500 is final, so the follower
+    # belongs at its share of 500 (ceil(500 * 0.011209) = 6), not left at 0.
+    eng, client = engine(follower_held=0, master_pos=-500)
+    await eng._confirm_order_copied(
+        event(size=1500, unfilled=1000), MOID, mapping={FID: "1510240261"})
+    check("tops up to the partial share", len(client.placed), 1)
+    if client.placed:
+        check("6 lots for 500 filled", int(client.placed[0]["size"]), 6)
+    # And an order he cancelled with NOTHING filled owes nothing.
+    eng2, client2 = engine(follower_held=0, master_pos=0)
+    await eng2._confirm_order_copied(
+        event(size=1500, unfilled=1500), MOID, mapping={FID: "1510240261"})
+    check("nothing filled -> nothing owed", client2.placed, [])
+
+
 async def main():
     print("=" * 74)
     print("confirm-copy - reconfirm the OUTCOME, not just that each step ran")
@@ -259,6 +297,8 @@ async def main():
         test_deadband,
         test_partial_completion_is_not_dispatched,
         test_defers_while_the_mirror_is_still_resting,
+        test_partial_master_fill_does_not_start_the_5s_clock,
+        test_cancel_after_partial_settles_to_what_filled,
     ):
         await fn()
     print("\n" + "=" * 74)
