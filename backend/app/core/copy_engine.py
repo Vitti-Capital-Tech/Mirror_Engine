@@ -1108,8 +1108,6 @@ class CopyEngine:
             except Exception as e:
                 logger.warning(f"confirm-copy: order map unreadable for {master_order_id}: {e}")
                 return
-        if not mapping:
-            return
 
         size = float(event.get("size") or 0)
         unfilled = event.get("unfilled_size")
@@ -1126,6 +1124,26 @@ class CopyEngine:
                            and (not _oid or a.get("owner_id") == _oid)), None)
         if master_row is None:
             return
+        if not mapping:
+            # NOTHING was mirrored for this order. That is not a reason to stop —
+            # it is the case most worth checking, because the follower got no order
+            # at all. 2026-09-04 04:15:36 IST, P-BTC-78400-040926: the master's sell
+            # OPENED a 2400 short, was inferred as a close because his position
+            # still read 0 (the fill was milliseconds old and Delta's position
+            # endpoint had not caught up), the reduce-only path found nothing to
+            # reduce and skipped, and the reconciler had to open 27 lots 21s later.
+            # confirm-copy would have caught it at ~3s, except it keyed off an
+            # ordermap that was never written.
+            mapping = {a["id"]: None for a in (accounts or [])
+                       if a.get("id") and not a.get("is_master")
+                       and a.get("status") == "active"}
+            if not mapping:
+                return
+            logger.info(
+                f"confirm-copy: nothing was mirrored for {master_order_id} on "
+                f"{symbol} — checking every active follower against what the "
+                f"master actually filled"
+            )
         ref_price = event.get("limit_price") or 0.0
         entry = await ledger.get_entry(self.redis, master_order_id) or {}
         legs = entry.get("legs") or {}
@@ -1135,11 +1153,23 @@ class CopyEngine:
             follower = by_id.get(fid)
             if not follower or follower.get("status") != "active":
                 continue
-            # A deliberate zero is not a miss. The engine records those as
-            # "skipped" with the reason, so they are distinguishable from a copy
-            # that was attempted and came up short.
-            if (legs.get(fid) or {}).get("status") == "skipped":
-                continue
+            # A deliberate zero is not a miss — but not every "skipped" leg is
+            # deliberate. Only "already at target" means we looked and owed
+            # nothing. The other two wear the same label while describing a
+            # FAILURE: "sizing unavailable (balance ratio could not be computed)"
+            # and "holds +0, not reducible by <side>" — the latter is the engine
+            # itself saying "(position desync?)", which is exactly the P-BTC-78400
+            # misroute above. Treating those as deliberate is why confirm-copy sat
+            # out the one case it was built for.
+            _leg = legs.get(fid) or {}
+            if _leg.get("status") == "skipped":
+                _why = str(_leg.get("reason") or "")
+                if _why.startswith("already at target"):
+                    continue
+                logger.info(
+                    f"confirm-copy: {symbol} leg for {fid} was skipped as "
+                    f"'{_why}' — that is a failure, not a deliberate zero; checking"
+                )
             # ESCALATION OWNS A LIVE MIRROR. If the follower's mirrored order is
             # still resting, the 5s escalation is about to cancel it and market the
             # remainder. Topping up the position gap here as well would stack:

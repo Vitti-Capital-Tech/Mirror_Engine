@@ -72,11 +72,12 @@ def check(name, got, want):
 
 
 class FakeRedis:
-    def __init__(self):
+    def __init__(self, ordermap=None):
         self.kv = {}
+        self.ordermap = {FID: "1510240261"} if ordermap is None else ordermap
 
     async def hgetall(self, key):
-        return {FID: "1510240261"} if key == f"ordermap:{MOID}" else {}
+        return dict(self.ordermap) if key == f"ordermap:{MOID}" else {}
 
     async def set(self, k, v, ex=None, nx=False):
         if nx and k in self.kv:
@@ -107,9 +108,9 @@ class FakeClient:
         return [{"id": i} for i in self.live] if state == "open" else []
 
 
-def engine(follower_held, master_pos, legs=None, live_ids=()):
+def engine(follower_held, master_pos, legs=None, live_ids=(), ordermap=None):
     eng = CopyEngine.__new__(CopyEngine)
-    eng.redis = FakeRedis()
+    eng.redis = FakeRedis(ordermap)
     eng.risk_engine = RiskEngine()
     eng._open_orders_cache = {}
     eng._OPEN_ORDERS_TTL = 0.0
@@ -282,6 +283,46 @@ async def test_cancel_after_partial_settles_to_what_filled():
     check("nothing filled -> nothing owed", client2.placed, [])
 
 
+async def test_nothing_mirrored_is_still_checked():
+    print()
+    print("13. NOTHING mirrored -> check every active follower anyway")
+    # 2026-09-04 04:15:36 IST, P-BTC-78400-040926. The master's sell OPENED a 2400
+    # short but was inferred as a close (his position still read 0 — the fill was
+    # milliseconds old and Delta's position endpoint had not caught up), so the
+    # reduce-only path found nothing to reduce and skipped. No order was placed, so
+    # no ordermap entry existed, so confirm-copy returned early on an empty mapping
+    # and sat out the one case it was built for. The reconciler opened 27 lots 21s
+    # later. It must now check regardless.
+    eng, client = engine(follower_held=0, master_pos=-2400, ordermap={},
+                         legs={FID: {"status": "skipped",
+                                     "reason": "holds +0, not reducible by sell"}})
+    await eng._confirm_order_copied(event(size=2400, unfilled=0), MOID)
+    check("opens the leg nobody placed", len(client.placed), 1)
+    if client.placed:
+        check("27 lots for 2400 filled", int(client.placed[0]["size"]), 27)
+
+
+async def test_a_deliberate_skip_is_still_respected():
+    print()
+    print("14. 'already at target' is the ONLY deliberate skip")
+    eng, client = engine(follower_held=-4, master_pos=-2000,
+                         legs={FID: {"status": "skipped",
+                                     "reason": "already at target 4 (holds 4)"}})
+    await eng._confirm_order_copied(event(), MOID)
+    check("left alone", client.placed, [])
+
+
+async def test_a_failed_skip_is_not_deliberate():
+    print()
+    print("15. 'sizing unavailable' wears the same label but is a FAILURE")
+    eng, client = engine(follower_held=-4, master_pos=-2000,
+                         legs={FID: {"status": "skipped",
+                                     "reason": "sizing unavailable (balance ratio "
+                                               "could not be computed)"}})
+    await eng._confirm_order_copied(event(), MOID)
+    check("corrected, not skipped", len(client.placed), 1)
+
+
 async def main():
     print("=" * 74)
     print("confirm-copy - reconfirm the OUTCOME, not just that each step ran")
@@ -299,6 +340,9 @@ async def main():
         test_defers_while_the_mirror_is_still_resting,
         test_partial_master_fill_does_not_start_the_5s_clock,
         test_cancel_after_partial_settles_to_what_filled,
+        test_nothing_mirrored_is_still_checked,
+        test_a_deliberate_skip_is_still_respected,
+        test_a_failed_skip_is_not_deliberate,
     ):
         await fn()
     print("\n" + "=" * 74)
