@@ -57,10 +57,19 @@ FID = "f1"
 MASTER = {"id": "m1", "is_master": True, "owner_id": "u1", "status": "active",
           "api_key": "k", "api_secret": "s", "environment": "live",
           "balance": 7066.78289717}
+# Shaped like a row from _read_accounts, which is a RAW DB row: it carries NO
+# master_balance, and auto_ratio divides by that. The earlier version of this
+# fixture helpfully supplied it, so every test passed while the real thing could
+# not size anything at all — confirm-copy logged nothing for four days
+# (2026-09-07 14:31:57, "Auto Ratio UNAVAILABLE", 3.5s after the C-BTC-82400
+# completion). A fixture kinder than production tests nothing; same mistake as
+# supplying filled_size in test_manual_exit.
 FOLLOWER = {"id": FID, "name": "Mini Prathav", "is_master": False, "owner_id": "u1",
             "status": "active", "allocation_mode": "auto_ratio",
             "allocation_value": None, "balance": 79.21331535,
-            "master_balance": 7066.78289717, "available_margin": 79.21331535}
+            "available_margin": 79.21331535}
+assert "master_balance" not in FOLLOWER, "fixture must mirror a raw _read_accounts row"
+assert "balance" in MASTER, "the master row is where the balance must come from"
 
 
 def check(name, got, want):
@@ -323,6 +332,22 @@ async def test_a_failed_skip_is_not_deliberate():
     check("corrected, not skipped", len(client.placed), 1)
 
 
+async def test_it_can_actually_size_from_a_raw_account_row():
+    print()
+    print("16. it must derive master_balance itself, not be handed it")
+    # _read_accounts returns raw DB rows with no master_balance. auto_ratio divides
+    # by it, so without deriving it every size comes back 0 and the method exits on
+    # `int(target) < 1` without a word. That is precisely what happened for four
+    # days: zero confirm-copy lines, and the reconciler quietly doing the job 20s
+    # slower (2026-09-07: TOPPED UP by 23, "master filled 21s ago").
+    eng, client = engine(follower_held=-4, master_pos=-2000)
+    await eng._confirm_order_copied(event(), MOID)
+    check("sizes and acts on a raw row", len(client.placed), 1)
+    if client.placed:
+        check("19 lots, so the ratio really resolved",
+              int(client.placed[0]["size"]), 19)
+
+
 async def main():
     print("=" * 74)
     print("confirm-copy - reconfirm the OUTCOME, not just that each step ran")
@@ -343,6 +368,7 @@ async def main():
         test_nothing_mirrored_is_still_checked,
         test_a_deliberate_skip_is_still_respected,
         test_a_failed_skip_is_not_deliberate,
+        test_it_can_actually_size_from_a_raw_account_row,
     ):
         await fn()
     print("\n" + "=" * 74)

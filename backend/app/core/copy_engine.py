@@ -1145,6 +1145,21 @@ class CopyEngine:
                 f"master actually filled"
             )
         ref_price = event.get("limit_price") or 0.0
+        # The rows from _read_accounts are raw DB rows and carry NO master_balance,
+        # and auto_ratio divides by it — so every calculate_follower_quantity call
+        # below returns 0 ("Auto Ratio UNAVAILABLE") and this whole method exits
+        # silently on `int(target) < 1`. That is why confirm-copy logged NOTHING for
+        # four days: not bad luck, it could not size anything at all. Seen on
+        # 2026-09-07 14:31:57, 3.5s after the C-BTC-82400-080926 completion (the 3s
+        # settle) — the reconciler then topped up 23 lots 20s later, doing the job
+        # this check exists to do faster. The same trap is documented in
+        # _escalate_after_master_fill, where it made the escalation size cap vanish
+        # (2026-08-04, P-BTC-63000-040826).
+        _mbal = self._master_balance_or_last(
+            float(master_row.get("allocated_balance") or master_row.get("balance")
+                  or master_row.get("available_margin") or 0.0),
+            master_row,
+        )
         entry = await ledger.get_entry(self.redis, master_order_id) or {}
         legs = entry.get("legs") or {}
 
@@ -1153,6 +1168,8 @@ class CopyEngine:
             follower = by_id.get(fid)
             if not follower or follower.get("status") != "active":
                 continue
+            follower = dict(follower)          # per-follower, never shared
+            follower["master_balance"] = _mbal
             # A deliberate zero is not a miss — but not every "skipped" leg is
             # deliberate. Only "already at target" means we looked and owed
             # nothing. The other two wear the same label while describing a
@@ -1201,6 +1218,11 @@ class CopyEngine:
                 target = self.risk_engine.calculate_follower_quantity(
                     master_filled, ref_price, follower, round_up=True)
                 if int(target) < 1:
+                    logger.warning(
+                        f"confirm-copy: cannot size {symbol} for "
+                        f"{follower.get('name')} (master filled {master_filled:.0f}, "
+                        f"master_balance {_mbal}) — leaving it to the reconciler"
+                    )
                     continue
                 client = _fclient
                 held = int(abs(float(await self._position_size_signed(client, symbol))))
