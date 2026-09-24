@@ -192,7 +192,7 @@ SYM = "C-BTC-67200-300726"
 
 
 def build(follower_size, master_size, orders=(), last_master_fill_age=600.0,
-          mark=1.2, entry=None):
+          mark=1.2, entry=None, master_working=False):
     from app.core.copy_engine import CopyEngine
     client = FakeClient([{"product_symbol": SYM, "size": follower_size}], orders)
     eng = CopyEngine(FakeDB(), FakeRedis(), FakeSocket(), FakeConnMgr(client))
@@ -205,6 +205,11 @@ def build(follower_size, master_size, orders=(), last_master_fill_age=600.0,
     eng._classify_master_exit = fake_classify
     async def fake_master_size(_row, _sym, fresh=False): return abs(master_size)
     eng._master_position_size = fake_master_size
+    # Is the master still WORKING an order on this symbol? These scenarios have him
+    # finished (his last fill is `last_master_fill_age` old), so the honest answer is
+    # no — pass master_working=True to model an exit still in flight.
+    async def fake_working(_row, _sym, _msz): return master_working
+    eng._master_working_reducer = fake_working
     event = {"owner_id": "u1", "positions": (
         [{"symbol": SYM, "size": master_size, "mark": mark, "entry": entry}]
         if master_size else []
@@ -654,6 +659,27 @@ async def main():
     ok &= check("master REDUCING still allows a TRIM (reducing risk is safe)",
                 len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
                 f"placed={client.placed}")
+
+    # ...but NOT while he is still WORKING that reduction. His order fills in
+    # pieces, so his position drops before ours does; trimming against each piece
+    # markets the difference over and over. 2026-09-21, P-BTC-79600: one 2400-lot
+    # cover produced five market trims in eleven minutes while our mirrored exit sat
+    # behind his in the queue. His fill or his cancel settles it, not a trim.
+    # (desk call, Prathav 2026-09-25 — no magnitude cap, no time limit.)
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2, master_working=True)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master still WORKING the reduction -> trim is HELD",
+                not client.placed, f"placed={client.placed}")
+
+    # An unreadable order book is not permission to trim, same as everywhere else.
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2)
+    async def _unreadable(_row, _sym, _msz): return None
+    eng._master_working_reducer = _unreadable
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master order book unreadable -> trim is HELD",
+                not client.placed, f"placed={client.placed}")
 
     # ---- 12g. UNAVAILABLE RATIO must never mean "copy 1:1" or "close everything".
     #           Live 2026-08-02: the master's balance read as 0.0 five times in a

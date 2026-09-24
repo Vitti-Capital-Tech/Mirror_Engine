@@ -971,6 +971,58 @@ class CopyEngine:
         self._master_exits_cache[ck] = (deduped, time.time())
         return deduped
 
+    async def _master_working_reducer(self, master_row: dict, symbol: str, msz: float):
+        """Is the master still WORKING an order on `symbol` that would reduce his
+        position there?
+
+        True means his exit is in progress — his position is dropping in pieces
+        while ours has not moved yet, so a follower that looks over-exposed is a
+        copy mid-flight, not a fault. False means his order reached a terminal
+        state and whatever gap is left is real.
+
+        Returns None when the order book could not be READ, which is not the same
+        as "he has nothing working". The caller must not treat an unreadable book
+        as permission to trim.
+
+        Derived from the SIDE against his position, not the reduce_only flag: the
+        exchange does not always set that flag, and the reconciler already derives
+        the follower's own stuck-close the same way a few lines below. Stops, TPs
+        and brackets are excluded — they are resting cover, not an exit in flight.
+        """
+        if not master_row or not symbol or not msz:
+            return False
+        client = self._get_master_client(master_row)
+        if client is None:
+            return None
+        ck = ("working", symbol)
+        cached = self._master_exits_cache.get(ck)
+        if cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
+            return cached[0]
+        working, ok = False, False
+        for state in ("open", "pending"):
+            try:
+                orders = await client.get_open_orders(state=state)
+            except Exception as e:
+                logger.warning(f"Could not read master working orders ({state}) for {symbol}: {e}")
+                continue
+            ok = True
+            for o in orders:
+                if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                    continue
+                if o.get("stop_order_type") or o.get("stop_price") or o.get("bracket_order"):
+                    continue
+                oside = (o.get("side") or "").lower()
+                # buy reduces a short, sell reduces a long
+                if (oside == "buy" and msz < 0) or (oside == "sell" and msz > 0):
+                    working = True
+                    break
+            if working:
+                break
+        if not ok:
+            return None  # unreadable — NOT "nothing working"
+        self._master_exits_cache[ck] = (working, time.time())
+        return working
+
     async def _master_position_signed(self, master_row: dict, symbol: str, fresh: bool = False):
         """Live SIGNED master position for a symbol (negative=short, positive=long,
         0=flat). Cached ~3s. Used to tell whether a master order OPENS or CLOSES:
@@ -1715,6 +1767,50 @@ class CopyEngine:
                             continue
 
                         # ---- OVER-exposed: an exit the follower didn't complete.
+                        #
+                        # Not while the master is still WORKING an order here. His
+                        # exit fills in pieces, so his position drops before ours
+                        # does, and trimming against each piece markets the
+                        # difference again and again: 2026-09-21, one 2400-lot cover
+                        # on P-BTC-79600 produced FIVE market trims in eleven minutes
+                        # (27 -> 21 -> 18 -> 13 -> 11 -> 4), paying the spread every
+                        # time, while our mirrored exit sat behind his in the queue
+                        # and never got the chance to fill at his price.
+                        #
+                        # Both proper resolutions already exist and both key off HIS
+                        # order reaching a terminal state:
+                        #   he fills   -> _escalate_after_master_fill gives our mirror
+                        #                 ESCALATE_WAIT_SEC at his price, then markets
+                        #                 the remainder.
+                        #   he cancels -> _settle_exit_after_cancel markets the gap at
+                        #                 once ("the master just abandoned that price").
+                        # The reconciler was cutting across both by acting while his
+                        # order was still live.
+                        #
+                        # Held with NO magnitude cap and NO time limit (desk call,
+                        # Prathav 2026-09-25): the drift while he unwinds is accepted
+                        # in exchange for matching his price. On the 21 Sep episode
+                        # that means holding at 27 against a falling target for ~11
+                        # minutes, ending ~575% over, then settling in one step when
+                        # his order terminates.
+                        #
+                        # An UNREADABLE book is not permission to trim — same rule as
+                        # everywhere else in this engine.
+                        working = await self._master_working_reducer(master_row, sym, msz)
+                        if working is None:
+                            logger.warning(
+                                f"reconcile: {fol.get('name')} over-exposed on {sym} but the "
+                                f"master's order book is unreadable — not trimming on an unknown"
+                            )
+                            continue
+                        if working:
+                            logger.info(
+                                f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
+                                f"{held}, target {int(target)} for master {msz:+.0f} "
+                                f"(excess {excess}) — but the master is still WORKING an order "
+                                f"here; his fill or cancel settles it, not a trim"
+                            )
+                            continue
                         tkey = (fid, sym, excess)
                         current_trim.add(tkey)
                         if tkey not in self._recon_trim_prev:
