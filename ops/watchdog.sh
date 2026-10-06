@@ -31,6 +31,16 @@ FLAP_WINDOW="${FLAP_WINDOW:-3600}"        # count restarts within this window (1
 FLAP_THRESHOLD="${FLAP_THRESHOLD:-3}"     # >= this many restarts/window -> one summary
 FLAP_NOTIFY_SEC="${FLAP_NOTIFY_SEC:-3600}"
 
+# Disk. A full root filesystem is the one failure that /health cannot see and a
+# restart cannot fix: the process answers 200 while being unable to write a
+# single byte. 2026-10-05 00:00 the disk hit 100% (a 5.5 GB uncapped Docker log
+# plus 8 GB of stale image layers); copying and logins were dead for 31 hours and
+# nothing alerted, because the health check stayed green the whole time.
+DISK_PATH="${DISK_PATH:-/}"
+DISK_WARN_PCT="${DISK_WARN_PCT:-85}"      # alert while there is still room to act
+DISK_NOTIFY_SEC="${DISK_NOTIFY_SEC:-21600}"   # re-alert at most every 6h
+DISK_STATE="${DISK_STATE:-/tmp/me_watchdog.disk}"
+
 _val() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'\r'; }
 BOT="$(_val TELEGRAM_BOT_TOKEN)"; CHAT="$(_val TELEGRAM_CHAT_ID)"
 
@@ -44,7 +54,40 @@ tg() {
 # Single clean status code; caller defaults empty to 000 (no double-echo -> no "000000").
 health() { curl -s -m 8 -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null; }
 
+disk_pct() { df -P "$DISK_PATH" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}'; }
+disk_top() { du -xh --max-depth=2 / 2>/dev/null | sort -rh | sed -n '2,4p' | tr '
+' ' '; }
+
+# Alerts, never restarts: restarting into a full disk changes nothing. Own state
+# file so the existing 4-field state line keeps its format.
+check_disk() {
+  local pct last
+  pct="$(disk_pct)"
+  case "$pct" in ''|*[!0-9]*) return 0;; esac
+  last=0; [ -f "$DISK_STATE" ] && read -r last < "$DISK_STATE" 2>/dev/null
+  case "$last" in ''|*[!0-9]*) last=0;; esac
+
+  if [ "$pct" -ge "$DISK_WARN_PCT" ]; then
+    log "disk ${pct}% >= ${DISK_WARN_PCT}% on $DISK_PATH"
+    if [ $(( now - last )) -ge "$DISK_NOTIFY_SEC" ]; then
+      tg "$(printf '🟠 <b>Mirror Engine: disk %s%% full</b>
+Host %s, %s.
+At 100%% the backend keeps answering /health but cannot write, so copying and logins stop silently — a restart does NOT fix it.
+Biggest: %s
+Free space with <code>docker system prune -af</code>.' "$pct" "$host" "$DISK_PATH" "$(disk_top)")"
+      echo "$now" > "$DISK_STATE"
+    fi
+  elif [ "$last" -ne 0 ]; then
+    tg "$(printf '✅ <b>Mirror Engine: disk back to %s%%</b> on %s.' "$pct" "$host")"
+    : > "$DISK_STATE"
+  fi
+}
+
 now="$(date +%s)"; host="$(hostname)"
+
+# Checked every run, before the health branch returns early on a healthy backend —
+# the disk can be full while /health is still 200.
+check_disk
 
 # state line: STATUS SINCE LAST_NOTIFY LAST_FLAP
 STATUS=OK; SINCE=0; LAST_NOTIFY=0; LAST_FLAP=0
