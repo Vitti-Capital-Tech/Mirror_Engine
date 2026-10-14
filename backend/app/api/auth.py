@@ -46,6 +46,10 @@ class ResendIn(BaseModel):
     pending_id: str
 
 
+class RefreshIn(BaseModel):
+    refresh_token: str
+
+
 @router.post("/signup")
 async def signup(body: SignupIn):
     # Create the user via the admin API with email pre-confirmed. Our email-OTP
@@ -151,6 +155,30 @@ async def verify_2fa(body: Verify2FAIn):
         "expires_in": session.get("expires_in"),
         "user": session.get("user"),
     }
+
+
+@router.post("/refresh")
+async def refresh(body: RefreshIn):
+    """Exchange a refresh token for a fresh access token.
+
+    GoTrue issues access tokens with a one-hour life (measured: exp - iat =
+    3600). Nothing renewed them, so every session died exactly on the hour —
+    GoTrue answered /auth/v1/user with 403, get_current_user turned that into a
+    401, and the dashboard wiped the token and bounced to /login mid-session.
+    The refresh token was handed to the frontend by /login and /verify-2fa all
+    along and simply thrown away; this is the endpoint that spends it.
+
+    No 2FA re-prompt: the refresh token only exists because a login already
+    passed 2FA, and GoTrue invalidates it the moment the session is signed out.
+    """
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(_gotrue("/token?grant_type=refresh_token"), headers=_headers(),
+                         json={"refresh_token": body.refresh_token})
+    if r.status_code >= 400:
+        # Genuinely dead (revoked, reused, or past the refresh window) — this is
+        # the ONLY case in which the caller should send the user back to /login.
+        raise HTTPException(status_code=401, detail="Session expired — please log in again")
+    return _session_response(r.json())
 
 
 @router.post("/resend-2fa")

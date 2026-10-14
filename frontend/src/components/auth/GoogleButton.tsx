@@ -18,10 +18,11 @@ export function GoogleButton() {
       if (e.origin !== window.location.origin) return;
       if (e.data?.type !== 'mirror-auth' || !e.data.token) return;
       const token = e.data.token as string;
-      setSession(token);
+      const refreshToken = e.data.refreshToken as string | undefined;
+      setSession(token, undefined, refreshToken);
       let me: any = null;
       try { me = await api.auth.me(); } catch { /* ignore */ }
-      if (me) setSession(token, { id: me.id, email: me.email, role: me.role });
+      if (me) setSession(token, { id: me.id, email: me.email, role: me.role }, refreshToken);
       setBusy(false);
       router.replace(me?.role === 'admin' ? '/admin' : '/positions');
     };

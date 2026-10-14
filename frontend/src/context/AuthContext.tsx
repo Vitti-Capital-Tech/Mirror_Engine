@@ -1,6 +1,6 @@
 'use client';
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import { api, getToken, setToken } from '@/lib/api';
+import { api, getToken, setToken, setRefreshToken, clearSession } from '@/lib/api';
 
 interface User { id: string; email?: string; role?: string; }
 interface AuthState {
@@ -8,7 +8,7 @@ interface AuthState {
   loading: boolean;
   signingOut: boolean;
   isAuthenticated: boolean;
-  setSession: (accessToken: string, user?: User) => void;
+  setSession: (accessToken: string, user?: User, refreshToken?: string) => void;
   logout: () => void;
   refresh: () => Promise<void>;
 }
@@ -45,8 +45,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const me = await api.auth.me();
       setUser(me);
     } catch {
-      setToken(null);
-      setUser(null);
+      // Deliberately NOT a sign-out. This catch used to drop the token on any
+      // failure at all, so one 503 from the auth service — or a laptop waking
+      // up with the network still down — ended the session for good, minutes
+      // after logging in. api.ts owns that decision now: it renews an expired
+      // token and only clears the session when the refresh token is genuinely
+      // dead. Anything reaching here is transient; keep the cached user and
+      // let the next poll settle it.
     } finally {
       setLoading(false);
     }
@@ -54,15 +59,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const setSession = (accessToken: string, u?: User) => {
+  const setSession = (accessToken: string, u?: User, refreshToken?: string) => {
     setToken(accessToken);
+    // Without this the session could never be renewed and died on the hour.
+    if (refreshToken) setRefreshToken(refreshToken);
     if (u) setUser(u);
     else refresh();
   };
 
   const logout = () => {
     setSigningOut(true);
-    setToken(null);
+    clearSession();
     setUser(null);
     if (typeof window !== 'undefined') window.location.href = '/login';
   };

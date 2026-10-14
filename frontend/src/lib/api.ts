@@ -1,6 +1,7 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export const TOKEN_KEY = 'me_access_token';
+export const REFRESH_KEY = 'me_refresh_token';
 
 export function getToken(): string | null {
   if (typeof window === 'undefined') return null;
@@ -10,6 +11,72 @@ export function setToken(t: string | null) {
   if (typeof window === 'undefined') return;
   if (t) localStorage.setItem(TOKEN_KEY, t);
   else localStorage.removeItem(TOKEN_KEY);
+}
+
+export function getRefreshToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem(REFRESH_KEY);
+}
+export function setRefreshToken(t: string | null) {
+  if (typeof window === 'undefined') return;
+  if (t) localStorage.setItem(REFRESH_KEY, t);
+  else localStorage.removeItem(REFRESH_KEY);
+}
+
+/** Drop the whole session. Only for a genuine sign-out or a dead refresh token
+ *  — never for a network blip, which used to be enough to sign the user out. */
+export function clearSession() {
+  setToken(null);
+  setRefreshToken(null);
+}
+
+/** `rejected` means the session is genuinely dead and the user must sign in
+ *  again. A timeout or a 5xx is NOT rejected: the session may well be fine, so
+ *  the caller keeps it and simply fails that one request. */
+export interface RefreshResult { token: string | null; rejected: boolean; }
+
+let inFlight: Promise<RefreshResult> | null = null;
+
+async function doRefresh(): Promise<RefreshResult> {
+  const rt = getRefreshToken();
+  // Nothing to renew with (e.g. signed in before this build shipped) — the only
+  // way back is a real login.
+  if (!rt) return { token: null, rejected: true };
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: rt }),
+    });
+    if (res.status === 401) return { token: null, rejected: true };
+    if (!res.ok) return { token: null, rejected: false };
+    const data = await res.json();
+    if (!data?.access_token) return { token: null, rejected: false };
+    setToken(data.access_token);
+    if (data.refresh_token) setRefreshToken(data.refresh_token);
+    return { token: data.access_token as string, rejected: false };
+  } catch {
+    // Offline, DNS, CORS, API down. Not an auth failure — keep the session.
+    return { token: null, rejected: false };
+  }
+}
+
+/**
+ * Renew the access token.
+ *
+ * Supabase access tokens live exactly one hour (measured: exp - iat = 3600).
+ * Nothing spent the refresh token, so every session died on the hour and the
+ * dashboard threw the user back to /login mid-session.
+ *
+ * The dashboard polls six endpoints at once, so one expiry surfaces as six
+ * simultaneous 401s. This collapses them into a SINGLE refresh and lets the
+ * other five await the same promise — GoTrue rotates the refresh token on use
+ * and treats a replay as a stolen token, so six parallel refreshes would kill
+ * the session outright.
+ */
+export function refreshAccessToken(): Promise<RefreshResult> {
+  if (!inFlight) inFlight = doRefresh().finally(() => { inFlight = null; });
+  return inFlight;
 }
 
 function buildQuery(params?: Record<string, any>): string {
@@ -22,9 +89,20 @@ function buildQuery(params?: Record<string, any>): string {
   return qs ? `?${qs}` : '';
 }
 
-async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
-  const token = getToken();
-  const res = await fetch(`${API_BASE}${path}`, {
+// Routes where a 401 means "those credentials are wrong", not "your token
+// aged out" — retrying them would be meaningless. /api/auth/me is deliberately
+// NOT here: it is a normal authenticated call and must renew like the rest, or
+// every page load with an hour-old token lands on /login.
+const NO_RETRY = [
+  '/api/auth/login',
+  '/api/auth/signup',
+  '/api/auth/verify-2fa',
+  '/api/auth/resend-2fa',
+  '/api/auth/refresh',
+];
+
+function send(path: string, options?: RequestInit, token?: string | null) {
+  return fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -32,10 +110,25 @@ async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
       ...(options?.headers || {}),
     },
   });
-  if (res.status === 401 && typeof window !== 'undefined' && !path.startsWith('/api/auth')) {
-    // Session expired/invalid — drop token and bounce to login.
-    setToken(null);
-    if (!window.location.pathname.startsWith('/login')) window.location.href = '/login';
+}
+
+async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
+  let res = await send(path, options, getToken());
+
+  // A 401 means the access token is an hour old, not that the user signed out.
+  // Renew it once and replay the request; only a refresh token that GoTrue
+  // itself rejects ends the session. Auth routes are excluded — /login and
+  // /refresh answer 401 on bad credentials, which must not trigger a retry.
+  if (res.status === 401 && typeof window !== 'undefined' && !NO_RETRY.some(p => path.startsWith(p))) {
+    const { token, rejected } = await refreshAccessToken();
+    if (token) res = await send(path, options, token);
+    // Sign out only when the refresh token is genuinely dead, or the replay is
+    // still refused. If the refresh merely couldn't be reached, the session
+    // stays and this one request fails — a blip must not evict the user.
+    if ((rejected && !token) || res.status === 401) {
+      clearSession();
+      if (!window.location.pathname.startsWith('/login')) window.location.href = '/login';
+    }
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

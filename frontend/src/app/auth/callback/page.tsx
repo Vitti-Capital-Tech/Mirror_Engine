@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
-import { setToken, api } from '@/lib/api';
+import { setToken, setRefreshToken, api } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 
 export default function AuthCallback() {
@@ -20,10 +20,14 @@ export default function AuthCallback() {
       setProgress((p) => (p < 90 ? p + Math.max(1, (90 - p) * 0.12) : p));
     }, 200);
 
-    const finish = async (token?: string | null) => {
+    const finish = async (token?: string | null, refreshToken?: string | null) => {
       if (done || !token) return;
       done = true;
       setToken(token);
+      // Google sessions expired on the hour exactly like password ones: the
+      // access token was copied out of the Supabase session and the refresh
+      // token left behind, so nothing could renew it.
+      if (refreshToken) setRefreshToken(refreshToken);
       clearInterval(creep);
       setProgress(100);
 
@@ -31,7 +35,7 @@ export default function AuthCallback() {
       // back to the opener and close, instead of navigating this window.
       if (typeof window !== 'undefined' && window.opener && window.opener !== window) {
         try {
-          window.opener.postMessage({ type: 'mirror-auth', token }, window.location.origin);
+          window.opener.postMessage({ type: 'mirror-auth', token, refreshToken }, window.location.origin);
           setTimeout(() => window.close(), 300);
           return;
         } catch { /* fall through to normal redirect */ }
@@ -39,15 +43,16 @@ export default function AuthCallback() {
 
       let me: any = null;
       try { me = await api.auth.me(); } catch { /* ignore */ }
-      if (me) setSession(token, { id: me.id, email: me.email, role: me.role });
-      else setSession(token);
+      if (me) setSession(token, { id: me.id, email: me.email, role: me.role }, refreshToken || undefined);
+      else setSession(token, undefined, refreshToken || undefined);
       setTimeout(() => router.replace(me?.role === 'admin' ? '/admin' : '/positions'), 450);
     };
 
     const { data: sub } = supabase.auth.onAuthStateChange((_e: any, session: any) => {
-      finish(session?.access_token);
+      finish(session?.access_token, session?.refresh_token);
     });
-    supabase.auth.getSession().then(({ data }: any) => finish(data.session?.access_token));
+    supabase.auth.getSession().then(({ data }: any) =>
+      finish(data.session?.access_token, data.session?.refresh_token));
 
     const t = setTimeout(() => {
       if (!done) { clearInterval(creep); setError('Google sign-in failed. Please try again.'); }

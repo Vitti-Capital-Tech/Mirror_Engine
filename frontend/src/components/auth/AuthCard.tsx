@@ -63,13 +63,15 @@ export function AuthCard({ initialMode = 'login' }: { initialMode?: Mode }) {
   );
 }
 
-async function finishLogin(router: any, setSession: any, token: string) {
+async function finishLogin(router: any, setSession: any, token: string, refreshToken?: string) {
   // Store the token, then resolve the FULL user (incl. role) before navigating,
   // so the correct panel (admin vs trader) shows immediately — no refresh needed.
-  setSession(token);
+  // The refresh token must be stored too: the access token expires in an hour,
+  // and without it the only way back in was a fresh login.
+  setSession(token, undefined, refreshToken);
   let me: any = null;
   try { me = await api.auth.me(); } catch { /* ignore */ }
-  if (me) setSession(token, { id: me.id, email: me.email, role: me.role });
+  if (me) setSession(token, { id: me.id, email: me.email, role: me.role }, refreshToken);
   router.replace(me?.role === 'admin' ? '/admin' : '/positions');
 }
 
@@ -88,7 +90,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     try {
       const res = await api.auth.login(email, password);
       if (res.twofa_required) { setPendingId(res.pending_id); setStep('otp'); }
-      else { await finishLogin(router, setSession, res.access_token); }
+      else { await finishLogin(router, setSession, res.access_token, res.refresh_token); }
     } catch (err: any) {
       const msg = err.message || 'Login failed';
       setError(/invalid email or password/i.test(msg)
@@ -102,7 +104,7 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     setError(''); setBusy(true);
     try {
       const res = await api.auth.verify2fa(pendingId, code.trim());
-      await finishLogin(router, setSession, res.access_token);
+      await finishLogin(router, setSession, res.access_token, res.refresh_token);
     } catch (err: any) { setError(err.message || 'Verification failed'); } finally { setBusy(false); }
   };
 
