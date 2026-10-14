@@ -198,17 +198,33 @@ class PositionMonitor:
         Returns 'synced' or 'out_of_sync'.
         """
         try:
-            # 1. Fetch master account (cached — this ran ~1.1x/second against a
-            #    synchronous client, and the master's id changes only on a promote).
-            master_account = account_cache.master(self.db)
+            # 1. The account being checked, first — because WHICH master it
+            #    should be measured against depends on who owns it. (Cached; this
+            #    path runs ~1.1x/second against a synchronous client.)
+            follower_account = account_cache.get(self.db, account_id)
+            if not follower_account:
+                return "unknown"
+
+            # A master is copied from nothing, so it can never be out of sync.
+            # This used to read `account_id == account_cache.master(db)["id"]`,
+            # which quietly stopped protecting Jigar the moment a second tenant
+            # added a second master: master() returned whichever row Postgres
+            # gave first (Algo), so Jigar failed the test, was treated as a
+            # follower of Algo, and was alerted on. Ask the row itself instead.
+            if follower_account.get("is_master"):
+                return "synced"
+
+            owner_id = follower_account.get("owner_id")
+
+            # 2. The master OF THIS OWNER. Comparing against another tenant's
+            #    master is what produced "expected size=35" for a follower that
+            #    was holding exactly the 85 it should have been.
+            master_account = account_cache.master_for(self.db, owner_id)
             if not master_account:
                 return "unknown"
             master_id = master_account["id"]
 
-            if account_id == master_id:
-                return "synced"
-
-            # 2. Fetch master's position for this symbol.
+            # 3. Fetch that master's position for this symbol.
             # If we have NO record of the master's position for this symbol, we
             # cannot compute an expected size (e.g. options positions can't be
             # fetched over REST — Delta's options endpoint 400s — and the WS
@@ -219,10 +235,6 @@ class PositionMonitor:
                 return "unknown"
             master_qty = float(master_pos_res.data[0]["quantity"])
 
-            # 3. Fetch follower account settings (cached)
-            follower_account = account_cache.get(self.db, account_id)
-            if not follower_account:
-                return "unknown"
             # Copied because master_balance is injected below for the sizing call,
             # and the cached row is shared with every other caller this tick.
             follower_account = dict(follower_account)
@@ -271,7 +283,7 @@ class PositionMonitor:
                         f"{expected_qty}) but master is BELOW its peak ({master_qty:.0f} of "
                         f"{peak:.0f}) — expected while it unwinds, not alerting"
                     )
-                    await self._resolve_mismatch_alert(account_id, symbol)
+                    await self._resolve_mismatch_alert(account_id, symbol, owner_id)
                     self.db.table("positions").update({"sync_status": "synced"}).eq(
                         "account_id", account_id).eq("symbol", symbol).execute()
                     return "synced"
@@ -286,7 +298,6 @@ class PositionMonitor:
                 # pinging every 30 min while it persists. It re-arms automatically
                 # when the mismatch resolves (_resolve_mismatch_alert flips
                 # is_resolved), so a fresh mismatch later alerts once again.
-                owner_id = follower_account.get("owner_id")
                 targets = [account_id, master_id]
                 open_alerts = (
                     self.db.table("alerts")
@@ -321,7 +332,7 @@ class PositionMonitor:
                 self.db.table("positions").update({"sync_status": "out_of_sync"}).eq("account_id", account_id).eq("symbol", symbol).execute()
                 return "out_of_sync"
             else:
-                await self._resolve_mismatch_alert(account_id, symbol)
+                await self._resolve_mismatch_alert(account_id, symbol, owner_id)
                 self.db.table("positions").update({"sync_status": "synced"}).eq("account_id", account_id).eq("symbol", symbol).execute()
                 return "synced"
 
@@ -329,13 +340,25 @@ class PositionMonitor:
             logger.error(f"Error checking position sync: {e}")
             return "unknown"
 
-    async def _resolve_mismatch_alert(self, account_id: str, symbol: str) -> None:
+    async def _resolve_mismatch_alert(self, account_id: str, symbol: str,
+                                      owner_id: Optional[str] = None) -> None:
         """Resolve open position mismatch alerts for this symbol on BOTH the
-        follower and the master (mismatch alerts are raised on both)."""
+        follower and the master (mismatch alerts are raised on both).
+
+        The master here must be THIS owner's master. It used to be the global
+        master_id(), which with two tenants resolved the wrong account's alerts
+        and left the right ones standing: on 2026-10-14 every Algo/Algo2 alert
+        read resolved while Jigar's and Mini Prathav's sat open indefinitely,
+        which is the notification that kept being shown for a mismatch that had
+        already cleared.
+        """
         try:
             account_ids = [account_id]
             try:
-                mid = account_cache.master_id(self.db)
+                if owner_id is None:
+                    acc = account_cache.get(self.db, account_id) or {}
+                    owner_id = acc.get("owner_id")
+                mid = account_cache.master_id_for(self.db, owner_id)
                 if mid:
                     account_ids.append(mid)
             except Exception:

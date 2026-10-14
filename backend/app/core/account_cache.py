@@ -92,11 +92,50 @@ class AccountCache:
         return rows
 
     def master(self, db) -> Optional[dict]:
+        """The master — ONLY meaningful while there is exactly one.
+
+        Returns None when several exist, because there is no correct answer:
+        this used to return rows[0] and that is precisely how a second tenant
+        broke the sync check. Callers that know whose master they want must use
+        master_for().
+        """
         rows = self.masters(db)
-        return rows[0] if rows else None
+        if len(rows) == 1:
+            return rows[0]
+        return None
+
+    def master_for(self, db, owner_id) -> Optional[dict]:
+        """The master belonging to ONE owner.
+
+        A second tenant (Algo/Algo2, owner 1deaba39) joined the live system
+        alongside Jigar/Mini Prathav, so `accounts` now holds two rows with
+        is_master=True. Every caller asking for "the master" got rows[0] in
+        whatever order Postgres returned — Algo — and the position check then
+        compared Tushar's follower against the OTHER tenant's master:
+
+            Mini Prathav held 85 on P-BTC-79600-141026
+              vs Jigar (its real master, 4850) -> expected 85, diff 0   correct
+              vs Algo  (rows[0],        2000) -> expected 35, diff 50  ALERTED
+
+        Jigar itself was alerted on too, because the "am I the master?" test
+        compared against that same single id and Jigar was no longer it.
+
+        Never falls back to another owner's master: if this owner has no master,
+        the answer is "unknown", which the caller already handles.
+        """
+        rows = self.masters(db)
+        if not rows:
+            return None
+        if owner_id:
+            return next((r for r in rows if r.get("owner_id") == owner_id), None)
+        return rows[0] if len(rows) == 1 else None
 
     def master_id(self, db) -> Optional[str]:
         m = self.master(db)
+        return m.get("id") if m else None
+
+    def master_id_for(self, db, owner_id) -> Optional[str]:
+        m = self.master_for(db, owner_id)
         return m.get("id") if m else None
 
     def get(self, db, account_id: str) -> Optional[dict]:

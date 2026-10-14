@@ -1186,9 +1186,18 @@ class CopyEngine:
             # reduce and skipped, and the reconciler had to open 27 lots 21s later.
             # confirm-copy would have caught it at ~3s, except it keyed off an
             # ordermap that was never written.
+            # Owner-scoped. _read_accounts here is deliberately unscoped (it also
+            # backs the by_id lookups), so without this filter the candidate list
+            # spans BOTH tenants: since Algo/Algo2 joined, a Jigar order whose
+            # mirror was never recorded could select Algo2 and size a trade on
+            # another owner's account from Jigar's balance. Nothing like that has
+            # been written — 0 of the last 1,000 trade_copies rows cross owners,
+            # because this fallback only fires when nothing was mirrored at all —
+            # but that is luck rather than a guard.
             mapping = {a["id"]: None for a in (accounts or [])
                        if a.get("id") and not a.get("is_master")
-                       and a.get("status") == "active"}
+                       and a.get("status") == "active"
+                       and (not _oid or a.get("owner_id") == _oid)}
             if not mapping:
                 return
             logger.info(
@@ -1219,6 +1228,16 @@ class CopyEngine:
             fid = follower_id.decode() if isinstance(follower_id, bytes) else str(follower_id)
             follower = by_id.get(fid)
             if not follower or follower.get("status") != "active":
+                continue
+            # Belt and braces on the owner: by_id spans every tenant, and a
+            # redis ordermap entry is the other way a follower id reaches this
+            # loop. Sizing another owner's account from this master's balance
+            # must be impossible by construction, not by which path got here.
+            if _oid and follower.get("owner_id") != _oid:
+                logger.warning(
+                    f"confirm-copy: follower {follower.get('name')} belongs to a "
+                    f"different owner than master order {master_order_id} — skipping"
+                )
                 continue
             follower = dict(follower)          # per-follower, never shared
             follower["master_balance"] = _mbal
