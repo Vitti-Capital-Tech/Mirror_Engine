@@ -112,6 +112,14 @@ async def lifespan(app: FastAPI):
     position_poller_task = asyncio.create_task(position_poller())
     logger.info("Background live position poller started.")
 
+    # 7b. Backstop for copy legs the fill stream never closed out. A cancelled
+    #     order never fills, so no event is ever coming, and a fill that lands
+    #     during a restart or a dropped WS finds nothing listening — those legs
+    #     sat at 'pending' with a NULL quantity forever (503 of the newest 1,000
+    #     rows, back to 25 Sep), which is what made the dashboard read ~36%
+    #     success for trades that had actually filled.
+    sweeper_task = asyncio.create_task(oh.pending_leg_sweeper(db, connection_manager))
+
     # 8. Daily master-vs-follower fill match report to Telegram. Idempotent per
     #    IST day via a Redis marker, so the deploy-time restarts don't re-send it.
     if settings.DAILY_REPORT_ENABLED:
@@ -151,6 +159,12 @@ async def lifespan(app: FastAPI):
             await daily_report_task
         except asyncio.CancelledError:
             pass
+
+    sweeper_task.cancel()
+    try:
+        await sweeper_task
+    except asyncio.CancelledError:
+        pass
 
     await listener_manager.stop_all()
     await connection_manager.disconnect_all()
