@@ -18,7 +18,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (loading) return;
     if (!isAuthenticated && !isPublic) router.replace('/login');
-    if (isAuthenticated && isPublic) router.replace(user?.role === 'admin' ? '/admin' : '/positions');
+    // Everyone lands on /positions. The admin used to be sent to /admin, which
+    // is the one console its own nav no longer links to.
+    if (isAuthenticated && isPublic) router.replace('/positions');
   }, [loading, isAuthenticated, isPublic, pathname, router, user]);
 
   // Public pages (login/signup) render without the app chrome.

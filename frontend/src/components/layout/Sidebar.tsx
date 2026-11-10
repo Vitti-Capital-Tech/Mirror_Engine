@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, Wallet, GitCompareArrows } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, GitCompareArrows } from 'lucide-react';
 // (Activity reused for admin Positions)
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
@@ -20,16 +20,20 @@ export function Sidebar() {
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
   ];
 
-  const adminLinks = [
-    { href: '/admin', label: 'Positions', icon: Activity },
-    { href: '/admin/users', label: 'Users', icon: Users },
-    { href: '/admin/accounts', label: 'All Accounts', icon: Wallet },
-    { href: '/admin/trades', label: 'Trades Log', icon: FileText },
-    { href: '/admin/comparison', label: 'Comparison', icon: GitCompareArrows },
-    { href: '/admin/alerts', label: 'Alert Feed', icon: Bell },
-  ];
-
-  const links = isAdmin ? adminLinks : traderLinks;
+  // ONE nav for everyone, and it is the trader's.
+  //
+  // The admin nav used to replace it entirely, which quietly cost the admin
+  // every control that matters. /admin/accounts can only promote an account to
+  // master; adding one, setting its allocated balance, allocation mode, value or
+  // max position size, pausing, resuming, testing the connection and deleting
+  // all live on /accounts — and the admin nav had no link to it. So the one
+  // account with full rights was the one that could not manage anything, and
+  // accounts had to be added straight into the database instead.
+  //
+  // The admin-only pages still exist and still work if you navigate to them;
+  // they are just not the default any more. With a single tenant they were
+  // cross-tenant views of one tenant.
+  const links = traderLinks;
 
   return (
     <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border hidden lg:flex flex-col h-full select-none transition-all duration-300 ${

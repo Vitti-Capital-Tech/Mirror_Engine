@@ -2,14 +2,10 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Users, Activity, FileText, Bell, Wallet, GitCompareArrows } from 'lucide-react';
-import { useAuth } from '@/context/AuthContext';
+import { Users, Activity, FileText, Bell, GitCompareArrows } from 'lucide-react';
 
 export function MobileNav() {
   const pathname = usePathname();
-  const { user } = useAuth();
-  const isAdmin = user?.role === 'admin';
-
   const traderLinks = [
     { href: '/positions', label: 'Positions', icon: Activity },
     { href: '/accounts', label: 'Accounts', icon: Users },
@@ -17,15 +13,7 @@ export function MobileNav() {
     { href: '/comparison', label: 'Match', icon: GitCompareArrows },
     { href: '/alerts', label: 'Alerts', icon: Bell },
   ];
-  const adminLinks = [
-    { href: '/admin', label: 'Positions', icon: Activity },
-    { href: '/admin/users', label: 'Users', icon: Users },
-    { href: '/admin/accounts', label: 'Accounts', icon: Wallet },
-    { href: '/admin/trades', label: 'Trades', icon: FileText },
-    { href: '/admin/comparison', label: 'Match', icon: GitCompareArrows },
-    { href: '/admin/alerts', label: 'Alerts', icon: Bell },
-  ];
-  const links = isAdmin ? adminLinks : traderLinks;
+  const links = traderLinks;   // see Sidebar.tsx for why there is one nav
 
   return (
     <nav className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-bg-secondary/95 backdrop-blur-xl border-t border-bg-border flex items-stretch justify-around"
