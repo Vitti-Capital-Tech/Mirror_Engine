@@ -63,7 +63,7 @@ export default function Landing() {
               sized to the last contract, in real time, fully automated.
             </p>
             <div className="flex flex-wrap items-center gap-3 mt-8">
-              <Link href="/signup"
+              <Link href="/login"
                 className="group relative inline-flex items-center gap-2 py-3 px-6 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white text-sm font-semibold shadow-lg shadow-blue-600/25 transition-all overflow-hidden">
                 <span className="pointer-events-none absolute top-0 left-0 h-full w-1/3 bg-gradient-to-r from-transparent via-white/25 to-transparent -translate-x-full group-hover:translate-x-[400%] transition-transform duration-700" />
                 Get started <ArrowRight className="w-4 h-4" />
@@ -112,7 +112,7 @@ export default function Landing() {
             <h2 className="text-xl font-bold text-text-primary tracking-tight">Ready to mirror your trades?</h2>
             <p className="text-sm text-text-muted mt-1">Set up your master and followers in minutes.</p>
           </div>
-          <Link href="/signup"
+          <Link href="/login"
             className="inline-flex items-center gap-2 py-3 px-6 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white text-sm font-semibold shadow-lg shadow-blue-600/25 transition-all shrink-0">
             Get started <ArrowRight className="w-4 h-4" />
           </Link>

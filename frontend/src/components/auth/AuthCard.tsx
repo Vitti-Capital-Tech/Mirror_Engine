@@ -1,65 +1,19 @@
 'use client';
-import React, { useLayoutEffect, useRef, useState } from 'react';
+import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
-import { Field, PasswordField, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
-import { Mail, ShieldCheck, RefreshCw, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
+import { Field, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
+import { Mail, ShieldCheck, RefreshCw, ArrowRight, ArrowLeft } from 'lucide-react';
 
-type Mode = 'login' | 'signup';
-
-/** Flip-card auth: login on the front, signup on the back. Clicking "Create one"
- *  rolls to signup; signing up (or "Sign in") rolls back to login. */
-export function AuthCard({ initialMode = 'login' }: { initialMode?: Mode }) {
+/** The login card. There is no signup: typing an email that has never been
+ *  seen signs you in and creates the account on the spot, so a separate
+ *  "create account" form had nothing left to do. Option_Scope, which this login
+ *  was modelled on, has no signup route either. */
+export function AuthCard() {
   const router = useRouter();
   const { setSession } = useAuth();
-  const [mode, setMode] = useState<Mode>(initialMode);
-
-  const frontRef = useRef<HTMLDivElement>(null);
-  const backRef = useRef<HTMLDivElement>(null);
-  const [h, setH] = useState<number | undefined>(undefined);
-
-  // Keep the flip container height matched to whichever face is showing,
-  // and re-measure whenever that face grows/shrinks (errors, step change).
-  useLayoutEffect(() => {
-    const el = (mode === 'login' ? frontRef : backRef).current;
-    if (!el) return;
-    const measure = () => setH(el.offsetHeight);
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [mode]);
-
-  const goSignup = () => { setMode('signup'); window.history.replaceState(null, '', '/signup'); };
-  const goLogin = () => { setMode('login'); window.history.replaceState(null, '', '/login'); };
-
-  return (
-    <div style={{ perspective: '1600px' }}>
-      <div
-        className="relative"
-        style={{
-          transformStyle: 'preserve-3d',
-          transition: 'transform 0.7s cubic-bezier(0.4, 0, 0.2, 1), height 0.5s cubic-bezier(0.4, 0, 0.2, 1)',
-          transform: mode === 'signup' ? 'rotateY(-180deg)' : 'rotateY(0deg)',
-          height: h,
-        }}
-      >
-        {/* Front — Login */}
-        <div ref={frontRef} style={{ backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden' }} className="w-full">
-          <LoginForm onSwitch={goSignup} setSession={setSession} router={router} active={mode === 'login'} />
-        </div>
-        {/* Back — Signup */}
-        <div
-          ref={backRef}
-          style={{ backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', transform: 'rotateY(180deg)', position: 'absolute', inset: 0 }}
-          className="w-full"
-        >
-          <SignupForm onSwitch={goLogin} onDone={goLogin} active={mode === 'signup'} />
-        </div>
-      </div>
-    </div>
-  );
+  return <LoginForm setSession={setSession} router={router} active />;
 }
 
 async function finishLogin(router: any, setSession: any, token: string, refreshToken?: string) {
@@ -74,7 +28,7 @@ async function finishLogin(router: any, setSession: any, token: string, refreshT
   router.replace(me?.role === 'admin' ? '/admin' : '/positions');
 }
 
-function LoginForm({ onSwitch, setSession, router, active }: any) {
+function LoginForm({ setSession, router, active }: any) {
   const [step, setStep] = useState<'creds' | 'otp'>('creds');
   const [email, setEmail] = useState('');
   const [pendingId, setPendingId] = useState('');
@@ -131,10 +85,6 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
               {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Sign in <ArrowRight className="w-4 h-4" /></>}
             </SubmitButton>
           </form>
-          <p className="text-xs text-text-muted mt-6 text-center">
-            No account?{' '}
-            <button type="button" onClick={onSwitch} tabIndex={active ? 0 : -1} className="text-blue-400 font-semibold hover:text-blue-300 transition-colors">Create one</button>
-          </p>
         </>
       ) : (
         <>
@@ -158,63 +108,6 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
             </button>
             <button onClick={resend} disabled={busy} className="text-blue-400 font-semibold hover:text-blue-300 disabled:opacity-50 transition-colors">Resend code</button>
           </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function SignupForm({ onSwitch, onDone, active }: any) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirm, setConfirm] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState(false);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    if (password.length < 6) { setError('Password must be at least 6 characters.'); return; }
-    if (password !== confirm) { setError('Passwords do not match.'); return; }
-    setBusy(true);
-    try {
-      await api.auth.signup(email, password);
-      setDone(true);
-      setTimeout(() => { onDone(); setTimeout(() => setDone(false), 700); }, 1300);
-    } catch (err: any) { setError(err.message || 'Signup failed'); } finally { setBusy(false); }
-  };
-
-  return (
-    <div className="card-premium p-8" aria-hidden={!active}>
-      {done ? (
-        <div className="text-center py-8">
-          <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-emerald-500/10 ring-1 ring-emerald-500/20 mb-4 mx-auto glow-green">
-            <CheckCircle className="w-7 h-7 text-emerald-400" />
-          </div>
-          <h1 className="text-lg font-bold text-text-primary tracking-tight">Account created</h1>
-          <p className="text-xs text-text-muted mt-1.5">Taking you to sign in…</p>
-        </div>
-      ) : (
-        <>
-          <h1 className="text-xl font-bold text-text-primary tracking-tight">Create your account</h1>
-          <p className="text-xs text-text-muted mt-1.5 mb-6">Start mirroring trades in minutes.</p>
-          <form onSubmit={submit} className="space-y-3">
-            <Field icon={<Mail className="w-4 h-4" />}>
-              <input type="email" required={active} placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} tabIndex={active ? 0 : -1}
-                className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
-            </Field>
-            <PasswordField value={password} onChange={setPassword} required={active} />
-            <PasswordField value={confirm} onChange={setConfirm} placeholder="Confirm password" required={active} />
-            <ErrorBanner message={error} />
-            <SubmitButton busy={busy}>
-              {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Create account <ArrowRight className="w-4 h-4" /></>}
-            </SubmitButton>
-          </form>
-          <p className="text-xs text-text-muted mt-6 text-center">
-            Already have an account?{' '}
-            <button type="button" onClick={onSwitch} tabIndex={active ? 0 : -1} className="text-blue-400 font-semibold hover:text-blue-300 transition-colors">Sign in</button>
-          </p>
         </>
       )}
     </div>
