@@ -57,20 +57,60 @@ def telegram_enabled() -> bool:
     return bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
 
 
+# A Telegram group that gets upgraded to a SUPERGROUP changes its chat id, and
+# every send to the old one fails with 400 "group chat was upgraded to a
+# supergroup chat". It is a silent killer: the engine thinks it alerted, the
+# failure is a WARNING nobody reads, and the desk simply stops hearing from it.
+#
+# Exactly that happened on 2026-11-11 — the two reconciler corrections at
+# 03:16:24 and 03:16:25 both bounced, which is why nobody was told the follower
+# had been left holding unprotected positions.
+#
+# Telegram hands back the new id in parameters.migrate_to_chat_id, so follow it
+# and remember it for the rest of the process. The .env should still be updated
+# (this is lost on restart), and the log says so loudly enough to notice.
+_migrated_chat_id = None
+
+
+def _chat_id():
+    return _migrated_chat_id or settings.TELEGRAM_CHAT_ID
+
+
 async def send_message(text: str) -> bool:
     """Send a plain-text message to the configured Telegram chat. Best-effort."""
     if not telegram_enabled():
         return False
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
+
+    async def _post(chat_id):
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.post(url, json={
-                "chat_id": settings.TELEGRAM_CHAT_ID,
+            return await c.post(url, json={
+                "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             })
+
+    try:
+        r = await _post(_chat_id())
         if r.status_code >= 400:
+            # Follow a supergroup migration once, then retry this same message.
+            new_id = None
+            try:
+                new_id = ((r.json() or {}).get("parameters") or {}).get("migrate_to_chat_id")
+            except Exception:
+                pass
+            if new_id:
+                global _migrated_chat_id
+                _migrated_chat_id = new_id
+                logger.error(
+                    "Telegram chat was upgraded to a supergroup. Now sending to %s "
+                    "— UPDATE TELEGRAM_CHAT_ID in .env, this is only remembered "
+                    "until the next restart.", new_id,
+                )
+                r = await _post(new_id)
+                if r.status_code < 400:
+                    return True
             logger.warning("Telegram send failed %s: %s", r.status_code, r.text[:200])
             return False
         return True
