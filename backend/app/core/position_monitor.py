@@ -6,6 +6,9 @@ from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core import order_ledger as ledger
 from app.core.account_cache import account_cache
+from app.services import telegram_client as tg
+import asyncio
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,10 @@ class PositionMonitor:
         self.db = db_client
         self.socket_manager = socket_mgr
         self.risk_engine = RiskEngine()
+        # (account_id, symbol) -> when we first saw a follower position with no
+        # master row behind it. See the "no master row" branch in
+        # check_sync_and_alert for why this is timed rather than immediate.
+        self._orphan_since: dict = {}
         # Set at startup. Needed to read the master's high-water size per symbol —
         # without it this monitor alerts on gaps the copy engine is deliberately
         # maintaining. See check_sync_and_alert.
@@ -232,7 +239,27 @@ class PositionMonitor:
             # "expected size = 0" mismatch for a follower that is actually synced.
             master_pos_res = self.db.table("positions").select("*").eq("account_id", master_id).eq("symbol", symbol).execute()
             if not master_pos_res.data:
+                # THE BLIND SPOT. A closed symbol has its position row DELETED,
+                # not zeroed — verified on the live table, which holds no rows at
+                # quantity 0. So "no master row" is indistinguishable from "the
+                # master is flat", and returning unknown means the check goes
+                # quiet in exactly the situation where the follower is most
+                # exposed: still holding a position the master has fully exited.
+                #
+                # On 2026-11-11 that is why NOTHING alerted between 03:05 and
+                # 03:25 while the follower held C-BTC-74000 and C-BTC-75000 with
+                # its TP/SL already cancelled.
+                #
+                # Still returns "unknown" — the sizing logic genuinely cannot
+                # compute a target here, and flipping this to a mismatch would
+                # raise false alarms on options, whose positions REST cannot read
+                # (Delta's endpoint 400s) and whose WS snapshot can be briefly
+                # empty. Instead it is TIMED: a snapshot gap clears in seconds, a
+                # real orphan does not. Only a position that outlives
+                # _ORPHAN_ALERT_SEC with no master row behind it is called out.
+                await self._maybe_alert_orphan(account_id, account_name, symbol, follower_qty)
                 return "unknown"
+            self._orphan_since.pop((account_id, symbol), None)
             master_qty = float(master_pos_res.data[0]["quantity"])
 
             # Copied because master_balance is injected below for the sizing call,
@@ -339,6 +366,46 @@ class PositionMonitor:
         except Exception as e:
             logger.error(f"Error checking position sync: {e}")
             return "unknown"
+
+    # How long a follower may hold a position with no master row behind it
+    # before it is called out. Long enough that a WS snapshot gap or a REST blip
+    # clears on its own; short enough to beat the reconciler's own cleanup, so
+    # the alert tells you something is wrong rather than confirming it is fixed.
+    _ORPHAN_ALERT_SEC = 45.0
+
+    async def _maybe_alert_orphan(self, account_id, account_name, symbol, follower_qty):
+        """Warn when a follower is holding a position the master no longer has.
+
+        This is the one the 2026-11-11 incident needed. The follower held
+        C-BTC-74000 and C-BTC-75000 after the master had closed both, with its
+        TP/SL already cancelled — cancels match by order id, so that half of the
+        copy worked while the close did not — and for 4.5 minutes nothing said a
+        word. The only Telegram messages the whole incident produced were the
+        reconciler's, after the fact.
+
+        Says the two things that matter in one line: the position is unmatched,
+        and it has no protection behind it.
+        """
+        key = (account_id, symbol)
+        if not follower_qty:
+            self._orphan_since.pop(key, None)
+            return
+        first = self._orphan_since.get(key)
+        now = time.time()
+        if first is None:
+            self._orphan_since[key] = now
+            return
+        if now - first < self._ORPHAN_ALERT_SEC:
+            return
+        try:
+            await tg.notify_fail(
+                account_name, symbol, "hold", abs(follower_qty),
+                "master has exited this symbol but the follower still holds it — "
+                "its TP/SL are gone too, so this position is unmatched AND unprotected",
+                key=f"orphan:{account_id}:{symbol}",
+            )
+        except Exception as e:
+            logger.warning("orphan alert failed for %s %s: %s", account_name, symbol, e)
 
     async def _resolve_mismatch_alert(self, account_id: str, symbol: str,
                                       owner_id: Optional[str] = None) -> None:
