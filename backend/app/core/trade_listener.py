@@ -6,6 +6,8 @@ from typing import Optional
 from app.services.delta_client import DeltaClient
 from app.models.trade import TradeEvent, TradeSide, TradeType
 from app.core.order_ledger import master_filled_key
+from app.core.account_cache import account_cache
+from app.database import db
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +152,48 @@ class TradeListener:
             return
         payload = {
             "action": "reconcile_positions",
-            "owner_id": (self.master_account or {}).get("owner_id"),
+            "owner_id": self._owner_id(),
             "positions": positions,
         }
         await self.redis.lpush("order_events", json.dumps(payload))
+
+    def _owner_id(self):
+        """The master's CURRENT owner — never the one captured at startup.
+
+        self.master_account is a snapshot taken in start(), and every event used
+        to stamp its owner_id straight from that dict. copy_engine scopes the
+        follower lookup by the event's owner_id, so the instant an account
+        changed hands the running listener went on stamping the PREVIOUS owner
+        and the engine found nobody to copy to.
+
+        That is not hypothetical. On 2026-11-11 both accounts were transferred
+        from admin@vitti.capital to shahkajal991@gmail.com while the engine was
+        running. For the next ~25 minutes every sizing call logged "master
+        balance read as 0" (391 times), and when the master closed C-BTC-74000
+        and C-BTC-75000 at 03:11:54 and 03:11:58 the engine answered:
+
+            No active follower accounts found.
+
+        Neither close was mirrored. The 10s position reconciler caught both, but
+        only after ~4.5 minutes of the follower holding positions the master had
+        already exited. It stopped the moment an unrelated deploy restarted the
+        process and the snapshot was rebuilt — which is exactly the problem: it
+        self-healed by accident, not by design.
+
+        Looked up by the account's ID, which does not change, through the 3s
+        account cache — so an ownership change takes effect within 3 seconds
+        with no restart. Falls back to the snapshot if the row cannot be read,
+        because a transient DB failure must not stop events being stamped.
+        """
+        master_id = (self.master_account or {}).get("id")
+        if master_id:
+            try:
+                row = account_cache.get(db, master_id)
+                if row and row.get("owner_id"):
+                    return row["owner_id"]
+            except Exception as e:
+                logger.warning("Could not refresh master owner: %s", e)
+        return (self.master_account or {}).get("owner_id")
 
     async def _reconcile_orders(self) -> None:
         if not self.client or not self.master_account:
@@ -223,7 +263,7 @@ class TradeListener:
         if master_symbols:
             payload = {
                 "action": "sync_protection",
-                "owner_id": (self.master_account or {}).get("owner_id"),
+                "owner_id": self._owner_id(),
                 "master_protection": master_protection,
                 "master_symbols": master_symbols,
             }
@@ -352,7 +392,7 @@ class TradeListener:
         )
         logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
         payload = trade_event.dict()
-        payload["owner_id"] = (self.master_account or {}).get("owner_id")
+        payload["owner_id"] = self._owner_id()
         payload["ts"] = time.time()  # detection time, for latency measurement
         await self.redis.lpush("trade_events", json.dumps(payload))
 
@@ -404,7 +444,7 @@ class TradeListener:
             # manual cancel, but never strip protection just because the master's
             # leg went away. See _mirror_cancel.
             "reason": order.get("reason"),
-            "owner_id": (self.master_account or {}).get("owner_id"),
+            "owner_id": self._owner_id(),
             "ts": time.time(),  # detection time, for latency measurement
         }
         logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")
