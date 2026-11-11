@@ -324,8 +324,33 @@ class CopyEngine:
         master_balance = self._master_balance_or_last(master_balance, master_row)
 
         if not followers:
-            logger.info("No active follower accounts found.")
-            self.db.table("trades").update({"status": "copied"}).eq("id", trade_uuid).execute()
+            # A MASTER FILL THAT REACHED NOBODY. This used to log at INFO and mark
+            # the trade "copied" — recording a successful copy of something that
+            # was never copied, and telling no one.
+            #
+            # 2026-11-11: both accounts were transferred to a new owner while the
+            # engine was running, so the owner-scoped follower lookup came back
+            # empty. The master closed C-BTC-74000 and C-BTC-75000 at 03:11:54 and
+            # 03:11:58; this branch ran twice, said nothing, and the follower sat
+            # holding both positions — with its TP/SL already cancelled — until
+            # the reconciler caught it 4.5 minutes later. The only Telegram
+            # messages sent all incident were the reconciler's own, AFTER the
+            # fact.
+            #
+            # Nothing being copied is the most serious thing that can happen here,
+            # so it is an ERROR, it alerts, and the trade is NOT recorded as
+            # copied. Deduped per owner: a deliberately paused desk should say so
+            # once, not once per fill.
+            logger.error(
+                "No active follower accounts found — %s %s %s was NOT copied to anyone.",
+                side, quantity, symbol,
+            )
+            asyncio.create_task(tg.notify_fail(
+                "all followers", symbol, side, quantity,
+                "no active follower account was found — this trade was NOT copied",
+                key=f"nofollower:{owner_id or 'unscoped'}",
+            ))
+            self.db.table("trades").update({"status": "failed"}).eq("id", trade_uuid).execute()
             
             # Emit completed trade with no copies
             await self.socket_manager.emit_trade_copy({
