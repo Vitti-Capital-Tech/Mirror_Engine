@@ -68,6 +68,14 @@ class AccountResponse(BaseModel):
     today_pnl: float
     created_at: datetime
     updated_at: datetime
+    # Who owns this account. Declared here because response_model silently drops
+    # anything it does not know about: without it the dashboard could not tell
+    # one tenant's accounts from another's and grouped them all together, which
+    # looked correct only for as long as there was a single owner.
+    owner_id: Optional[str] = None
+    # Filled in for ADMIN callers only (api/accounts.py). A uuid is not a label;
+    # this is what lets the UI head a group with the person it belongs to.
+    owner_email: Optional[str] = None
 
     class Config:
         from_attributes = True

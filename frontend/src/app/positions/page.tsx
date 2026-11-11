@@ -3,7 +3,9 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByOwner, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAuth } from '@/context/AuthContext';
+import { OwnerGroup } from '@/components/positions/OwnerGroup';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
@@ -14,6 +16,7 @@ export default function PositionsPage() {
   const queryClient = useQueryClient();
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
   const { scope } = useAccountScope();
+  const { user } = useAuth();
   const { isLoading: positionsLoading } = usePositions();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
@@ -70,6 +73,38 @@ export default function PositionsPage() {
         const followerAccts = visible.filter((a: any) => !a.is_master);
 
         const renderCard = (acc: any) => <AccountPositionCard key={acc.id} acc={acc} />;
+
+        // An admin looking at everything needs to see WHOSE accounts these are.
+        // Flat "Master / Followers" headings read as one desk, which is exactly
+        // the confusion: it looks like you are signed in as a single user. So
+        // group by owner, each card headed by the person, master and followers
+        // together inside. Done even for a single owner — naming them is the
+        // point, not just separating them.
+        const isAdmin = user?.role === 'admin';
+        if (isAdmin && scope === ALL_ACCOUNTS && visible.length > 0) {
+          const groups = groupByOwner(visible as any[]);
+          return (
+            <div className="space-y-5">
+              {groups.map((g) => (
+                <OwnerGroup
+                  key={g.ownerId}
+                  email={(g.master as any)?.owner_email
+                    ?? (g.followers[0] as any)?.owner_email}
+                  master={g.master}
+                  followers={g.followers}
+                >
+                  {g.master && renderCard(g.master)}
+                  {g.followers.map(renderCard)}
+                  {!g.master && (
+                    <div className="card-premium py-5 text-center text-text-muted text-xs">
+                      No active master account for this owner.
+                    </div>
+                  )}
+                </OwnerGroup>
+              ))}
+            </div>
+          );
+        }
 
         return (
           <div className="space-y-10">

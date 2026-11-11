@@ -58,10 +58,30 @@ async def list_accounts(user: CurrentUser = Depends(get_current_user)):
     try:
         res = scope_owned(db.table("accounts").select("*"), user).order("created_at").execute()
         accounts = res.data or []
-        
+
         # Mask secrets (decrypts for accurate last-4 display)
         for acc in accounts:
             _mask_secrets(acc)
+
+        # An admin gets every tenant's accounts back, so the UI has to be able
+        # to say WHOSE each one is — otherwise several people's masters and
+        # followers render in one undifferentiated list and it reads as a single
+        # account set. owner_id is a uuid and means nothing on screen, so attach
+        # the email. One extra read, and only for admins: a normal user already
+        # knows the accounts are theirs.
+        if user.is_admin and accounts:
+            owner_ids = {a.get("owner_id") for a in accounts if a.get("owner_id")}
+            email_by_id = {}
+            if owner_ids:
+                try:
+                    profiles = (db.table("profiles").select("id, email")
+                                .in_("id", list(owner_ids)).execute().data) or []
+                    email_by_id = {p["id"]: p.get("email") for p in profiles}
+                except Exception as e:
+                    # Labels only — never fail the account list over them.
+                    logger.warning("Could not resolve owner emails: %s", e)
+            for acc in accounts:
+                acc["owner_email"] = email_by_id.get(acc.get("owner_id"))
 
         return accounts
     except Exception as e:

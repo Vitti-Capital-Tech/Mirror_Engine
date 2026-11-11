@@ -2,6 +2,7 @@
 import React from 'react';
 import { ChevronDown, Check, Crown, CornerDownRight, Layers } from 'lucide-react';
 import { useAccounts } from '@/hooks/useAccounts';
+import { useAuth } from '@/context/AuthContext';
 import { useAccountScope, groupByOwner, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 
 /**
@@ -25,6 +26,7 @@ import { useAccountScope, groupByOwner, ALL_ACCOUNTS } from '@/context/AccountSc
  */
 export function AccountSwitcher() {
   const { data: accounts = [] } = useAccounts();
+  const { user } = useAuth();
   const { scope, setScope } = useAccountScope();
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
@@ -39,14 +41,19 @@ export function AccountSwitcher() {
 
   const groups = groupByOwner(accounts as any[]);
 
-  // ALWAYS shown once there is anything to show. An earlier cut hid this
-  // whenever there was only one group, reasoning there was nothing to switch
-  // between — but that meant an admin signing in with `trade` saw no account
-  // control at all and had no way to tell whose accounts were on screen. A
-  // control that appears only once a second tenant exists cannot be found or
-  // trusted. Option_Scope keeps its selector in the header permanently for the
-  // same reason: it is the label as much as the switch.
-  if (!accounts.length) return null;
+  // ADMIN ONLY. A normal user is scoped to their own accounts by the backend,
+  // so there is exactly one group and the control can only ever be a no-op —
+  // offering it implies there is something else to see and invites the question
+  // "whose accounts are the others?".
+  //
+  // For an admin it is ALWAYS shown once there is anything to show. An earlier
+  // cut hid it whenever there was a single group, reasoning there was nothing
+  // to switch between — but that left an admin with no account control at all
+  // and no way to tell whose accounts were on screen. A control that appears
+  // only once a second tenant exists cannot be found or trusted. Option_Scope
+  // keeps its selector in the header permanently for the same reason: it is the
+  // label as much as the switch.
+  if (user?.role !== 'admin' || !accounts.length) return null;
 
   const selected = groups.find((g) => g.ownerId === scope);
   const label = selected ? selected.label : 'All accounts';

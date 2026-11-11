@@ -35,25 +35,15 @@ export function Sidebar() {
   // cross-tenant views of one tenant.
   const links = traderLinks;
 
-  // ...and the admin gets EXTRA entries underneath, never a replacement set.
-  // That distinction is the whole point: swapping the list out is what left the
-  // one account with full rights unable to add or edit an account at all.
+  // No admin-only nav entries. /admin/users was tried and removed: an admin is
+  // exempt from scope_owned(), so every normal page already shows every
+  // tenant's data, and the one thing it added — changing roles — is not part of
+  // running the desk day to day. The admin difference is WHAT the normal pages
+  // show (all tenants, grouped by owner), not a separate set of pages.
   //
-  // Only genuinely admin-only pages belong here. An admin is exempt from
-  // scope_owned(), so /positions, /trades, /comparison and /alerts already show
-  // every tenant's data — /admin/trades and /admin/alerts are the same views
-  // with a different route, and /admin/accounts can only promote, which
-  // /accounts does too. Listing those again would rebuild the confusion that
-  // collapsing the two navs just removed.
-  //
-  // Role management is the exception: nothing in the trader nav can change who
-  // is an admin. It was dropped when there was one tenant and nothing to
-  // manage; there are two now — the trading accounts were handed to
-  // shahkajal991@gmail.com and admin@vitti.capital keeps oversight — so it
-  // means something again.
-  const adminLinks = isAdmin
-    ? [{ href: '/admin/users', label: 'Users & Roles', icon: Shield }]
-    : [];
+  // If an admin-only entry is ever added back it must EXTEND this list, never
+  // replace it: replacing is what 2accb20 had to undo, because it left the one
+  // account with full rights unable to add or edit an account at all.
 
   return (
     <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border hidden lg:flex flex-col h-full select-none transition-all duration-300 ${
@@ -96,7 +86,7 @@ export function Sidebar() {
 
       {/* Nav links */}
       <nav className={`flex-1 ${isCollapsed ? 'px-2 pt-6' : 'px-4 pt-6'} space-y-1`}>
-        {[...links, ...adminLinks].map((link) => {
+        {links.map((link) => {
           const Icon = link.icon;
           const isActive = pathname === link.href;
           return (
