@@ -23,6 +23,17 @@ class Settings(BaseSettings):
     OTP_TTL_SECONDS: int = 300
     OTP_MAX_ATTEMPTS: int = 5
 
+    # Passwordless login: an email on its own signs you in, creating the account
+    # on first sight. The password is derived server-side from the email (see
+    # api/auth.py _derived_password) so the formula never reaches the browser.
+    #
+    # PASSWORDLESS_SECRET keys that derivation. Pin it once and leave it alone:
+    # changing it locks out every passwordless user until their password is
+    # reset, the same way changing ENCRYPTION_KEY orphans the stored API keys.
+    # Blank falls back to ENCRYPTION_KEY, which is already pinned.
+    PASSWORDLESS_LOGIN: bool = False
+    PASSWORDLESS_SECRET: str = ""
+
     # Encryption at rest for Delta API keys/secrets.
     # If unset, a stable key is derived from SUPABASE_SERVICE_KEY (see crypto.py).
     ENCRYPTION_KEY: str = ""

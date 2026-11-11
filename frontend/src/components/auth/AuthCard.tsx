@@ -78,7 +78,6 @@ async function finishLogin(router: any, setSession: any, token: string, refreshT
 function LoginForm({ onSwitch, setSession, router, active }: any) {
   const [step, setStep] = useState<'creds' | 'otp'>('creds');
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [pendingId, setPendingId] = useState('');
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
@@ -88,13 +87,16 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
     e.preventDefault();
     setError(''); setBusy(true);
     try {
-      const res = await api.auth.login(email, password);
+      // No password field on this form at all: the email is the whole login.
+      // The backend treats a blank password as "passwordless" and signs the
+      // user in, creating the account the first time it sees the address.
+      const res = await api.auth.login(email, '');
       if (res.twofa_required) { setPendingId(res.pending_id); setStep('otp'); }
       else { await finishLogin(router, setSession, res.access_token, res.refresh_token); }
     } catch (err: any) {
       const msg = err.message || 'Login failed';
       setError(/invalid email or password/i.test(msg)
-        ? "We couldn't sign you in — check your email and password, or create an account if you don't have one yet."
+        ? "We couldn't sign you in — check the email address and try again."
         : msg);
     } finally { setBusy(false); }
   };
@@ -118,14 +120,14 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
       {step === 'creds' ? (
         <>
           <h1 className="text-xl font-bold text-text-primary tracking-tight">Welcome back</h1>
-          <p className="text-xs text-text-muted mt-1.5 mb-6">Sign in to your Mirror Engine account.</p>
+          <p className="text-xs text-text-muted mt-1.5 mb-6">Enter your email to sign in.</p>
           <GoogleButton />
           <form onSubmit={submitCreds} className="space-y-3">
             <Field icon={<Mail className="w-4 h-4" />}>
               <input type="text" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} tabIndex={active ? 0 : -1}
+                autoComplete="email" autoFocus={active}
                 className="w-full bg-transparent outline-none text-sm text-text-primary placeholder:text-text-muted" />
             </Field>
-            <PasswordField value={password} onChange={setPassword} />
             <ErrorBanner message={error} />
             <SubmitButton busy={busy}>
               {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <>Sign in <ArrowRight className="w-4 h-4" /></>}
