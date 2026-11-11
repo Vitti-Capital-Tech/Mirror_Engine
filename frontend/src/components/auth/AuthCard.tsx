@@ -3,7 +3,6 @@ import React, { useLayoutEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
-import { GoogleButton } from '@/components/auth/GoogleButton';
 import { Field, PasswordField, SubmitButton, ErrorBanner } from '@/components/auth/AuthShell';
 import { Mail, ShieldCheck, RefreshCw, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
 
@@ -121,7 +120,6 @@ function LoginForm({ onSwitch, setSession, router, active }: any) {
         <>
           <h1 className="text-xl font-bold text-text-primary tracking-tight">Welcome back</h1>
           <p className="text-xs text-text-muted mt-1.5 mb-6">Enter your email to sign in.</p>
-          <GoogleButton />
           <form onSubmit={submitCreds} className="space-y-3">
             <Field icon={<Mail className="w-4 h-4" />}>
               <input type="text" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} tabIndex={active ? 0 : -1}
@@ -201,7 +199,6 @@ function SignupForm({ onSwitch, onDone, active }: any) {
         <>
           <h1 className="text-xl font-bold text-text-primary tracking-tight">Create your account</h1>
           <p className="text-xs text-text-muted mt-1.5 mb-6">Start mirroring trades in minutes.</p>
-          <GoogleButton />
           <form onSubmit={submit} className="space-y-3">
             <Field icon={<Mail className="w-4 h-4" />}>
               <input type="email" required={active} placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} tabIndex={active ? 0 : -1}
