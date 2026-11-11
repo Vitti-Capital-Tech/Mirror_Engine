@@ -3,6 +3,7 @@ import { Inter } from 'next/font/google';
 import './globals.css';
 import { AppShell } from '@/components/layout/AppShell';
 import { AuthProvider } from '@/context/AuthContext';
+import { AccountScopeProvider } from '@/context/AccountScopeContext';
 import Providers from './providers';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -37,7 +38,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={inter.className}>
         <Providers>
           <AuthProvider>
-            <AppShell>{children}</AppShell>
+            <AccountScopeProvider>
+              <AppShell>{children}</AppShell>
+            </AccountScopeProvider>
           </AuthProvider>
         </Providers>
       </body>

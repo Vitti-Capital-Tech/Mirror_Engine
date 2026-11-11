@@ -6,6 +6,7 @@ import { Bell, Sun, Moon, AlertTriangle, ShieldAlert, Info, CheckCircle, ArrowRi
 import Link from 'next/link';
 import { useSocket } from '@/hooks/useSocket';
 import { useAuth } from '@/context/AuthContext';
+import { AccountSwitcher } from '@/components/layout/AccountSwitcher';
 
 function relTime(iso: string): string {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -222,6 +223,9 @@ export function TopBar() {
           )}
         </div>
 
+        {/* Which account the dashboard is showing */}
+        <AccountSwitcher />
+
         {/* User + logout */}
         <div className="flex items-center gap-2 pl-1.5 ml-0.5 border-l border-bg-border">
           {user?.email && (
@@ -230,6 +234,13 @@ export function TopBar() {
                 {user.email.charAt(0).toUpperCase()}
               </span>
               <span className="text-[11px] font-medium text-text-secondary max-w-[140px] truncate">{user.email}</span>
+              {/* Signing in with `trade` lands here — worth saying so plainly,
+                  because an admin is seeing every account, not just their own. */}
+              {user.role === 'admin' && (
+                <span className="text-[9px] font-bold tracking-wider text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-px">
+                  ADMIN
+                </span>
+              )}
             </span>
           )}
           <button

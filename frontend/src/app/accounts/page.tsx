@@ -1,13 +1,20 @@
 'use client';
 import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
+import { useAccountScope, applyScope } from '@/context/AccountScopeContext';
 import { AccountsTable } from '@/components/accounts/AccountsTable';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
 import { Plus } from 'lucide-react';
 
 export default function AccountsPage() {
-  const { data: accounts = [], isLoading } = useAccounts();
+  const { data: allAccounts = [], isLoading } = useAccounts();
+  // Admins get every account here (scope_owned exempts them), with the full
+  // set of controls — add, edit, pause, resume, test, promote, delete — on all
+  // of them regardless of who owns them. The header switcher narrows WHICH
+  // owner's accounts are listed; it never removes a control.
+  const { scope } = useAccountScope();
+  const accounts = applyScope(allAccounts as any[], scope);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
   const total = accounts.length;

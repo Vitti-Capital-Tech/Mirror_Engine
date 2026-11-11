@@ -35,6 +35,26 @@ export function Sidebar() {
   // cross-tenant views of one tenant.
   const links = traderLinks;
 
+  // ...and the admin gets EXTRA entries underneath, never a replacement set.
+  // That distinction is the whole point: swapping the list out is what left the
+  // one account with full rights unable to add or edit an account at all.
+  //
+  // Only genuinely admin-only pages belong here. An admin is exempt from
+  // scope_owned(), so /positions, /trades, /comparison and /alerts already show
+  // every tenant's data — /admin/trades and /admin/alerts are the same views
+  // with a different route, and /admin/accounts can only promote, which
+  // /accounts does too. Listing those again would rebuild the confusion that
+  // collapsing the two navs just removed.
+  //
+  // Role management is the exception: nothing in the trader nav can change who
+  // is an admin. It was dropped when there was one tenant and nothing to
+  // manage; there are two now — the trading accounts were handed to
+  // shahkajal991@gmail.com and admin@vitti.capital keeps oversight — so it
+  // means something again.
+  const adminLinks = isAdmin
+    ? [{ href: '/admin/users', label: 'Users & Roles', icon: Shield }]
+    : [];
+
   return (
     <aside className={`bg-bg-secondary/80 backdrop-blur-xl border-r border-bg-border hidden lg:flex flex-col h-full select-none transition-all duration-300 ${
       isCollapsed ? 'w-20' : 'w-64'
@@ -76,7 +96,7 @@ export function Sidebar() {
 
       {/* Nav links */}
       <nav className={`flex-1 ${isCollapsed ? 'px-2 pt-6' : 'px-4 pt-6'} space-y-1`}>
-        {links.map((link) => {
+        {[...links, ...adminLinks].map((link) => {
           const Icon = link.icon;
           const isActive = pathname === link.href;
           return (

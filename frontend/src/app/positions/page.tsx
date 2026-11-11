@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
+import { useAccountScope, applyScope } from '@/context/AccountScopeContext';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
@@ -12,6 +13,7 @@ import { AccountPositionCard } from '@/components/positions/AccountPositionCard'
 export default function PositionsPage() {
   const queryClient = useQueryClient();
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
+  const { scope } = useAccountScope();
   const { isLoading: positionsLoading } = usePositions();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
@@ -60,7 +62,10 @@ export default function PositionsPage() {
       {/* Grouped account cards: master on top, active followers below.
           Paused accounts are intentionally hidden from the positions view. */}
       {(accountsLoading || positionsLoading) && accounts.length === 0 ? <Loader label="Loading positions…" /> : (() => {
-        const visible = accounts.filter((a: any) => a.status !== 'paused');
+        // Paused accounts are intentionally hidden here; the TopBar switcher
+        // then narrows to one account when the user has picked one.
+        const visible = applyScope(
+          accounts.filter((a: any) => a.status !== 'paused'), scope);
         const masterAccts = visible.filter((a: any) => a.is_master);
         const followerAccts = visible.filter((a: any) => !a.is_master);
 
