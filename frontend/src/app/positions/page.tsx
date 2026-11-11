@@ -3,9 +3,9 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByOwner, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
-import { OwnerGroup } from '@/components/positions/OwnerGroup';
+import { OwnerGroup } from '@/components/shared/OwnerGroup';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
@@ -81,7 +81,7 @@ export default function PositionsPage() {
         // together inside. Done even for a single owner — naming them is the
         // point, not just separating them.
         const isAdmin = user?.role === 'admin';
-        if (isAdmin && scope === ALL_ACCOUNTS && visible.length > 0) {
+        if (isAdmin && effectiveScope(visible as any[], scope) === ALL_ACCOUNTS && visible.length > 0) {
           const groups = groupByOwner(visible as any[]);
           return (
             <div className="space-y-5">

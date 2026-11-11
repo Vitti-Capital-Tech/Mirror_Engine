@@ -34,6 +34,12 @@ class AccountCreate(BaseModel):
     allocated_balance: Optional[float] = Field(default=None, gt=0)
     max_position_size: Optional[float] = Field(default=None, gt=0)
     leverage_limit: int = Field(default=10, ge=1, le=200)
+    # ADMIN ONLY, and ignored from anyone else. An admin sees every tenant's
+    # accounts, so "add an account" is ambiguous: without this the new row was
+    # always stamped with the ADMIN's own id, which quietly put it in a group of
+    # its own with no master to mirror — a follower that could never copy
+    # anything. Omitted means "mine", which is what a normal user always gets.
+    owner_id: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):

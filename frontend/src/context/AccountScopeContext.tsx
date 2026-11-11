@@ -70,6 +70,25 @@ export function applyScope<T extends { owner_id?: string | null }>(
   return hit.length ? hit : accounts;
 }
 
+/**
+ * The scope actually in force.
+ *
+ * A stored scope can stop matching anything — the group was transferred away,
+ * its accounts were deleted, or (as happened here) the stored value predates a
+ * change in what a scope IS and is now an account id where an owner_id is
+ * expected. Everything must agree about that: applyScope already falls back to
+ * showing all accounts and the switcher already falls back to the "All
+ * accounts" label, so a page deciding whether to group had to reach the same
+ * answer or the header would read "All accounts" while the view quietly stayed
+ * ungrouped.
+ */
+export function effectiveScope<T extends { owner_id?: string | null }>(
+  accounts: T[], scope: string,
+): string {
+  if (!scope || scope === ALL_ACCOUNTS) return ALL_ACCOUNTS;
+  return accounts.some((a) => a.owner_id === scope) ? scope : ALL_ACCOUNTS;
+}
+
 /** Group accounts by owner: one entry per set of master + its followers. */
 export interface AccountGroup<T> {
   ownerId: string;

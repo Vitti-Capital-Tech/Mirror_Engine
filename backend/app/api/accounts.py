@@ -92,16 +92,30 @@ async def list_accounts(user: CurrentUser = Depends(get_current_user)):
 async def create_account(account_data: AccountCreate, user: CurrentUser = Depends(get_current_user)):
     """Create a new account owned by the caller, and connect WS if active."""
     try:
-        # One master per owner
+        # WHO the account belongs to. An admin sees every tenant, so "add an
+        # account" has to say whose — stamping the admin's own id (which is what
+        # this did unconditionally) dropped the new row into a group of its own
+        # with no master to mirror, i.e. a follower that could never copy. A
+        # non-admin cannot choose: it is always theirs.
+        target_owner = user.id
+        if user.is_admin and account_data.owner_id:
+            target_owner = account_data.owner_id
+            if not db.table("profiles").select("id").eq("id", target_owner).execute().data:
+                raise HTTPException(status_code=400, detail="That owner does not exist.")
+
+        # One master per owner — checked against the TARGET owner, not the
+        # caller, or an admin adding a master for someone else would be blocked
+        # by their own (or waved through onto a tenant that already has one).
         if account_data.is_master:
-            existing_master = db.table("accounts").select("id").eq("is_master", True).eq("owner_id", user.id).execute()
+            existing_master = db.table("accounts").select("id").eq("is_master", True).eq("owner_id", target_owner).execute()
             if existing_master.data:
-                raise HTTPException(status_code=400, detail="You already have a master account. Only one master per user is supported.")
+                raise HTTPException(status_code=400, detail="That owner already has a master account. Only one master per user is supported.")
 
         # Save to DB (stamped with owner; secrets encrypted at rest)
         from app.core.crypto import encrypt
         data = account_data.model_dump()
-        data["owner_id"] = user.id
+        data.pop("owner_id", None)
+        data["owner_id"] = target_owner
         if data.get("api_key"):
             data["api_key"] = encrypt(data["api_key"])
         if data.get("api_secret"):

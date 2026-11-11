@@ -3,11 +3,32 @@ import React, { useState } from 'react';
 import { useCreateAccount, useAccounts } from '@/hooks/useAccounts';
 import { X, Eye, EyeOff, ShieldCheck, RefreshCw } from 'lucide-react';
 import { Select } from '@/components/shared/Select';
+import { useAuth } from '@/context/AuthContext';
+import { useAccountScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 
 export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount();
   const { data: accounts = [] } = useAccounts();
-  const hasMaster = accounts.some((a: any) => a.is_master);
+  const { user } = useAuth();
+  const { scope } = useAccountScope();
+  const isAdmin = user?.role === 'admin';
+
+  // WHOSE account is being added. An admin sees every tenant, so without asking
+  // this the new row was stamped with the admin's own id — landing in a group
+  // of its own with no master to mirror, i.e. a follower that could never copy.
+  // Defaults to whichever group is currently in scope; on "All accounts" the
+  // admin has to say, because there is no sensible guess.
+  const groups = React.useMemo(() => groupByOwner(accounts as any[]), [accounts]);
+  const scoped = effectiveScope(accounts as any[], scope);
+  const [ownerId, setOwnerId] = useState<string>(
+    scoped !== ALL_ACCOUNTS ? scoped : (groups.length === 1 ? groups[0].ownerId : ''));
+
+  // "Is there already a master?" is a question about the TARGET owner, not
+  // about everything the admin can see — otherwise one tenant having a master
+  // hides the option for every other tenant.
+  const targetOwner = isAdmin ? ownerId : (groups[0]?.ownerId ?? '');
+  const hasMaster = accounts.some(
+    (a: any) => a.is_master && (!targetOwner || a.owner_id === targetOwner));
 
   // Form states
   const [name, setName] = useState('');
@@ -31,6 +52,13 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Without a holder the backend falls back to the caller — which for an
+    // admin means a brand-new group with no master, and a follower that silently
+    // never copies. Better to refuse than to create something inert.
+    if (isAdmin && !ownerId) {
+      setErrorMsg('Choose which account holder this belongs to.');
+      return;
+    }
     setIsSaving(true);
     setErrorMsg('');
 
@@ -42,6 +70,9 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
         is_master: isMaster,
         environment,
       };
+
+      // Only an admin may set this; the backend ignores it from anyone else.
+      if (isAdmin && ownerId) payload.owner_id = ownerId;
 
       if (leverageLimit) {
         payload.leverage_limit = parseInt(leverageLimit);
@@ -146,6 +177,33 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
               </button>
             </div>
           </div>
+
+          {/* Who it belongs to — admins only; everyone else has exactly one answer */}
+          {isAdmin && (
+            <div className="flex flex-col gap-1.5">
+              <label className="text-text-muted uppercase tracking-wider text-[10px]">
+                Add to which account holder
+              </label>
+              <Select
+                value={ownerId}
+                onChange={(v) => setOwnerId(v)}
+                options={[
+                  ...(ownerId ? [] : [{ value: '', label: 'Select an account holder…' }]),
+                  ...groups.map((g) => ({
+                    value: g.ownerId,
+                    label: `${(g.master as any)?.owner_email
+                      ?? (g.followers[0] as any)?.owner_email
+                      ?? g.label}  —  ${g.master ? g.master.name : 'no master'}`,
+                  })),
+                  { value: user?.id || '', label: `${user?.email || 'Me'} (admin) — new group` },
+                ]}
+              />
+              <span className="text-[10px] text-text-muted">
+                A follower copies the master of the holder you pick. Adding it under a
+                holder with no master means it will never copy anything.
+              </span>
+            </div>
+          )}
 
           {/* Role and Environment Toggles */}
           <div className="grid grid-cols-2 gap-4">

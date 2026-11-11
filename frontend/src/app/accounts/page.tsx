@@ -1,7 +1,9 @@
 'use client';
 import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAuth } from '@/context/AuthContext';
+import { OwnerGroup } from '@/components/shared/OwnerGroup';
 import { AccountsTable } from '@/components/accounts/AccountsTable';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
@@ -14,6 +16,7 @@ export default function AccountsPage() {
   // of them regardless of who owns them. The header switcher narrows WHICH
   // owner's accounts are listed; it never removes a control.
   const { scope } = useAccountScope();
+  const { user } = useAuth();
   const accounts = applyScope(allAccounts as any[], scope);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
@@ -50,8 +53,31 @@ export default function AccountsPage() {
         ))}
       </div>
 
-      {/* Accounts Table */}
-      {isLoading ? <Loader label="Loading accounts…" /> : <AccountsTable accounts={accounts} isLoading={false} />}
+      {/* Accounts table — one per owner when an admin is looking at everything.
+          A single flat table reads as one person's desk, which is exactly wrong
+          here: these accounts belong to different people and the controls on
+          them are destructive. Pausing or deleting the wrong account because
+          two tenants' rows sat under one "FOLLOWER ACCOUNTS" heading is a real
+          mistake to design out. */}
+      {isLoading ? <Loader label="Loading accounts…" /> : (
+        user?.role === 'admin' && effectiveScope(accounts, scope) === ALL_ACCOUNTS && accounts.length > 0 ? (
+          <div className="space-y-5">
+            {groupByOwner(accounts).map((g) => (
+              <OwnerGroup
+                key={g.ownerId}
+                email={(g.master as any)?.owner_email ?? (g.followers[0] as any)?.owner_email}
+                master={g.master}
+                followers={g.followers}
+              >
+                <AccountsTable
+                  accounts={[...(g.master ? [g.master] : []), ...g.followers]}
+                  isLoading={false}
+                />
+              </OwnerGroup>
+            ))}
+          </div>
+        ) : <AccountsTable accounts={accounts} isLoading={false} />
+      )}
 
       {/* Add Account Modal */}
       {isAddModalOpen && (
