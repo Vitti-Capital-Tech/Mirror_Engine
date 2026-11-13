@@ -41,6 +41,7 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [allocatedBalance, setAllocatedBalance] = useState<string>('');
   const [maxPositionSize, setMaxPositionSize] = useState<string>('');
   const [leverageLimit, setLeverageLimit] = useState<string>('');
+  const [tpSlOffset, setTpSlOffset] = useState<string>('');
 
   // UI States
   const [showKey, setShowKey] = useState(false);
@@ -76,6 +77,10 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
 
       if (leverageLimit) {
         payload.leverage_limit = parseInt(leverageLimit);
+      }
+      // Master only: how far this master's followers sit from its SL/TP.
+      if (isMaster && tpSlOffset) {
+        payload.tp_sl_offset = parseFloat(tpSlOffset);
       }
       if (allocatedBalance) {
         payload.allocated_balance = parseFloat(allocatedBalance);
@@ -250,6 +255,26 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
           </div>
 
           {/* Allocation Config (Follower only) */}
+          {/* Master only: the SL/TP spread for this master's copies */}
+          {isMaster && (
+            <div className="flex flex-col gap-1.5">
+              <label className="text-text-muted uppercase tracking-wider text-[10px]">
+                TP / SL offset — optional
+              </label>
+              <input
+                type="number" step="any" min="0" value={tpSlOffset}
+                onChange={(e) => setTpSlOffset(e.target.value)}
+                placeholder="Leave blank for the default spread"
+                className="bg-bg-primary border border-bg-border rounded-xl px-3.5 py-3 text-sm text-text-primary placeholder:text-text-muted outline-none focus:border-blue-500/70"
+              />
+              <span className="text-[10px] text-text-muted">
+                In price units. Copies straddle this master's stop — the 1st sits at
+                +offset, the 2nd at −offset — so they don't all trigger at the same
+                instant. Blank keeps the built-in spread.
+              </span>
+            </div>
+          )}
+
           {!isMaster && (
             <div className="border border-bg-border rounded-xl p-4 bg-bg-primary/45 space-y-3">
               <div className="text-[10px] text-blue-400 font-bold uppercase tracking-wider">

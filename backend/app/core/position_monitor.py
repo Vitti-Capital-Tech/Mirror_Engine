@@ -7,6 +7,7 @@ from app.core.risk_engine import RiskEngine
 from app.core import order_ledger as ledger
 from app.core.account_cache import account_cache
 from app.services import telegram_client as tg
+from app.core import quote_cache
 import asyncio
 import time
 
@@ -86,7 +87,19 @@ class PositionMonitor:
             raw_qty = abs(raw_size)
 
             entry_price = float(position_data.get("entry_price") or 0.0)
-            current_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
+            mark_price = float(position_data.get("mark_price") or position_data.get("current_price") or entry_price)
+
+            # PnL is valued at the price this position would actually be CLOSED
+            # at — a long sells into the best bid, a short lifts the best ask —
+            # not at mark_price. On options the two are nowhere near each other:
+            # C-BTC-72000-141126 on 2026-11-13 marked at 1.97 against a book of
+            # 2.8 / 3, so the dashboard could not agree with Delta's own number.
+            # (Jigar, 2026-11-11: "mark price ki jagah sirf bid ask use karna
+            # hai".) Falls back to mark_price when the book cannot be read.
+            current_price = await quote_cache.exit_price_for(
+                symbol, side, fallback=mark_price,
+                environment=(position_data.get("environment") or "production"),
+            )
             
             # Options contracts have a multiplier (e.g. 0.001 BTC per contract).
             # Look for 'contract_value' in the API payload. If missing, check symbol format.

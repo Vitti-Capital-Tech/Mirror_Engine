@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
 from app.database import db
 from app.models.position import PositionResponse
 from app.services.delta_client import DeltaClient
@@ -578,3 +579,74 @@ async def get_account_live_view(account_id: str, user: CurrentUser = Depends(get
     except Exception as e:
         logger.error(f"Error fetching live view for account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class ClosePositionIn(BaseModel):
+    symbol: str
+
+
+@router.post("/{account_id}/close")
+async def close_position(account_id: str, body: ClosePositionIn,
+                         user: CurrentUser = Depends(get_current_user)):
+    """Flatten one position on one account, from the dashboard.
+
+    Until now the only way to close a copied position was the exchange UI, which
+    means leaving the tool that knows which accounts are paired to go and do it
+    by hand on each one.
+
+    Deliberately narrow:
+
+    * REDUCE-ONLY, always. The order can only shrink an existing position, never
+      open or flip one. A stale screen showing a position that has already gone
+      therefore closes nothing rather than opening the opposite side.
+    * Size is read from the EXCHANGE at the moment of the click, not taken from
+      the request. The caller says WHICH position; it does not get to say how
+      much, so a stale quantity on screen cannot over-close.
+    * One account, one symbol. Closing the master does NOT close its followers —
+      the engine mirrors the master's exit on its own, through the same path as
+      any other exit, and short-circuiting that here would race it.
+
+    Owner-scoped via owned_account_or_404, so an admin can close any account's
+    position and a user can only close their own.
+    """
+    acc = owned_account_or_404(account_id, user)
+    symbol = (body.symbol or "").strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required.")
+
+    client = DeltaClient(
+        api_key=acc["api_key"],
+        api_secret=acc["api_secret"],
+        environment=acc.get("environment", "demo"),
+    )
+    try:
+        positions = await client.get_positions()
+    except Exception as e:
+        logger.error("close_position: could not read positions for %s: %s", acc.get("name"), e)
+        raise HTTPException(status_code=502, detail=f"Could not read the position: {e}")
+
+    live = next((p for p in positions
+                 if (p.get("product_symbol") or p.get("symbol")) == symbol
+                 and float(p.get("size") or 0) != 0), None)
+    if live is None:
+        # Already flat. Not an error worth shouting about — the screen was just
+        # a moment behind.
+        return {"success": True, "closed": 0, "message": f"{symbol} is already closed."}
+
+    size = float(live.get("size") or 0)
+    side = "sell" if size > 0 else "buy"      # close by trading the other way
+    qty = int(abs(size))
+    try:
+        resp = await client.place_order(
+            symbol=symbol, side=side, size=qty,
+            order_type="market_order", reduce_only=True,
+        )
+    except Exception as e:
+        logger.error("close_position: order failed for %s %s: %s", acc.get("name"), symbol, e)
+        raise HTTPException(status_code=502, detail=f"Close order was rejected: {e}")
+
+    result = resp.get("result", resp) if isinstance(resp, dict) else {}
+    logger.info("Dashboard close: %s %s %s %s (order %s)",
+                acc.get("name"), side, qty, symbol, result.get("id"))
+    return {"success": True, "closed": qty, "side": side,
+            "order_id": result.get("id"), "message": f"Closing {qty} of {symbol}."}

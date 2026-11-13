@@ -19,6 +19,8 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
   const [maxPositionSize, setMaxPositionSize] = useState<string>(
     account.max_position_size != null ? String(account.max_position_size) : ''
   );
+  const [tpSlOffset, setTpSlOffset] = useState<string>(
+    account.tp_sl_offset != null ? String(account.tp_sl_offset) : '');
   const [saving, setSaving] = useState(false);
 
   const handleSave = async (e: React.FormEvent) => {
@@ -29,6 +31,11 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
       // send null to clear, or the parsed number
       allocated_balance: allocatedBalance ? parseFloat(allocatedBalance) : null,
     };
+    if (account.is_master) {
+      // Null clears it, which puts this master's copies back on the built-in
+      // spread rather than leaving a stale number in force.
+      data.tp_sl_offset = tpSlOffset ? parseFloat(tpSlOffset) : null;
+    }
     if (!account.is_master) {
       data.allocation_mode = allocationMode;
       data.allocation_value = allocationValue ? parseFloat(allocationValue) : 1.0;
@@ -82,6 +89,26 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
               Overrides the real balance for the copy ratio. {account.is_master ? 'This is the ratio denominator.' : 'This is the ratio numerator.'}
             </p>
           </div>
+
+          {account.is_master && (
+            <div className="border border-bg-border rounded-xl p-4 bg-bg-primary/45 space-y-3">
+              <div className="text-[10px] text-blue-400 font-bold uppercase tracking-wider">Copy SL / TP Spread</div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-text-muted uppercase tracking-wider text-[9px]">TP / SL offset — optional</label>
+                <input
+                  type="number" step="any" min="0" value={tpSlOffset}
+                  onChange={(e) => setTpSlOffset(e.target.value)}
+                  placeholder="Leave blank for the default spread"
+                  className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
+                />
+                <p className="text-[10px] text-text-muted font-normal leading-relaxed">
+                  In price units. This master's copies straddle its stop — the 1st sits at
+                  +offset, the 2nd at −offset — so they don't all trigger at the same instant.
+                  Blank keeps the built-in spread.
+                </p>
+              </div>
+            </div>
+          )}
 
           {!account.is_master && (
             <div className="border border-bg-border rounded-xl p-4 bg-bg-primary/45 space-y-3">

@@ -169,6 +169,7 @@ class CopyEngine:
         # reflect in get_positions. A fill now reflects in 1-2s (see
         # TRIM_SETTLE_SEC), so 30s only delayed a real recovery.
         self._RECON_OPEN_DEBOUNCE = 10.0  # seconds
+        self._slot_cache: dict = {}   # owner_id -> (fetched_at, offset, ordered follower ids)
         # A mismatch must persist across TWO consecutive 10s reconcile passes
         # before we act — so a transient race (a just-filled mirror whose position
         # hasn't shown in get_positions yet) can never trigger a duplicate.
@@ -592,20 +593,85 @@ class CopyEngine:
         await self.socket_manager.emit_trade_copy(trade_event_payload)
         logger.info(f"Completed trade copy chain. Status: {final_status}. Fills: {filled_count}/{len(followers)}")
 
-    @staticmethod
-    def _jitter_trigger(price, seed: str = ""):
-        """Offset an SL/TP trigger by a DETERMINISTIC +/- (0..20).
+    # owner_id -> (fetched_at, offset, [follower_id, ...] ordered by created_at)
+    #
+    # One cached read serves both halves of the question: what offset did this
+    # desk configure, and which side of the master does this follower sit on.
+    # The SIDE has to be stable and has to differ between followers, so it is
+    # the follower's position in its owner's list rather than a hash — a hash
+    # would put both on the same side half the time, which is the stacking the
+    # offset exists to prevent.
+    _SLOT_TTL_SEC = 10.0
 
-        The offset is derived from the follower (``seed``) and the trigger price,
-        NOT random. This means:
-          * two legs of a pair that share the same master trigger price get the
-            SAME follower price (so a pair stays aligned), and
-          * different followers still get different offsets, so they don't all
-            trigger at the exact same price/instant.
+    async def _tp_sl_params(self, follower: dict, owner_id=None):
+        """(offset, slot) for this follower's SL/TP trigger.
+
+        offset is the MASTER's configured tp_sl_offset, or None to keep the
+        built-in hash jitter. slot is the follower's index among its owner's
+        active followers, which decides whether it sits above or below.
+        """
+        owner_id = owner_id or follower.get("owner_id")
+        fid = str(follower.get("id") or "")
+        try:
+            cached = self._slot_cache.get(owner_id)
+            if not cached or (time.time() - cached[0]) >= self._SLOT_TTL_SEC:
+                q = self.db.table("accounts").select("id, is_master, status, tp_sl_offset, created_at")
+                if owner_id:
+                    q = q.eq("owner_id", owner_id)
+                rows = q.order("created_at").execute().data or []
+                master = next((r for r in rows if r.get("is_master")), None)
+                offset = (master or {}).get("tp_sl_offset")
+                ids = [str(r["id"]) for r in rows
+                       if not r.get("is_master") and r.get("status") == "active"]
+                cached = (time.time(), offset, ids)
+                self._slot_cache[owner_id] = cached
+            _, offset, ids = cached
+            if offset in (None, ""):
+                return None, 0
+            return offset, (ids.index(fid) if fid in ids else 0)
+        except Exception as e:
+            # Never let this stop an order going out. No offset means the hash
+            # jitter, which is what every account had before this existed.
+            logger.warning("tp_sl offset lookup failed for %s: %s", fid, e)
+            return None, 0
+
+    @staticmethod
+    def _jitter_trigger(price, seed: str = "", offset=None, slot: int = 0):
+        """Move an SL/TP trigger off the master's exact price.
+
+        Followers must not all sit on the same stop price: a pack of identical
+        stops fires in the same instant, which is a worse fill for every one of
+        them and an obvious footprint in the book.
+
+        Two ways of doing that:
+
+        * ``offset`` set (the master's ``tp_sl_offset``) — the desk has said how
+          far apart its copies should sit. Followers are placed either side of
+          the master: ``slot`` 0 at +offset, slot 1 at -offset, alternating. Two
+          followers therefore straddle the master's price rather than stacking.
+
+        * ``offset`` None — the original behaviour, a DETERMINISTIC +/-(0..20)
+          hashed from the follower (``seed``) and the price. Kept as the default
+          because it is what every account has today, and because it is still
+          better than nothing: it is arbitrary, not wrong.
+
+        Deterministic either way, which matters more than it looks — two legs of
+        a pair sharing a master trigger price must land on the SAME follower
+        price, or the pair comes apart.
         """
         if price is None:
             return None
         base = round(float(price), 1)
+        if offset is not None:
+            try:
+                mag = abs(float(offset))
+            except (TypeError, ValueError):
+                mag = 0.0
+            if mag > 0:
+                # Slot decides the side, so follower #1 and follower #2 end up
+                # straddling the master instead of doubling up on one side.
+                sign = 1 if (slot % 2 == 0) else -1
+                return round(base + sign * mag, 1)
         h = int(hashlib.sha256(f"{seed}:{base}".encode()).hexdigest(), 16)
         magnitude = h % 21                 # 0..20 inclusive
         sign = 1 if (h >> 7) & 1 else -1
@@ -2181,7 +2247,8 @@ class CopyEngine:
                     if stop_price is None or not product_id:
                         continue
                     try:
-                        jittered = self._jitter_trigger(float(stop_price), seed=str(fol.get("id")))
+                        _off, _slot = await self._tp_sl_params(fol, owner_id)
+                        jittered = self._jitter_trigger(float(stop_price), seed=str(fol.get("id")), offset=_off, slot=_slot)
                         otype = det.get("order_type") or "market_order"
                         leg = {"order_type": otype, "stop_price": str(jittered)}
                         if otype == "limit_order" and det.get("limit_price") is not None:
@@ -2744,7 +2811,8 @@ class CopyEngine:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], existing_foid)
                     except Exception as e:
                         logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
-                jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
+                _off, _slot = await self._tp_sl_params(follower, owner_id)
+                jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
                 edited = False
                 if is_update and existing_foid:
                     # Master EDITED the SL/TP price -> edit the follower's existing
@@ -2833,7 +2901,8 @@ class CopyEngine:
                 # same instant on the same price. Per-follower local — mutating the
                 # shared stop_price would compound the jitter for the next follower.
                 if stop_price is not None:
-                    place_stop_price = self._jitter_trigger(stop_price, seed=str(follower.get("id")))
+                    _off, _slot = await self._tp_sl_params(follower, owner_id)
+                    place_stop_price = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
 
             elif reduce_only and not is_update:
                 # A reduce-only order must be on the OPPOSITE side of the

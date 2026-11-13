@@ -1,7 +1,7 @@
 'use client';
 import React, { useState } from 'react';
-import { Crown, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
-import { useAccountLiveView } from '@/hooks/usePositions';
+import { Crown, Loader2, ChevronLeft, ChevronRight, X } from 'lucide-react';
+import { useAccountLiveView, useClosePosition } from '@/hooks/usePositions';
 import { PageSizeSelect, DateFilter } from './controls';
 
 // ── Formatting helpers (mirror the live Delta tables) ─────────────────────
@@ -176,7 +176,7 @@ export function AccountPositionCard({ acc }: { acc: any }) {
           </div>
         ) : (
           <>
-            {tab === 'positions' && <DeltaPositionsTab positions={risk} stopOrders={stopOrders} />}
+            {tab === 'positions' && <DeltaPositionsTab positions={risk} stopOrders={stopOrders} accountId={acc.id} accountName={acc.name} />}
             {tab === 'open' && <OpenOrdersTab orders={openOrders} />}
             {tab === 'stop' && <StopOrdersTab orders={stopOrders} />}
             {tab === 'fills' && <FillsTab fills={fills} />}
@@ -217,8 +217,55 @@ function stopLevels(stopOrders: any[]) {
   return map;
 }
 
+/** Close one position, with the click-twice confirm that a destructive control
+ *  in a live table needs.
+ *
+ *  Two clicks rather than a modal: a modal over a table of positions hides the
+ *  row you are acting on, and this is a decision made while looking at the
+ *  numbers. The confirm resets itself after a few seconds so a half-pressed
+ *  button cannot sit there waiting to be hit by accident.
+ *
+ *  The size is NOT sent — the server reads it from the exchange and closes
+ *  reduce-only, so a stale screen cannot over-close or flip the position. */
+function ClosePositionButton({ accountId, accountName, symbol, size }:
+  { accountId: string; accountName?: string; symbol: string; size: number }) {
+  const closePos = useClosePosition();
+  const [armed, setArmed] = useState(false);
+  React.useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  if (closePos.isPending) {
+    return <Loader2 className="w-3.5 h-3.5 animate-spin text-text-muted inline" />;
+  }
+  if (armed) {
+    return (
+      <button
+        type="button"
+        onClick={() => { closePos.mutate({ accountId, symbol }); setArmed(false); }}
+        title={`Market-close ${Math.abs(size)} of ${symbol} on ${accountName || 'this account'}`}
+        className="px-2 py-1 rounded-md bg-rose-500 hover:bg-rose-400 text-white text-[10px] font-bold tracking-wide transition-colors"
+      >
+        CONFIRM
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => setArmed(true)}
+      title={`Close ${symbol}`}
+      className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-bg-border hover:border-rose-500/60 hover:text-rose-400 text-text-muted text-[10px] font-semibold transition-colors"
+    >
+      <X className="w-3 h-3" /> Close
+    </button>
+  );
+}
+
 // ── Positions (live) — mirrors Delta's Positions tab ──────────────────────
-function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOrders: any[] }) {
+function DeltaPositionsTab({ positions, stopOrders, accountId, accountName }: { positions: any[]; stopOrders: any[]; accountId: string; accountName?: string }) {
   const open = (positions || []).filter((p) => Number(p.size) !== 0);
   const pg = usePaged(open);
   if (open.length === 0) return <Empty text="No active open positions." />;
@@ -232,7 +279,8 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
             <th className="py-2">Symbol</th><th className="text-right">Size</th><th className="text-right">Notional</th>
             <th className="text-right">Entry</th><th>TP / SL</th><th className="text-right">Index</th>
             <th className="text-right">Mark</th><th className="text-right">Margin</th>
-            <th className="text-right">UPNL</th><th className="text-right pr-4">Cashflow</th>
+            <th className="text-right">UPNL</th><th className="text-right">Cashflow</th>
+            <th className="text-right pr-4">Close</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.04] font-medium">
@@ -270,7 +318,11 @@ function DeltaPositionsTab({ positions, stopOrders }: { positions: any[]; stopOr
                   {pnl >= 0 ? '+' : ''}{fmtNum(pnl)}
                   {pnlPct != null && <span className={`block text-[10px] ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnl >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</span>}
                 </td>
-                <td className={`text-right font-mono pr-4 ${cashflow == null ? 'text-text-muted' : pnlCls(cashflow)}`}>{cashflow != null ? `${cashflow >= 0 ? '+' : ''}${fmtNum(cashflow)}` : '—'}</td>
+                <td className={`text-right font-mono ${cashflow == null ? 'text-text-muted' : pnlCls(cashflow)}`}>{cashflow != null ? `${cashflow >= 0 ? '+' : ''}${fmtNum(cashflow)}` : '—'}</td>
+                <td className="text-right pr-4">
+                  <ClosePositionButton accountId={accountId} accountName={accountName}
+                    symbol={p.product_symbol || p.symbol} size={size} />
+                </td>
               </tr>
             );
           })}

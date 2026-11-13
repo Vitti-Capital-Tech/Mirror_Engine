@@ -206,6 +206,10 @@ export const api = {
     byAccount: (accountId: string) => fetchAPI<any[]>(`/api/positions/${accountId}`),
     syncStatus: () => fetchAPI<any>('/api/positions/sync-status'),
     syncLive: () => fetchAPI<any>('/api/positions/sync-live', { method: 'POST' }),
+    close: (accountId: string, symbol: string) =>
+      fetchAPI<any>(`/api/positions/${accountId}/close`, {
+        method: 'POST', body: JSON.stringify({ symbol }),
+      }),
     liveView: (accountId: string) =>
       fetchAPI<{ orders: any[]; history: any[]; fills: any[]; risk: any[] }>(`/api/positions/${accountId}/live-view`),
   },
