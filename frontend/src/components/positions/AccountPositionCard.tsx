@@ -357,7 +357,11 @@ function StopOrdersTab({ orders }: { orders: any[] }) {
           <tr className={TH_ROW}>
             <th className="py-2">Symbol</th><th className="text-right">Qty (Lot)</th><th className="text-right">Size</th>
             <th className="text-right">Notional</th><th className="text-right">Trigger Price</th><th>Trigger Index</th>
-            <th className="text-right">Triggering Price</th><th>Type</th><th className="text-right">Limit Price</th>
+            {/* This column is the live SPOT price, not a trigger level — it reads
+                num(o.spot_price). Sitting two columns from "Trigger Price" (the
+                level the stop actually fires at) under the near-identical name
+                "Triggering Price" made it look like a second trigger field. */}
+            <th className="text-right">Spot Price</th><th>Type</th><th className="text-right">Limit Price</th>
             <th className="text-right">Reduce Only</th><th>Status</th><th className="text-right pr-4">Time</th>
           </tr>
         </thead>

@@ -63,8 +63,15 @@ def monitor():
 
 
 def age(m, key, seconds):
-    """Pretend the orphan was first seen `seconds` ago."""
-    m._orphan_since[key] = time.time() - seconds
+    """Pretend the episode started `seconds` ago and was seen just now."""
+    m._orphan_since[key] = (time.time() - seconds, time.time())
+
+
+def go_quiet(m, key, seconds):
+    """Pretend the symbol has not been observed for `seconds` — i.e. the
+    follower closed it and the symbol stopped being checked."""
+    first, _ = m._orphan_since[key]
+    m._orphan_since[key] = (first, time.time() - seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +134,41 @@ def test_each_symbol_is_tracked_separately():
     check("different dedupe keys", len({s["key"] for s in SENT}), 2)
 
 
+def test_a_reopened_symbol_does_not_inherit_an_old_timer():
+    print("\n6. THE FALSE ALARM: a symbol closed and reopened starts clean")
+    # Live on 2026-11-13 04:19:26. C-BTC-71600 fired seven seconds after the
+    # follower opened 2515, while the master was taking 2800 in the same breath.
+    # Both were flat at 04:19:19. The "orphan" was a leftover timer from an
+    # earlier position in the same symbol: the follower had gone flat, so the
+    # symbol stopped being checked, so the clear-on-zero never ran.
+    m = monitor()
+    key = ("f1", "C-BTC-71600-131126")
+    asyncio.run(m._maybe_alert_orphan("f1", "JD algo3", "C-BTC-71600-131126", 280))
+    age(m, key, 600)              # an episode from ten minutes ago...
+    go_quiet(m, key, 300)         # ...last observed five minutes ago
+    # The follower now OPENS the symbol again. This is the first check of a new
+    # position, and it must not inherit the old clock.
+    asyncio.run(m._maybe_alert_orphan("f1", "JD algo3", "C-BTC-71600-131126", 2515))
+    check("no alert on a freshly opened position", len(SENT), 0)
+    first, last = m._orphan_since[key]
+    check("the clock restarted", round(time.time() - first) < 2, True)
+    # And it still alerts if THIS episode genuinely persists.
+    age(m, key, m._ORPHAN_ALERT_SEC + 1)
+    asyncio.run(m._maybe_alert_orphan("f1", "JD algo3", "C-BTC-71600-131126", 2515))
+    check("but a real orphan still alerts", len(SENT), 1)
+
+
+def test_continuous_observation_still_ages():
+    print("\n7. an episode observed throughout still ages normally")
+    m = monitor()
+    key = ("f1", "C-BTC-74000-111126")
+    asyncio.run(m._maybe_alert_orphan("f1", "JD algo3", "C-BTC-74000-111126", 361))
+    # Seen repeatedly, no gap — the clock must keep running.
+    age(m, key, m._ORPHAN_ALERT_SEC + 1)
+    asyncio.run(m._maybe_alert_orphan("f1", "JD algo3", "C-BTC-74000-111126", 361))
+    check("alerts", len(SENT), 1)
+
+
 def test_a_telegram_failure_never_breaks_the_monitor():
     print("\n6. the alert must not take the position monitor down")
     import app.core.position_monitor as pm
@@ -156,6 +198,8 @@ def main():
         test_it_clears_when_the_position_closes,
         test_a_flat_follower_never_alerts,
         test_each_symbol_is_tracked_separately,
+        test_a_reopened_symbol_does_not_inherit_an_old_timer,
+        test_continuous_observation_still_ages,
         test_a_telegram_failure_never_breaks_the_monitor,
     ):
         fn()

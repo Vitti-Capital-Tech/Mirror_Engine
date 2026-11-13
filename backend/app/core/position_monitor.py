@@ -372,6 +372,10 @@ class PositionMonitor:
     # clears on its own; short enough to beat the reconciler's own cleanup, so
     # the alert tells you something is wrong rather than confirming it is fixed.
     _ORPHAN_ALERT_SEC = 45.0
+    # Longest silence that still counts as the SAME episode. The sync check runs
+    # on position updates, roughly every few seconds per symbol, so anything
+    # beyond this means the symbol stopped being held and came back.
+    _ORPHAN_GAP_SEC = 30.0
 
     async def _maybe_alert_orphan(self, account_id, account_name, symbol, follower_qty):
         """Warn when a follower is holding a position the master no longer has.
@@ -387,14 +391,40 @@ class PositionMonitor:
         and it has no protection behind it.
         """
         key = (account_id, symbol)
+        now = time.time()
         if not follower_qty:
             self._orphan_since.pop(key, None)
             return
-        first = self._orphan_since.get(key)
-        now = time.time()
-        if first is None:
-            self._orphan_since[key] = now
+
+        entry = self._orphan_since.get(key)
+        # A GAP IN OBSERVATION IS A NEW EPISODE, not a continuing one.
+        #
+        # This is only reached while the symbol is being checked, and it is only
+        # checked while the follower has a position in it. So when a position
+        # closes the symbol simply stops being seen — and the clear-on-zero above
+        # never runs, because there is no update carrying a zero. The entry then
+        # sits there, and the next time that symbol is opened the very first
+        # check reads an age of "however long ago that was" and alerts instantly.
+        #
+        # That is not theoretical: on 2026-11-13 04:19:26 this fired on
+        # C-BTC-71600-131126 seven seconds after the follower opened 2515, while
+        # the master was taking 2800 in the same breath. Both were flat at
+        # 04:19:19, the fill landed at 04:19:24, and the "orphan" was a leftover
+        # timer from an earlier position in the same symbol. A false alarm on a
+        # new alert costs more than the alert is worth — it teaches the desk to
+        # ignore it.
+        #
+        # So an episode must be CONTINUOUSLY observed to age. A gap longer than
+        # _ORPHAN_GAP_SEC means whatever we were timing ended; start again.
+        if entry is not None:
+            first, last = entry
+            if now - last > self._ORPHAN_GAP_SEC:
+                entry = None
+        if entry is None:
+            self._orphan_since[key] = (now, now)
             return
+        first, _ = entry
+        self._orphan_since[key] = (first, now)
         if now - first < self._ORPHAN_ALERT_SEC:
             return
         try:
