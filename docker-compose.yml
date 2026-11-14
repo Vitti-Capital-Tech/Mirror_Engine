@@ -4,9 +4,25 @@ services:
   redis:
     image: redis:7-alpine
     container_name: copytrade_redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # CAP THE LOGS. Docker's json-file driver is UNBOUNDED by default, and this
+    # engine is extremely chatty. On 2026-10-05 the EC2 root disk hit 100% —
+    # 5.5 GB of uncapped container log plus stale image layers, 13.5 GB of a
+    # 19 GB volume. Copying and logins were dead for 31 HOURS and nothing
+    # alerted, because /health kept answering 200 throughout: the process was
+    # alive and simply could not write a byte.
+    #
+    # This lived only on the server for a month, as an uncommitted edit. Losing
+    # it is a SILENT failure — nothing looks wrong until the disk is full again
+    # — which is exactly why it belongs in the repo rather than on one box.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -33,7 +49,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # See the note on redis above — the backend is the chatty one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
 
+  # NOTE: the frontend's URLs and Supabase build args are HOST-SPECIFIC and are
+  # kept as a local edit on the server (the deploy stashes this file, pulls, and
+  # pops it). They are left out of the repo deliberately: they name one box's IP
+  # and one Supabase project, and the primary frontend is Vercel — this service
+  # is the legacy on-box copy.
+  #
+  # The logging and restart settings above are the opposite kind of thing:
+  # not host-specific, and their absence cannot be seen until it has already
+  # cost an outage. Those belong here.
   frontend:
     build:
       context: ./frontend
