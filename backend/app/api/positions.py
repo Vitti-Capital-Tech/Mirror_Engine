@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+import re
+from datetime import datetime, timezone, timedelta, date
 from typing import List, Dict
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -274,6 +275,52 @@ async def list_account_positions(account_id: str, user: CurrentUser = Depends(ge
         logger.error(f"Error querying positions for account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Delta option symbols end in the expiry as DDMMYY (e.g. C-BTC-67000-280726).
+_EXPIRY_RE = re.compile(r"-(\d{6})$")
+
+
+def _expired_symbol(symbol: str, today=None) -> bool:
+    """True when this contract's expiry is in the past.
+
+    A position row is only deleted when Delta sends an explicit size of 0. A
+    contract that simply EXPIRES never sends one — it just stops appearing — so
+    its row sat in the table forever. Ten of them had accumulated by 2026-11-14,
+    the oldest last updated in July, and that table is what the sync check reads.
+
+    Pruning against "symbols Delta returned this cycle" would be the obvious fix
+    and is a trap: get_positions() swallows its errors and returns [], so one
+    failed call would look like "no positions anywhere" and wipe every row.
+    Expiry is decided by the calendar instead, which cannot be wrong about it.
+    """
+    m = _EXPIRY_RE.search(symbol or "")
+    if not m:
+        return False            # perpetuals and anything unparseable: never prune
+    d = m.group(1)
+    try:
+        exp = date(2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]))
+    except ValueError:
+        return False
+    return exp < (today or date.today())
+
+
+def _prune_expired_positions(account_id: str) -> int:
+    """Drop this account's position rows for contracts that have expired."""
+    try:
+        rows = (db.table("positions").select("id, symbol")
+                .eq("account_id", account_id).execute().data) or []
+        dead = [r["id"] for r in rows if _expired_symbol(r.get("symbol"))]
+        if dead:
+            db.table("positions").delete().in_("id", dead).execute()
+            logger.info("Pruned %d expired position row(s) for account %s",
+                        len(dead), account_id)
+        return len(dead)
+    except Exception as e:
+        # Housekeeping must never break a sync.
+        logger.warning("Could not prune expired positions for %s: %s", account_id, e)
+        return 0
+
+
 async def _sync_accounts(accounts: list) -> list:
     """Sync live balance + positions for the given accounts into the DB."""
     sync_results = []
@@ -359,6 +406,11 @@ async def _sync_accounts(accounts: list) -> list:
                         account_name=acc["name"],
                         position_data=pos
                     )
+
+                # Expired contracts never send a closing update, so their rows
+                # would otherwise live forever. Calendar-based, so a failed
+                # position fetch cannot cause a mass delete.
+                _prune_expired_positions(acc["id"])
 
                 # Add realized PnL booked today (closed trades) so the figure
                 # survives closing positions — "today's PnL" = realized + unrealized.
