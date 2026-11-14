@@ -264,13 +264,13 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
               <input
                 type="number" step="any" min="0" value={tpSlOffset}
                 onChange={(e) => setTpSlOffset(e.target.value)}
-                placeholder="Leave blank for the default spread"
+                placeholder="50 (default)"
                 className="bg-bg-primary border border-bg-border rounded-xl px-3.5 py-3 text-sm text-text-primary placeholder:text-text-muted outline-none focus:border-blue-500/70"
               />
               <span className="text-[10px] text-text-muted">
                 In price units. Copies straddle this master's stop — the 1st sits at
                 +offset, the 2nd at −offset — so they don't all trigger at the same
-                instant. Blank keeps the built-in spread.
+                instant. Blank uses the default of 50.
               </span>
             </div>
           )}

@@ -89,15 +89,22 @@ def engine(offset=None, followers=(F1, F2)):
 # ---------------------------------------------------------------------------
 
 
-def test_unset_keeps_the_old_hash_jitter():
-    print("\n1. no offset configured -> the existing behaviour, unchanged")
+def test_unset_falls_back_to_the_default():
+    print("\n1. no offset configured -> DEFAULT_TP_SL_OFFSET (50)")
+    from app.core.copy_engine import DEFAULT_TP_SL_OFFSET
+    check("the default is 50", DEFAULT_TP_SL_OFFSET, 50.0)
     eng = engine(offset=None)
     off, slot = asyncio.run(eng._tp_sl_params(F1, OWNER))
-    check("no offset returned", off, None)
-    a = CopyEngine._jitter_trigger(70000, seed="f1", offset=off, slot=slot)
-    b = CopyEngine._jitter_trigger(70000, seed="f1")
-    check("identical to the old call", a, b)
-    check("and it did move off the master's price", a != 70000.0, True)
+    check("nothing stored on the account", off, None)
+    # ...but the trigger still moves, by the default rather than the old hash.
+    check("follower 1 sits at +50",
+          CopyEngine._jitter_trigger(70000, seed="f1", offset=off, slot=slot), 70050.0)
+    check("follower 2 sits at -50",
+          CopyEngine._jitter_trigger(70000, seed="f2", offset=off, slot=1), 69950.0)
+    # 50 against a spot-priced trigger of ~70,000 is ~0.07% — far enough apart
+    # not to fire together, near enough to still be the same decision. The old
+    # 0..20 hash could land a follower 1 point away, which is not far enough.
+    check("~0.07% of the trigger", round(50 / 70000 * 100, 3), 0.071)
 
 
 def test_two_followers_straddle_the_master():
@@ -159,9 +166,9 @@ def test_a_db_failure_falls_back_to_the_hash():
 
     eng.db = Broken()
     off, slot = asyncio.run(eng._tp_sl_params(F1, OWNER))
-    check("no offset -> hash jitter", off, None)
-    check("and a usable price comes out",
-          CopyEngine._jitter_trigger(70000, seed="f1", offset=off, slot=slot) is not None, True)
+    check("no offset read", off, None)
+    check("so the default still applies",
+          CopyEngine._jitter_trigger(70000, seed="f1", offset=off, slot=slot), 70050.0)
 
 
 def test_zero_and_junk_are_ignored():
@@ -169,9 +176,9 @@ def test_zero_and_junk_are_ignored():
     # 0 would put every follower on the master's exact price — the one outcome
     # this feature exists to prevent. The DB constraint rejects it; belt and
     # braces here too.
-    check("0 -> hash jitter, not the raw price",
+    check("0 never lands on the master's price",
           CopyEngine._jitter_trigger(70000, seed="f1", offset=0, slot=0) != 70000.0, True)
-    check("junk -> hash jitter",
+    check("junk never lands on the master's price",
           CopyEngine._jitter_trigger(70000, seed="f1", offset="abc", slot=0) != 70000.0, True)
     check("None price stays None",
           CopyEngine._jitter_trigger(None, seed="f1", offset=5, slot=0), None)
@@ -182,7 +189,7 @@ def main():
     print("tp/sl offset - the desk decides how far apart its copies sit")
     print("=" * 74)
     for fn in (
-        test_unset_keeps_the_old_hash_jitter,
+        test_unset_falls_back_to_the_default,
         test_two_followers_straddle_the_master,
         test_it_is_a_real_price_offset_not_a_percentage,
         test_the_same_price_gives_the_same_answer,

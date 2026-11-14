@@ -40,6 +40,16 @@ def _short_reason(exc, body: str = "") -> str:
 # wait, then retry-wait), escalate it to a full-or-nothing market order.
 ESCALATE_WAIT_SEC = 5
 
+# How far a follower's SL/TP sits from the master's when the master account has
+# not set its own tp_sl_offset. In price units, against triggers that fire on
+# spot_price (~70,000 on BTC), so 50 is ~0.07%.
+#
+# Replaces the old deterministic +/-(0..20) hash jitter as the default. That was
+# never chosen — it was a magic number nobody could see or tune — and 0..20
+# meant some followers landed within a couple of points of the master, which is
+# close enough to trigger in the same instant and defeats the point.
+DEFAULT_TP_SL_OFFSET = 50.0
+
 # How long one escalation's claim on a follower order lives. Comfortably longer
 # than an escalation takes (a sleep plus a few REST calls) so a task killed
 # mid-flight cannot leave the claim held, and short enough that it never
@@ -650,10 +660,11 @@ class CopyEngine:
           the master: ``slot`` 0 at +offset, slot 1 at -offset, alternating. Two
           followers therefore straddle the master's price rather than stacking.
 
-        * ``offset`` None — the original behaviour, a DETERMINISTIC +/-(0..20)
-          hashed from the follower (``seed``) and the price. Kept as the default
-          because it is what every account has today, and because it is still
-          better than nothing: it is arbitrary, not wrong.
+        * ``offset`` None — DEFAULT_TP_SL_OFFSET is used instead, so followers
+          still straddle the master by a known, visible amount. The old
+          deterministic +/-(0..20) hash survives only as the fallback for an
+          offset that cannot be read as a positive number, so a bad value can
+          never stack a follower on the master's exact price.
 
         Deterministic either way, which matters more than it looks — two legs of
         a pair sharing a master trigger price must land on the SAME follower
@@ -662,6 +673,8 @@ class CopyEngine:
         if price is None:
             return None
         base = round(float(price), 1)
+        if offset is None:
+            offset = DEFAULT_TP_SL_OFFSET
         if offset is not None:
             try:
                 mag = abs(float(offset))

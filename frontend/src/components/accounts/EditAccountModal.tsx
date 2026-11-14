@@ -32,8 +32,8 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
       allocated_balance: allocatedBalance ? parseFloat(allocatedBalance) : null,
     };
     if (account.is_master) {
-      // Null clears it, which puts this master's copies back on the built-in
-      // spread rather than leaving a stale number in force.
+      // Null clears it, which puts this master's copies back on the default
+      // of 50 rather than leaving a stale number in force.
       data.tp_sl_offset = tpSlOffset ? parseFloat(tpSlOffset) : null;
     }
     if (!account.is_master) {
@@ -98,13 +98,13 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
                 <input
                   type="number" step="any" min="0" value={tpSlOffset}
                   onChange={(e) => setTpSlOffset(e.target.value)}
-                  placeholder="Leave blank for the default spread"
+                  placeholder="50 (default)"
                   className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
                 />
                 <p className="text-[10px] text-text-muted font-normal leading-relaxed">
                   In price units. This master's copies straddle its stop — the 1st sits at
                   +offset, the 2nd at −offset — so they don't all trigger at the same instant.
-                  Blank keeps the built-in spread.
+                  Blank uses the default of 50.
                 </p>
               </div>
             </div>
