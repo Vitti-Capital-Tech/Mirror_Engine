@@ -2616,7 +2616,37 @@ class CopyEngine:
                     # Still resting. A plain re-send has nothing to do; an EDIT
                     # falls through to the edit path below, which is the one case
                     # that may legitimately act on an already-mirrored order.
-                    if not is_update:
+                    #
+                    # ...except "still resting" was the ONLY question asked, and
+                    # it is not the only one that matters. A master who changes a
+                    # resting order's QUANTITY leaves it resting, so this skipped
+                    # and the follower went on holding the original size — for as
+                    # long as the order lived. The 30s reconcile re-pushes every
+                    # resting order, hit the same guard, and skipped too, so
+                    # nothing ever corrected it.
+                    #
+                    # Delta may or may not flag such an edit as action=update
+                    # (not observed either way in the live stream), so relying on
+                    # that flag is not enough on its own. Compare the master's
+                    # size now against what it was when this mirror was placed —
+                    # one Redis HGET, no exchange round trip, so the fast path
+                    # stays fast.
+                    _resized = False
+                    try:
+                        _prev = await self.redis.hget(f"ordersize:{master_order_id}", follower["id"])
+                        if _prev is not None:
+                            _prev_v = _prev.decode() if isinstance(_prev, bytes) else _prev
+                            _resized = abs(float(_prev_v) - float(master_qty)) > 1e-9
+                    except Exception as e:
+                        logger.debug("ordersize compare failed for %s: %s", master_order_id, e)
+                    if _resized:
+                        logger.info(
+                            f"Master resized order {master_order_id} on {symbol} "
+                            f"({_prev_v} -> {master_qty:.0f}) — updating "
+                            f"{follower['name']}'s mirror {mapped}"
+                        )
+                        is_update = True          # take the edit path below
+                    elif not is_update:
                         _hist_leg(follower, once=True, status="pending",
                                   follower_order_id=mapped)
                         continue
@@ -3089,12 +3119,26 @@ class CopyEngine:
             existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
             if is_update and existing_foid:
                 try:
-                    resp = await client.edit_order(existing_foid, product_id=product_id, limit_price=limit_price)
+                    # SIZE as well as price. The master changing an order's
+                    # quantity is an edit like any other, but size was never
+                    # sent — so the price moved on the follower and the quantity
+                    # silently did not, leaving it resting the original amount.
+                    resp = await client.edit_order(
+                        existing_foid, product_id=product_id,
+                        limit_price=limit_price,
+                        size=int(qty) if qty else None,
+                    )
                     # Delta edits can cancel-and-replace (new order id) — refresh the map.
                     new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
                     if new_id and str(new_id) != str(existing_foid):
                         await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(new_id))
-                    logger.info(f"Updated order {master_order_id} -> {follower['name']} order {new_id or existing_foid} @ {limit_price}")
+                    # Re-stamp the master size this mirror now reflects, or the
+                    # resize check above would keep firing on every reconcile.
+                    await self.redis.hset(f"ordersize:{master_order_id}", follower["id"], str(master_qty))
+                    logger.info(
+                        f"Updated order {master_order_id} -> {follower['name']} order "
+                        f"{new_id or existing_foid} @ {limit_price} x {int(qty) if qty else '-'}"
+                    )
                     continue
                 except Exception as e:
                     body = getattr(getattr(e, "response", None), "text", "")
@@ -3144,6 +3188,11 @@ class CopyEngine:
                     # the next liveness check reads fresh.
                     self._open_orders_cache.pop(follower["id"], None)
                     await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], str(follower_order_id))
+                    # What the MASTER's order was sized at when this mirror was
+                    # placed. One cheap Redis read later tells us whether the
+                    # master has since resized it — see the live-mirror guard.
+                    await self.redis.hset(f"ordersize:{master_order_id}", follower["id"], str(master_qty))
+                    await self.redis.expire(f"ordersize:{master_order_id}", 7 * 24 * 3600)
                     await self.redis.expire(f"ordermap:{master_order_id}", 7 * 24 * 3600)
                     await ledger.record_follower_leg(
                         self.redis, master_order_id, follower["id"], status="placed",

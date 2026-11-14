@@ -336,10 +336,16 @@ class DeltaClient:
         stop_price: Optional[float] = None,
         limit_price: Optional[float] = None,
         stop_trigger_method: Optional[str] = None,
+        size: Optional[int] = None,
     ) -> dict:
-        """Edit an existing order's trigger/limit price and trigger method
-        (PUT /v2/orders). Used to mirror SL/TP modifications in place — also
-        keeps the trigger reference (mark/index) in sync."""
+        """Edit an existing order's price, trigger method and/or SIZE
+        (PUT /v2/orders). Used to mirror modifications in place.
+
+        `size` was missing, so a master who changed the QUANTITY of a resting
+        order had the price mirrored and the quantity silently left alone — the
+        follower went on resting its original size. Delta accepts `size` on this
+        endpoint; it simply was never sent.
+        """
         path = "/v2/orders"
         body_dict: dict = {"id": int(order_id), "product_id": int(product_id)}
         if stop_price is not None:
@@ -348,6 +354,8 @@ class DeltaClient:
             body_dict["limit_price"] = str(limit_price)
         if stop_trigger_method:
             body_dict["stop_trigger_method"] = stop_trigger_method
+        if size is not None:
+            body_dict["size"] = int(size)
         body = json.dumps(body_dict)
         headers = self._get_headers("PUT", path, body)
         resp = await self._client.put(f"{self.rest_url}{path}", headers=headers, content=body)
