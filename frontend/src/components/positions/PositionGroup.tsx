@@ -156,8 +156,10 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
         </span>
       </button>
 
-      {/* Not mounted until asked for, so a collapsed account is not polling
-          Delta every four seconds for tables nobody is reading. */}
+      {/* Open by default: the tables are what the page is for, and having to
+          click into each account to see them was a click per account on every
+          visit. A collapsed account is still not mounted, so collapsing one
+          does stop it polling — it is just no longer the starting state. */}
       {open && (
         <div className="px-3 sm:px-4 pb-4">
           <AccountPositionCard acc={acc} compact />
@@ -252,7 +254,7 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
       {open && (
         <div className="border-t border-bg-border rounded-b-2xl bg-bg-primary/20">
           {master
-            ? <AccountRow acc={master} legs={masterLegs} missing={[]} isMaster defaultOpen={false} />
+            ? <AccountRow acc={master} legs={masterLegs} missing={[]} isMaster defaultOpen />
             : (
               <div className="px-5 py-4 text-[12px] text-text-muted">
                 No active master in this group — nothing is being copied.
@@ -260,7 +262,7 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
             )}
           {followers.map((f) => (
             <AccountRow key={f.id} acc={f} legs={legsOf(f.id)} missing={missingFor(f)}
-              isMaster={false} defaultOpen={false} />
+              isMaster={false} defaultOpen />
           ))}
           {followers.length === 0 && master && (
             <div className="px-5 py-3 border-t border-bg-border text-[11.5px] text-text-muted">
