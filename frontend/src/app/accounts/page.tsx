@@ -3,8 +3,7 @@ import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
-import { OwnerGroup } from '@/components/shared/OwnerGroup';
-import { AccountsTable } from '@/components/accounts/AccountsTable';
+import { AccountGroupCard, COL } from '@/components/accounts/AccountGroupCard';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
 import { Plus } from 'lucide-react';
@@ -21,67 +20,116 @@ export default function AccountsPage() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
   const total = accounts.length;
-  const active = accounts.filter(a => a.status === 'active').length;
   const paused = accounts.filter(a => a.status === 'paused').length;
-  const followers = accounts.filter(a => !a.is_master).length;
+  const totalBalance = accounts.reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
+  const todayPnl = accounts.reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+  const money2 = (v: number) =>
+    v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const groups = groupByMaster(accounts);
+  const isAdmin = user?.role === 'admin';
+  const MAX_MASTERS = 5, MAX_FOLLOWERS = 2;
+  const masterCount = accounts.filter((a: any) => a.is_master).length;
+  // The button now opens a form that can add either kind, so it may only be
+  // disabled when there is nothing left to add at all — masters capped AND
+  // every master's copy slots used. Disabling it on the master cap alone
+  // (which is what it did when it only added masters) would lock someone out
+  // of adding a copy the moment they had five masters.
+  const everythingFull =
+    masterCount >= MAX_MASTERS &&
+    groups.every((g) => g.followers.length >= MAX_FOLLOWERS);
+  const [presetMaster, setPresetMaster] = useState<string | undefined>(undefined);
+
+  const openAdd = (masterId?: string) => { setPresetMaster(masterId); setIsAddModalOpen(true); };
 
   return (
-    <div className="space-y-6">
-      {/* Header Action Row */}
-      <div className="flex items-center justify-end pb-2 select-none">
+    <div className="space-y-5">
+      {/* One line instead of four stat cards. The cards took a quarter of the
+          screen to say "2" and "0"; what someone actually needs to know here is
+          how many groups they have and whether anything is paused. */}
+      <div className="flex items-end justify-between gap-4 flex-wrap">
+        <div className="flex items-end gap-7">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Accounts</div>
+            <div className="text-[15px] font-bold text-text-primary leading-tight">
+              {total}
+              <span className="text-[12px] font-normal text-text-muted">
+                {' '}in {groups.length} {groups.length === 1 ? 'group' : 'groups'}
+                {paused > 0 && <span className="text-amber-400"> · {paused} paused</span>}
+              </span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Total balance</div>
+            <div className="text-[15px] font-mono font-bold text-text-primary leading-tight">
+              {money2(totalBalance)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Today</div>
+            <div className={`text-[15px] font-mono font-bold leading-tight ${
+              todayPnl > 0 ? 'text-emerald-400' : todayPnl < 0 ? 'text-rose-400' : 'text-text-muted'}`}>
+              {todayPnl > 0 ? '+' : ''}{money2(todayPnl)}
+            </div>
+          </div>
+        </div>
         <button
-          onClick={() => setIsAddModalOpen(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold rounded-lg transition-all duration-200 shadow-md hover:shadow-blue-500/10"
+          onClick={() => openAdd(undefined)}
+          disabled={everythingFull}
+          title={everythingFull
+            ? `All ${MAX_MASTERS} masters are set up and each has its ${MAX_FOLLOWERS} copies`
+            : undefined}
+          className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-bg-panel disabled:text-text-muted disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-colors"
         >
           <Plus className="w-3.5 h-3.5" />
-          Add Account
+          Add account
         </button>
       </div>
 
-      {/* Stats row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 select-none">
-        {[
-          { label: 'Total Accounts', value: total, color: 'text-text-primary' },
-          { label: 'Active Sessions', value: active, color: 'text-emerald-400' },
-          { label: 'Paused', value: paused, color: 'text-text-secondary' },
-          { label: 'Followers', value: followers, color: 'text-blue-400' },
-        ].map((item, i) => (
-          <div key={i} className="card-premium px-4 py-3.5 flex flex-col gap-1">
-            <span className="text-[10px] text-text-muted uppercase font-semibold tracking-[0.12em]">{item.label}</span>
-            <span className={`text-xl font-bold font-mono ${item.color}`}>{isLoading ? '–' : item.value}</span>
+      {isLoading ? <Loader label="Loading accounts…" /> : groups.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-bg-border py-14 text-center">
+          <p className="text-[13px] font-semibold text-text-primary">No accounts yet</p>
+          <p className="text-[12px] text-text-muted mt-1 max-w-sm mx-auto">
+            Start with a master — the account you trade yourself. You can then add
+            up to {MAX_FOLLOWERS} copies that mirror it.
+          </p>
+          <button onClick={() => openAdd(undefined)}
+            className="mt-4 inline-flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors">
+            <Plus className="w-3.5 h-3.5" /> Add account
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {/* Column labels, once. They used to be reprinted above every
+              number on every row — six times on a page of six accounts — and
+              still did not line up, because each row sized its own columns.
+              These sit on the same shared widths the rows use. */}
+          <div className="hidden sm:flex items-center gap-3 px-4 sm:px-5 text-[10px] uppercase tracking-wider text-text-muted/70">
+            <div className={COL.rail} />
+            <div className="min-w-0 flex-1">Account</div>
+            <div className={COL.mid}>Copies at</div>
+            <div className={COL.balance}>Balance</div>
+            <div className={COL.pnl}>Today</div>
+            <div className={`${COL.tail} pr-7 text-right whitespace-nowrap`}>Running</div>
           </div>
-        ))}
-      </div>
-
-      {/* Accounts table — one per owner when an admin is looking at everything.
-          A single flat table reads as one person's desk, which is exactly wrong
-          here: these accounts belong to different people and the controls on
-          them are destructive. Pausing or deleting the wrong account because
-          two tenants' rows sat under one "FOLLOWER ACCOUNTS" heading is a real
-          mistake to design out. */}
-      {isLoading ? <Loader label="Loading accounts…" /> : (
-        user?.role === 'admin' && effectiveScope(accounts, scope) === ALL_ACCOUNTS && accounts.length > 0 ? (
-          <div className="space-y-5">
-            {groupByMaster(accounts).map((g) => (
-              <OwnerGroup
-                key={g.groupId}
-                email={(g.master as any)?.owner_email ?? (g.followers[0] as any)?.owner_email}
-                master={g.master}
-                followers={g.followers}
-              >
-                <AccountsTable
-                  accounts={[...(g.master ? [g.master] : []), ...g.followers]}
-                  isLoading={false}
-                />
-              </OwnerGroup>
-            ))}
-          </div>
-        ) : <AccountsTable accounts={accounts} isLoading={false} />
+          {groups.map((g) => (
+            <AccountGroupCard
+              key={g.groupId}
+              group={g}
+              maxFollowers={MAX_FOLLOWERS}
+              onAddCopy={(mid) => openAdd(mid)}
+              showOwner={isAdmin}
+            />
+          ))}
+        </div>
       )}
 
-      {/* Add Account Modal */}
       {isAddModalOpen && (
-        <AddAccountModal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} />
+        <AddAccountModal
+          isOpen={isAddModalOpen}
+          onClose={() => { setIsAddModalOpen(false); setPresetMaster(undefined); }}
+          presetMasterId={presetMaster}
+        />
       )}
     </div>
   );

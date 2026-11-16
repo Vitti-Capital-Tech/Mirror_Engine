@@ -191,6 +191,10 @@ export const api = {
     resume: (id: string) => fetchAPI<any>(`/api/accounts/${id}/resume`, { method: 'POST' }),
     promote: (id: string) => fetchAPI<any>(`/api/accounts/${id}/promote`, { method: 'POST' }),
     test: (id: string) => fetchAPI<any>(`/api/accounts/${id}/test`, { method: 'POST' }),
+    /** Check a key/secret against Delta BEFORE creating anything. */
+    verify: (data: { api_key: string; api_secret: string; environment: string }) =>
+      fetchAPI<{ ok: boolean; balance: number | null; message: string }>(
+        '/api/accounts/verify', { method: 'POST', body: JSON.stringify(data) }),
     reset: (id: string) => fetchAPI<any>(`/api/accounts/${id}/reset`, { method: 'POST' }),
   },
   trades: {

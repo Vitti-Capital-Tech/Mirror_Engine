@@ -38,7 +38,7 @@ export function TopBar() {
 
   const persistRead = (s: Set<string>) => {
     setReadIds(new Set(s));
-    try { localStorage.setItem('readAlertIds', JSON.stringify([...s])); } catch {}
+    try { localStorage.setItem('readAlertIds', JSON.stringify(Array.from(s))); } catch {}
   };
   const markRead = (id: string) => {
     if (readIds.has(id)) return;
@@ -123,7 +123,6 @@ export function TopBar() {
             : 'bg-red-500/10 text-red-400 border-red-500/25'
         }`}>
           <span className="relative flex h-2 w-2">
-            {isConnected && <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping" />}
             <span className={`relative inline-flex h-2 w-2 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-red-400'}`} />
           </span>
           <span className="hidden sm:inline">{isConnected ? 'LIVE' : 'DISCONNECTED'}</span>
@@ -230,7 +229,7 @@ export function TopBar() {
         <div className="flex items-center gap-2 pl-1.5 ml-0.5 border-l border-bg-border">
           {user?.email && (
             <span className="hidden sm:flex items-center gap-2">
-              <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-[11px] font-bold text-text-primary">
+              <span className="flex items-center justify-center w-7 h-7 rounded-md bg-bg-panel ring-1 ring-bg-border text-[11px] font-bold text-text-secondary">
                 {user.email.charAt(0).toUpperCase()}
               </span>
               <span className="text-[11px] font-medium text-text-secondary max-w-[140px] truncate">{user.email}</span>

@@ -3,7 +3,25 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 
 export function useAccounts() {
-  return useQuery({ queryKey: ['accounts'], queryFn: api.accounts.list, refetchInterval: 30000 });
+  return useQuery({
+    queryKey: ['accounts'],
+    queryFn: api.accounts.list,
+    refetchInterval: 30000,
+  });
+}
+
+
+/** Check credentials before anything is created.
+ *
+ *  Not a mutation in the React Query sense — it writes nothing and nothing
+ *  needs invalidating afterwards. It exists so the Add form can refuse to save
+ *  a key that does not work, instead of saving it and leaving an account that
+ *  looks fine on the list and only fails when a trade needs it.
+ */
+export async function verifyCredentials(data: {
+  api_key: string; api_secret: string; environment: string;
+}): Promise<{ ok: boolean; balance: number | null; message: string }> {
+  return api.accounts.verify(data);
 }
 
 export function useCreateAccount() {

@@ -1,28 +1,77 @@
 'use client';
 import React, { useState } from 'react';
-import { useCreateAccount, useAccounts } from '@/hooks/useAccounts';
-import { X, Eye, EyeOff, ShieldCheck, RefreshCw } from 'lucide-react';
-import { Select } from '@/components/shared/Select';
+import { useCreateAccount, useAccounts, verifyCredentials } from '@/hooks/useAccounts';
 import { useAuth } from '@/context/AuthContext';
-import { useAccountScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { Select } from '@/components/shared/Select';
+import { X, Eye, EyeOff, ChevronDown, Crown, CornerDownRight, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
+import toast from 'react-hot-toast';
 
-export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
+/**
+ * Add an account.
+ *
+ * The previous version was one long form that asked everything at once —
+ * connection details, who owns it, which master, role, copy mode, allocation
+ * value, allocated balance, max position, leverage — with conditionals bolted
+ * on to hide the parts that did not apply. Adding a copy meant scrolling past
+ * nine fields to fill in four, and answering "which role?" after already
+ * clicking "Add a copy".
+ *
+ * Four changes, all of them about asking less and saving less that is wrong:
+ *
+ *   * WHAT is being added is decided before the form opens, not inside it. The
+ *     title says so, and the role picker is gone on that path.
+ *   * The fields are grouped by what they are for — connecting the account,
+ *     then how much it should copy — instead of arriving in schema order.
+ *   * Everything with a sensible default is behind "Advanced", and the
+ *     defaults are real prefilled values rather than greyed-out placeholders,
+ *     so what will happen is readable without reading the docs.
+ *   * The account cannot be saved until its keys have actually reached Delta.
+ *     Nothing on the list looks more like a working account than a broken one,
+ *     so a mistyped key used to stay invisible until a trade needed it.
+ */
+
+const MAX_MASTERS = 5;
+const MAX_FOLLOWERS = 2;
+const DEFAULT_TP_SL_OFFSET = '50';
+// What the backend stores when the form leaves it blank (AccountCreate's own
+// default), shown as a real value so the number in force is the number on
+// screen rather than a greyed-out hint.
+const DEFAULT_LEVERAGE_LIMIT = '10';
+
+const LABEL = 'text-[10px] font-semibold uppercase tracking-wider text-text-muted';
+const HINT = 'text-[10.5px] text-text-muted';
+const INPUT =
+  'w-full bg-bg-primary border border-bg-border rounded-lg px-3 py-2.5 text-[13px] ' +
+  'text-text-primary placeholder:text-text-muted/70 outline-none focus:border-blue-500/70 transition-colors';
+
+/** How a copy is sized. One dropdown rather than four stacked cards: it is a
+ *  single decision, the recommended answer is right for almost everyone, and
+ *  the cards made the least interesting part of the form the tallest. */
+const COPY_MODES = [
+  { id: 'auto_ratio', title: 'Match balance automatically', hint: 'Sizes each copy by the balance ratio between the two accounts. Right for most setups.', unit: null, recommended: true },
+  { id: 'multiplier', title: 'Multiple of the master', hint: 'e.g. 2 copies twice the master’s size, whatever that size is.', unit: '×', recommended: false },
+  { id: 'fixed', title: 'Fixed size', hint: 'The same number of contracts every time, ignoring the master’s size.', unit: 'lots', recommended: false },
+  { id: 'capital_pct', title: 'Percentage of capital', hint: 'Sizes by a share of this account’s own balance.', unit: '%', recommended: false },
+] as const;
+
+export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
+  isOpen: boolean;
+  onClose: () => void;
+  /** Set when "Add a copy" was clicked inside a group, so the form already
+   *  knows what it is adding and to which master. */
+  presetMasterId?: string;
+}) {
   const createAccount = useCreateAccount();
   const { data: accounts = [] } = useAccounts();
   const { user } = useAuth();
   const { scope } = useAccountScope();
   const isAdmin = user?.role === 'admin';
 
-  // WHOSE account is being added. An admin sees every tenant, so without asking
-  // this the new row was stamped with the admin's own id — landing in a group
-  // of its own with no master to mirror, i.e. a follower that could never copy.
-  // Defaults to whichever group is currently in scope; on "All accounts" the
-  // admin has to say, because there is no sensible guess.
-  const groups = React.useMemo(() => groupByMaster(accounts as any[]), [accounts]);
-  const scoped = effectiveScope(accounts as any[], scope);
+  const cameFromGroup = !!presetMasterId;
+  const [isMaster, setIsMaster] = useState(!cameFromGroup);
 
-  // Distinct account HOLDERS (owners), for the admin's picker. Separate from
-  // groups now: one holder may run several master/follower groups.
+  // Holders, for an admin adding on someone else's behalf.
   const owners = React.useMemo(() => {
     const seen: Record<string, string> = {};
     for (const a of accounts as any[]) {
@@ -32,391 +81,403 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
     return Object.keys(seen).map((id) => ({ id, label: seen[id] }));
   }, [accounts]);
 
-  const scopedOwner = (accounts as any[]).find((a) =>
-    scoped !== ALL_ACCOUNTS && (a.is_master ? String(a.id) : String(a.master_id || '')) === scoped)?.owner_id;
-  const [ownerId, setOwnerId] = useState<string>(
-    String(scopedOwner || (owners.length === 1 ? owners[0].id : '')));
-
+  const scoped = effectiveScope(accounts as any[], scope);
+  const scopedOwner = (accounts as any[]).find(
+    (a) => scoped !== ALL_ACCOUNTS && (a.is_master ? String(a.id) : String(a.master_id || '')) === scoped)?.owner_id;
+  const [ownerId, setOwnerId] = useState<string>(String(scopedOwner || (owners.length === 1 ? owners[0].id : '')));
   const targetOwner = isAdmin ? ownerId : (owners[0]?.id ?? '');
 
-  // Which master a new FOLLOWER will copy. One owner may run up to 5 masters,
-  // so this can no longer be inferred — picking the wrong one puts the copy in
-  // someone else's group. Defaults to the group in scope, or the only one.
   const ownerMasters = (accounts as any[]).filter(
     (a) => a.is_master && (!targetOwner || String(a.owner_id) === String(targetOwner)));
-  const scopedMaster = ownerMasters.find((m) => String(m.id) === scoped);
-  const [masterId, setMasterId] = useState<string>('');
-  const effMasterId = masterId
-    || (scopedMaster ? String(scopedMaster.id) : '')
-    || (ownerMasters.length === 1 ? String(ownerMasters[0].id) : '');
+  const countFor = (mid: string) =>
+    (accounts as any[]).filter((a) => !a.is_master && String(a.master_id || '') === String(mid)).length;
 
-  // Masters are capped per owner; followers per master.
-  const MAX_MASTERS = 5, MAX_FOLLOWERS = 2;
+  const [masterId, setMasterId] = useState<string>(presetMasterId || '');
+  // Only auto-pick the sole master when it can actually take another copy —
+  // otherwise the form opens with a full master already chosen and the person
+  // finds out only when saving fails.
+  const soleMaster = ownerMasters.length === 1 && countFor(ownerMasters[0].id) < MAX_FOLLOWERS
+    ? String(ownerMasters[0].id) : '';
+  const effMasterId = masterId || soleMaster;
+  const chosenMaster = ownerMasters.find((m) => String(m.id) === effMasterId);
   const masterLimitReached = ownerMasters.length >= MAX_MASTERS;
-  const followersOfTarget = (accounts as any[]).filter(
-    (a) => !a.is_master && String(a.master_id || '') === effMasterId);
-  const followerLimitReached = !!effMasterId && followersOfTarget.length >= MAX_FOLLOWERS;
-  const hasMaster = masterLimitReached;
+  const followerLimitReached = !!effMasterId && countFor(effMasterId) >= MAX_FOLLOWERS;
 
-  // Form states
+  // Connection
   const [name, setName] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
-  const [isMaster, setIsMaster] = useState(false);
-  const [environment, setEnvironment] = useState<'demo' | 'live'>('demo');
-  const [allocationMode, setAllocationMode] = useState<'fixed' | 'multiplier' | 'capital_pct' | 'auto_ratio'>('auto_ratio');
-  const [allocationValue, setAllocationValue] = useState<string>('1.0');
-  const [allocatedBalance, setAllocatedBalance] = useState<string>('');
-  const [maxPositionSize, setMaxPositionSize] = useState<string>('');
-  const [leverageLimit, setLeverageLimit] = useState<string>('');
-  const [tpSlOffset, setTpSlOffset] = useState<string>('');
-
-  // UI States
+  const [environment, setEnvironment] = useState<'demo' | 'live'>('live');
   const [showKey, setShowKey] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
-  const [errorMsg, setErrorMsg] = useState('');
+
+  // Verification. Its own step, sitting with the keys it checks rather than on
+  // the save button: one button asks Delta whether these keys work, the other
+  // saves, and the save one stays out of reach until the first has answered.
+  // Dropped the moment any part of the connection changes, so what was checked
+  // is always what gets saved.
+  const [verifyState, setVerifyState] = useState<'idle' | 'checking' | 'ok' | 'fail'>('idle');
+  const [verifyMsg, setVerifyMsg] = useState('');
+  const verified = verifyState === 'ok';
+  const unverify = () => {
+    if (verifyState !== 'idle') { setVerifyState('idle'); setVerifyMsg(''); }
+  };
+
+  // Copying
+  const [copyMode, setCopyMode] = useState<string>('auto_ratio');
+  const [copyValue, setCopyValue] = useState('2');
+
+  // Advanced
+  const [advOpen, setAdvOpen] = useState(false);
+  const [allocatedBalance, setAllocatedBalance] = useState('');
+  const [maxPositionSize, setMaxPositionSize] = useState('');
+  const [leverageLimit, setLeverageLimit] = useState(DEFAULT_LEVERAGE_LIMIT);
+  const [tpSlOffset, setTpSlOffset] = useState(DEFAULT_TP_SL_OFFSET);
+
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   if (!isOpen) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    // Without a holder the backend falls back to the caller — which for an
-    // admin means a brand-new group with no master, and a follower that silently
-    // never copies. Better to refuse than to create something inert.
-    if (isAdmin && !ownerId) {
-      setErrorMsg('Choose which account holder this belongs to.');
-      return;
-    }
-    if (!isMaster && !effMasterId) {
-      setErrorMsg('Choose which master this follower should copy.');
-      return;
-    }
-    if (!isMaster && followerLimitReached) {
-      setErrorMsg(`That master already has ${MAX_FOLLOWERS} followers.`);
-      return;
-    }
-    if (isMaster && masterLimitReached) {
-      setErrorMsg(`That account holder already has ${MAX_MASTERS} masters.`);
-      return;
-    }
-    setIsSaving(true);
-    setErrorMsg('');
+  // When the form was opened from a group it already knows what it is adding,
+  // so the title says it. Otherwise the Master/Copy picker below answers that
+  // question and the title should not try to answer it twice.
+  const title = cameFromGroup && chosenMaster
+    ? `Add a copy to “${chosenMaster.name}”`
+    : 'Add account';
 
+  const runVerify = async () => {
+    setError('');
+    setVerifyState('checking');
     try {
-      const payload: any = {
-        name,
-        api_key: apiKey,
-        api_secret: apiSecret,
-        is_master: isMaster,
-        environment,
-      };
-
-      // Only an admin may set this; the backend ignores it from anyone else.
-      if (isAdmin && ownerId) payload.owner_id = ownerId;
-      // Which master a follower joins. One owner may run several groups, so
-      // the backend refuses to guess when there is more than one.
-      if (!isMaster && effMasterId) payload.master_id = effMasterId;
-
-      if (leverageLimit) {
-        payload.leverage_limit = parseInt(leverageLimit);
-      }
-      // Master only: how far this master's followers sit from its SL/TP.
-      if (isMaster && tpSlOffset) {
-        payload.tp_sl_offset = parseFloat(tpSlOffset);
-      }
-      if (allocatedBalance) {
-        payload.allocated_balance = parseFloat(allocatedBalance);
-      }
-
-      if (!isMaster) {
-        payload.allocation_mode = allocationMode;
-        payload.allocation_value = allocationValue ? parseFloat(allocationValue) : 1.0;
-        if (maxPositionSize) {
-          payload.max_position_size = parseFloat(maxPositionSize);
-        }
-      }
-
-      await createAccount.mutateAsync(payload);
-      onClose();
+      const res = await verifyCredentials({ api_key: apiKey, api_secret: apiSecret, environment });
+      const msg = res.message || (res.ok ? 'These keys work.' : 'These keys did not work.');
+      setVerifyMsg(msg);
+      setVerifyState(res.ok ? 'ok' : 'fail');
+      // Deliberately never "connected" — nothing has been connected or saved
+      // at this point. All that happened is that Delta answered these keys.
+      if (res.ok) toast.success(msg); else toast.error(msg);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to save account credentials.');
-    } finally {
-      setIsSaving(false);
+      const msg = err.message || 'Could not reach Delta to check the keys.';
+      setVerifyMsg(msg);
+      setVerifyState('fail');
+      toast.error(msg);
     }
   };
 
+  const save = async () => {
+    if (isAdmin && !ownerId) return setError('Choose which account holder this belongs to.');
+    if (!isMaster && !effMasterId) return setError('Choose which master this copy should follow.');
+    if (!isMaster && followerLimitReached) return setError(`That master already has ${MAX_FOLLOWERS} copies.`);
+    if (isMaster && masterLimitReached) return setError(`You already have ${MAX_MASTERS} master accounts.`);
+
+    const payload: any = { name, api_key: apiKey, api_secret: apiSecret, is_master: isMaster, environment };
+    if (isAdmin && ownerId) payload.owner_id = ownerId;
+    if (!isMaster) {
+      payload.master_id = effMasterId;
+      payload.allocation_mode = copyMode;
+      payload.allocation_value = copyMode === 'auto_ratio' ? 1.0 : parseFloat(copyValue || '1');
+      if (maxPositionSize) payload.max_position_size = parseFloat(maxPositionSize);
+    }
+    if (isMaster && tpSlOffset) payload.tp_sl_offset = parseFloat(tpSlOffset);
+    if (allocatedBalance) payload.allocated_balance = parseFloat(allocatedBalance);
+    if (leverageLimit) payload.leverage_limit = parseInt(leverageLimit);
+
+    setSaving(true);
+    try {
+      await createAccount.mutateAsync(payload);
+      toast.success(`“${name}” added.`);
+      onClose();
+    } catch (err: any) {
+      setError(err.message || 'Could not add the account.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    // Reached by pressing the greyed-out Add button, or by Enter. Say what is
+    // missing rather than silently doing nothing.
+    if (!verified) {
+      toast.error(
+        canVerify
+          ? 'Verify the keys first — press Verify keys above.'
+          : 'Enter the API key and secret, then verify them.');
+      return;
+    }
+    return save();
+  };
+
+  const mode = COPY_MODES.find((m) => m.id === copyMode)!;
+  const checking = verifyState === 'checking';
+  const canVerify = !!apiKey.trim() && !!apiSecret.trim() && !checking;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg-primary/80 backdrop-blur-sm p-4 select-none">
-      <div className="card-premium w-full max-w-[500px] overflow-hidden shadow-2xl animate-slide-in">
-        
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-bg-border">
-          <h3 className="text-sm font-bold text-text-primary tracking-wide">ADD EXCHANGE ACCOUNT</h3>
-          <button 
-            onClick={onClose} 
-            className="p-1 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-white transition-all"
-          >
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/70 backdrop-blur-sm overflow-y-auto p-4">
+      <div className="w-full max-w-[520px] my-auto rounded-2xl border border-bg-border bg-bg-panel shadow-2xl">
+        <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-bg-border">
+          <div className="min-w-0">
+            <h2 className="text-[15px] font-bold text-text-primary truncate">{title}</h2>
+            <p className="text-[11px] text-text-muted mt-0.5">
+              {isMaster
+                ? 'The account you trade yourself. Copies mirror what it does.'
+                : chosenMaster
+                  ? `Mirrors ${chosenMaster.name}. ${countFor(effMasterId)} of ${MAX_FOLLOWERS} copies used.`
+                  : 'Mirrors a master account you choose.'}
+            </p>
+          </div>
+          <button type="button" onClick={onClose}
+            className="p-1 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-secondary/60 transition-colors shrink-0">
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Form Body */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-4 text-xs font-semibold text-text-secondary">
-          {errorMsg && (
-            <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-lg text-[11px]">
-              {errorMsg}
+        <form onSubmit={submit} className="px-5 py-4 space-y-5">
+          {/* What is being added — only when it was not already decided. */}
+          {!cameFromGroup && (
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { v: true, icon: Crown, t: 'Master', d: 'You trade it' },
+                { v: false, icon: CornerDownRight, t: 'Copy', d: 'Mirrors a master' },
+              ].map(({ v, icon: Icon, t, d }) => (
+                <button key={t} type="button" onClick={() => setIsMaster(v)}
+                  className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors ${
+                    isMaster === v
+                      ? 'border-blue-500/60 bg-blue-500/10'
+                      : 'border-bg-border hover:border-bg-border/80 bg-bg-primary/40'}`}>
+                  <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${isMaster === v ? 'text-blue-400' : 'text-text-muted'}`} />
+                  <span className="min-w-0">
+                    <span className="block text-[12.5px] font-semibold text-text-primary">{t}</span>
+                    <span className="block text-[10.5px] text-text-muted">{d}</span>
+                  </span>
+                </button>
+              ))}
             </div>
           )}
 
-          {/* Account Name */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-text-muted uppercase tracking-wider text-[10px]">Account Name</label>
-            <input
-              type="text"
-              required
-              placeholder="e.g. My Demo Follower 1"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary focus:border-blue-500 outline-none transition-all"
-            />
-          </div>
-
-          {/* API Key */}
-          <div className="flex flex-col gap-1.5 relative">
-            <label className="text-text-muted uppercase tracking-wider text-[10px]">API Key</label>
-            <div className="relative">
-              <input
-                type={showKey ? 'text' : 'password'}
-                required
-                placeholder="Enter Delta India API Key"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                className="w-full bg-bg-primary border border-bg-border rounded-lg pl-3 pr-10 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
-              />
-              <button
-                type="button"
-                onClick={() => setShowKey(!showKey)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-white"
-              >
-                {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-              </button>
-            </div>
-          </div>
-
-          {/* API Secret */}
-          <div className="flex flex-col gap-1.5 relative">
-            <label className="text-text-muted uppercase tracking-wider text-[10px]">API Secret</label>
-            <div className="relative">
-              <input
-                type={showSecret ? 'text' : 'password'}
-                required
-                placeholder="Enter Delta India API Secret"
-                value={apiSecret}
-                onChange={(e) => setApiSecret(e.target.value)}
-                className="w-full bg-bg-primary border border-bg-border rounded-lg pl-3 pr-10 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
-              />
-              <button
-                type="button"
-                onClick={() => setShowSecret(!showSecret)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-white"
-              >
-                {showSecret ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-              </button>
-            </div>
-          </div>
-
-          {/* Who it belongs to — admins only; everyone else has exactly one answer */}
-          {isAdmin && (
+          {isAdmin && owners.length > 0 && (
             <div className="flex flex-col gap-1.5">
-              <label className="text-text-muted uppercase tracking-wider text-[10px]">
-                Add to which account holder
-              </label>
-              <Select
-                value={ownerId}
-                onChange={(v) => setOwnerId(v)}
-                options={[
-                  ...(ownerId ? [] : [{ value: '', label: 'Select an account holder…' }]),
-                  ...owners.map((o) => ({ value: o.id, label: o.label })),
-                  { value: user?.id || '', label: `${user?.email || 'Me'} (admin) — new group` },
-                ]}
-              />
-              <span className="text-[10px] text-text-muted">
-                A follower copies the master of the holder you pick. Adding it under a
-                holder with no master means it will never copy anything.
-              </span>
+              <label className={LABEL}>Account holder</label>
+              <Select size="lg" value={ownerId} onChange={setOwnerId}
+                placeholder="Select a holder…"
+                options={owners.map((o) => ({ value: o.id, label: o.label }))} />
             </div>
           )}
 
-          {/* Which master a FOLLOWER joins. Not inferable any more: one holder
-              may run several groups, and the wrong pick puts this account in
-              someone else's. */}
-          {!isMaster && (
+          {!isMaster && !cameFromGroup && (
             <div className="flex flex-col gap-1.5">
-              <label className="text-text-muted uppercase tracking-wider text-[10px]">
-                Copies which master
-              </label>
-              <Select
-                value={effMasterId}
-                onChange={(v) => setMasterId(v)}
-                options={[
-                  ...(effMasterId ? [] : [{ value: '', label: 'Select a master…' }]),
-                  ...ownerMasters.map((m: any) => {
-                    const n = (accounts as any[]).filter(
-                      (f) => !f.is_master && String(f.master_id || '') === String(m.id)).length;
-                    return {
-                      value: String(m.id),
-                      label: `${m.name} — ${n}/${MAX_FOLLOWERS} follower${n === 1 ? '' : 's'}${n >= MAX_FOLLOWERS ? ' (full)' : ''}`,
-                    };
-                  }),
-                ]}
-              />
-              <span className="text-[10px] text-text-muted">
-                {ownerMasters.length === 0
-                  ? 'No master yet — add one first, a follower has nothing to mirror.'
-                  : followerLimitReached
-                    ? `That master already has ${MAX_FOLLOWERS} followers.`
-                    : `Each master can have up to ${MAX_FOLLOWERS} followers.`}
-              </span>
+              <label className={LABEL}>Copies which master</label>
+              <Select size="lg" value={effMasterId} onChange={setMasterId}
+                placeholder="Select a master…"
+                options={ownerMasters.map((m: any) => {
+                  const n = countFor(m.id);
+                  const full = n >= MAX_FOLLOWERS;
+                  return {
+                    value: String(m.id),
+                    label: `${m.name} — ${n} of ${MAX_FOLLOWERS} copies used`,
+                    // Still listed, so it is clear the master exists and why it
+                    // cannot take another copy — but faded and not pickable.
+                    disabled: full,
+                    badge: full ? 'Full' : undefined,
+                  };
+                })} />
+              {ownerMasters.length === 0 && (
+                <span className="text-[10.5px] text-amber-400">
+                  No master yet — add one first, a copy has nothing to mirror.
+                </span>
+              )}
             </div>
           )}
 
-          {/* Role and Environment Toggles */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="flex flex-col gap-1.5">
-              <label className="text-text-muted uppercase tracking-wider text-[10px]">Account Role</label>
-              <Select
-                value={isMaster ? 'master' : 'follower'}
-                onChange={(v) => setIsMaster(v === 'master')}
-                options={[
-                  { value: 'follower', label: 'Follower' },
-                  ...(!hasMaster ? [{ value: 'master', label: 'Master' }] : []),
-                ]}
-              />
-            </div>
+          {/* Connection */}
+          <div className="space-y-3">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-blue-400">Connection</div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-text-muted uppercase tracking-wider text-[10px]">Environment</label>
-              <Select
-                value={environment}
-                onChange={(v) => setEnvironment(v as 'demo' | 'live')}
-                options={[
-                  { value: 'demo', label: 'Demo (Testnet)' },
-                  { value: 'live', label: 'Live (Production)' },
-                ]}
-              />
+              <label className={LABEL}>Account name</label>
+              <input required value={name} onChange={(e) => setName(e.target.value)}
+                placeholder={isMaster ? 'e.g. BTC scalper' : 'e.g. BTC scalper copy'} className={INPUT} />
             </div>
-          </div>
 
-          {/* Allocated Balance (optional, used for ratio sizing) */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-text-muted uppercase tracking-wider text-[10px]">Allocated Balance (USD) — optional</label>
-            <input
-              type="number"
-              step="0.01"
-              min="0"
-              placeholder="Leave blank to use real balance"
-              value={allocatedBalance}
-              onChange={(e) => setAllocatedBalance(e.target.value)}
-              className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary focus:border-blue-500 outline-none transition-all font-mono"
-            />
-            <p className="text-[10px] text-text-muted font-normal leading-relaxed">
-              Overrides the real balance when computing the copy ratio. e.g. set 60 on the master and 56 on the follower so 1 lot copies as ~1 lot.
-            </p>
-          </div>
-
-          {/* Allocation Config (Follower only) */}
-          {/* Master only: the SL/TP spread for this master's copies */}
-          {isMaster && (
+            {/* Environment comes before the keys because it decides which
+                account the keys belong to — and because the check at the end
+                of this block has to be the last thing in it. */}
             <div className="flex flex-col gap-1.5">
-              <label className="text-text-muted uppercase tracking-wider text-[10px]">
-                TP / SL offset — optional
-              </label>
-              <input
-                type="number" step="any" min="0" value={tpSlOffset}
-                onChange={(e) => setTpSlOffset(e.target.value)}
-                placeholder="50 (default)"
-                className="bg-bg-primary border border-bg-border rounded-xl px-3.5 py-3 text-sm text-text-primary placeholder:text-text-muted outline-none focus:border-blue-500/70"
-              />
-              <span className="text-[10px] text-text-muted">
-                In price units. Copies straddle this master's stop — the 1st sits at
-                +offset, the 2nd at −offset — so they don't all trigger at the same
-                instant. Blank uses the default of 50.
-              </span>
-            </div>
-          )}
-
-          {!isMaster && (
-            <div className="border border-bg-border rounded-xl p-4 bg-bg-primary/45 space-y-3">
-              <div className="text-[10px] text-blue-400 font-bold uppercase tracking-wider">
-                Follower Copy Settings
+              <label className={LABEL}>Environment</label>
+              <div className="grid grid-cols-2 gap-2">
+                {(['live', 'demo'] as const).map((env) => (
+                  <button key={env} type="button" onClick={() => { setEnvironment(env); unverify(); }}
+                    className={`py-2 rounded-lg border text-[12px] font-semibold transition-colors ${
+                      environment === env
+                        ? 'border-blue-500/60 bg-blue-500/10 text-text-primary'
+                        : 'border-bg-border text-text-muted hover:text-text-secondary'}`}>
+                    {env === 'live' ? 'Live' : 'Demo (testnet)'}
+                  </button>
+                ))}
               </div>
+            </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className={`flex flex-col gap-1.5 ${allocationMode === 'auto_ratio' ? 'col-span-2' : 'col-span-2 sm:col-span-1'}`}>
-                  <label className="text-text-muted uppercase tracking-wider text-[9px]">Copy Mode</label>
-                  <Select
-                    value={allocationMode}
-                    onChange={(mode) => {
-                      setAllocationMode(mode as any);
-                      if (mode === 'auto_ratio') {
-                        setAllocationValue('1.0'); // default fallback value
-                      }
-                    }}
-                    options={[
-                      { value: 'auto_ratio', label: 'Auto Balance Ratio (Recommended)' },
-                      { value: 'multiplier', label: 'Multiplier (x Size)' },
-                    ]}
-                  />
-                  {allocationMode === 'auto_ratio' && (
-                    <p className="text-[10px] text-text-muted font-normal leading-relaxed mt-0.5">
-                      Sizes each copy by the follower-to-master balance ratio automatically.
-                    </p>
-                  )}
+            {[
+              { label: 'API key', v: apiKey, set: setApiKey, show: showKey, toggle: () => setShowKey((x) => !x) },
+              { label: 'API secret', v: apiSecret, set: setApiSecret, show: showSecret, toggle: () => setShowSecret((x) => !x) },
+            ].map((f) => (
+              <div key={f.label} className="flex flex-col gap-1.5">
+                <label className={LABEL}>{f.label}</label>
+                <div className="relative">
+                  <input required type={f.show ? 'text' : 'password'} value={f.v}
+                    onChange={(e) => { f.set(e.target.value); unverify(); }}
+                    placeholder={`Delta India ${f.label.toLowerCase()}`}
+                    className={`${INPUT} pr-10 font-mono`} />
+                  <button type="button" onClick={f.toggle} tabIndex={-1}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary">
+                    {f.show ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            {/* The check belongs with the fields it checks, not on the save
+                button. Its result stays here as one quiet line — a filled
+                green panel on a form that has saved nothing reads as "this
+                account is live", which it is not. */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <button type="button" onClick={runVerify} disabled={!canVerify || verified}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[12px] font-semibold transition-colors ${
+                  verified
+                    ? 'border-emerald-500/30 text-emerald-300/80 cursor-default'
+                    : 'border-bg-border text-text-secondary hover:text-text-primary hover:border-blue-500/50 disabled:text-text-muted disabled:border-bg-border disabled:cursor-not-allowed'}`}>
+                {checking
+                  ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Checking…</>
+                  : verified
+                    ? <><ShieldCheck className="w-3.5 h-3.5" /> Verified</>
+                    : <><ShieldCheck className="w-3.5 h-3.5" /> Verify keys</>}
+              </button>
+              {verifyState === 'idle' && (
+                <span className={HINT}>
+                  {canVerify ? 'Check these against Delta before saving.' : 'Enter the key and secret first.'}
+                </span>
+              )}
+              {verifyState === 'ok' && <span className={HINT}>{verifyMsg}</span>}
+              {verifyState === 'fail' && (
+                <span className="text-[10.5px] text-red-300 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  <span>{verifyMsg}</span>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* How much to copy (copies only) */}
+          {!isMaster && (
+            <div className="space-y-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-blue-400">How much to copy</div>
+              <Select size="lg" value={copyMode} onChange={setCopyMode}
+                options={COPY_MODES.map((m) => ({
+                  value: m.id,
+                  label: m.recommended ? `${m.title} (Recommended)` : m.title,
+                }))} />
+              <p className={HINT}>{mode.hint}</p>
+              {mode.unit && (
+                <div className="flex items-center gap-2 pt-1">
+                  <input type="number" step="any" min="0" value={copyValue}
+                    onChange={(e) => setCopyValue(e.target.value)} className={`${INPUT} w-28 font-mono`} />
+                  <span className="text-[12px] text-text-muted">{mode.unit}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Advanced */}
+          <div className="rounded-xl border border-bg-border overflow-hidden">
+            <button type="button" onClick={() => setAdvOpen((o) => !o)}
+              className="w-full flex items-center justify-between px-3.5 py-2.5 text-left hover:bg-bg-secondary/40 transition-colors">
+              <span className="text-[12px] font-semibold text-text-secondary">Advanced — optional</span>
+              <ChevronDown className={`w-4 h-4 text-text-muted transition-transform ${advOpen ? 'rotate-180' : ''}`} />
+            </button>
+            {advOpen && (
+              <div className="px-3.5 pb-3.5 pt-1 space-y-3 border-t border-bg-border">
+                <div className="flex flex-col gap-1.5">
+                  <label className={LABEL}>Allocated balance (USD)</label>
+                  <input type="number" step="any" min="0" value={allocatedBalance}
+                    onChange={(e) => setAllocatedBalance(e.target.value)}
+                    placeholder="Blank = use the real balance" className={`${INPUT} font-mono`} />
+                  <span className={HINT}>
+                    Overrides the real balance when working out the copy ratio.
+                  </span>
                 </div>
 
-                {allocationMode !== 'auto_ratio' && (
-                  <div className="flex flex-col gap-1.5 col-span-2 sm:col-span-1 animate-slide-in">
-                    <label className="text-text-muted uppercase tracking-wider text-[9px]">Multiplier Value</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0.01"
-                      required
-                      value={allocationValue}
-                      onChange={(e) => setAllocationValue(e.target.value)}
-                      className="bg-bg-primary border border-bg-border rounded-lg px-3 py-2 text-text-primary outline-none focus:border-blue-500"
-                    />
+                {isMaster && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className={LABEL}>SL / TP offset</label>
+                    <input type="number" step="any" min="0" value={tpSlOffset}
+                      onChange={(e) => setTpSlOffset(e.target.value)}
+                      className={`${INPUT} font-mono`} />
+                    <span className={HINT}>
+                      Copies straddle this master’s stop — the 1st sits at +{tpSlOffset || DEFAULT_TP_SL_OFFSET},
+                      the 2nd at −{tpSlOffset || DEFAULT_TP_SL_OFFSET}, so they don’t all trigger at the same
+                      instant. {DEFAULT_TP_SL_OFFSET} suits most setups; change it only if you mean to.
+                    </span>
                   </div>
                 )}
+
+                {!isMaster && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className={LABEL}>Max position size</label>
+                    <input type="number" step="any" min="0" value={maxPositionSize}
+                      onChange={(e) => setMaxPositionSize(e.target.value)} placeholder="No cap"
+                      className={`${INPUT} font-mono`} />
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1.5">
+                  <label className={LABEL}>Leverage limit</label>
+                  <input type="number" min="1" max="200" value={leverageLimit}
+                    onChange={(e) => setLeverageLimit(e.target.value)}
+                    className={`${INPUT} font-mono`} />
+                  <span className={HINT}>
+                    Only used here, to estimate the margin a copied trade needs before
+                    placing it. It is not sent to Delta and does not change the leverage
+                    set on the exchange.
+                  </span>
+                </div>
               </div>
+            )}
+          </div>
+
+          {error && (
+            <div className="flex items-start gap-2 text-[11.5px] text-red-300 bg-red-500/10 border border-red-500/25 rounded-lg px-3 py-2.5">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-px" />
+              <span>{error}</span>
             </div>
           )}
 
-          {/* Action Buttons */}
-          <div className="flex gap-3 pt-4 border-t border-bg-border select-none">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={isSaving}
-              className="flex-1 py-2 bg-bg-secondary hover:bg-[#2e2e3e] text-text-primary rounded-lg border border-[#2e2e3e] transition-all font-semibold"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={isSaving}
-              className="flex-1 py-2 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white rounded-lg transition-all flex items-center justify-center gap-1.5 font-semibold"
-            >
-              {isSaving ? (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                'Save Account'
-              )}
-            </button>
+          <div className="space-y-2 pt-1">
+            <div className="flex gap-2">
+              <button type="button" onClick={onClose}
+                className="flex-1 py-2.5 rounded-lg border border-bg-border text-[13px] font-semibold text-text-secondary hover:text-text-primary transition-colors">
+                Cancel
+              </button>
+              {/* Looks unavailable until the keys have answered, but is NOT a
+                  disabled element: a disabled button fires no click at all, so
+                  pressing it would do nothing and explain nothing. It stays
+                  live, refuses the submit, and says why. */}
+              <button type="submit" disabled={saving} aria-disabled={!verified}
+                title={!verified ? 'Verify the keys first' : undefined}
+                className={`flex-1 py-2.5 rounded-lg text-[13px] font-semibold transition-colors inline-flex items-center justify-center gap-2 ${
+                  verified
+                    ? 'bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-60'
+                    : 'bg-bg-primary border border-bg-border text-text-muted hover:text-text-secondary cursor-not-allowed'}`}>
+                {saving && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                {isMaster ? 'Add master' : 'Add copy'}
+              </button>
+            </div>
+            {!verified && (
+              <p className={`${HINT} text-center`}>
+                Verify the keys above to enable this.
+              </p>
+            )}
           </div>
         </form>
       </div>
