@@ -18,6 +18,12 @@ import { ChevronDown, User } from 'lucide-react';
  *
  * Collapsible, because oversight is usually "is anyone's desk on fire", and
  * that is answered by the totals on this bar without opening anything.
+ *
+ * Its figures are labelled "total …", one step up from a group's "group …"
+ * and an account's bare "balance". Three levels of summary stacked on a page
+ * all reading "BALANCE" is three numbers that look like the same measurement
+ * of different things, when they are different measurements: an account, that
+ * account's group, and everything this person holds.
  */
 export interface OwnerStat {
   label: string;
@@ -26,11 +32,14 @@ export interface OwnerStat {
 }
 
 export function OwnerSection({
-  email, subtitle, stats = [], children, defaultOpen = true,
+  email, subtitle, stats = [], status, children, defaultOpen = true,
 }: {
   email?: string;
   subtitle: string;
   stats?: OwnerStat[];
+  /** Whether anything on this desk needs a human — see DeskHealth. Totals
+   *  answer "how much" and never "is it working". */
+  status?: React.ReactNode;
   children: React.ReactNode;
   defaultOpen?: boolean;
 }) {
@@ -56,13 +65,14 @@ export function OwnerSection({
             <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">
               Holder
             </span>
+            {status}
           </div>
           <div className="text-[11px] text-text-muted mt-0.5 truncate">{subtitle}</div>
         </div>
 
         <div className="basis-full sm:basis-auto shrink-0 flex items-center justify-end gap-3 sm:gap-6 pl-8 sm:pl-0">
           {stats.map((s) => (
-            <div key={s.label} className="w-[4.75rem] sm:w-28 shrink-0 text-right">
+            <div key={s.label} className="w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right">
               <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">
                 {s.label}
               </div>

@@ -8,6 +8,7 @@ import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
 import { OwnerSection } from '@/components/shared/OwnerSection';
 import { ViewingAs } from '@/components/shared/ViewingAs';
+import { DeskHealth } from '@/components/shared/DeskHealth';
 import { Plus } from 'lucide-react';
 
 export default function AccountsPage() {
@@ -101,6 +102,10 @@ export default function AccountsPage() {
         <ViewingAs
           label={viewingLabel}
           detail="this is exactly what they see"
+          status={<DeskHealth
+            paused={accounts.filter((a: any) => a.status !== 'active').length}
+            failing={accounts.filter((a: any) => Number(a.consecutive_failures || 0) > 0).length}
+          />}
           onClear={() => setScope(ALL_ACCOUNTS)}
         />
       )}
@@ -131,9 +136,13 @@ export default function AccountsPage() {
                 return (
                   <OwnerSection key={o.ownerId} email={o.email}
                     subtitle={`${o.groups.length} group${o.groups.length === 1 ? '' : 's'} · ${accs.length} account${accs.length === 1 ? '' : 's'}${off ? ` · ${off} paused` : ''}`}
+                    status={<DeskHealth
+                      paused={off}
+                      failing={accs.filter((a: any) => Number(a.consecutive_failures || 0) > 0).length}
+                    />}
                     stats={[
-                      { label: 'Balance', value: money2(bal) },
-                      { label: 'Today', value: `${pnl > 0 ? '+' : ''}${money2(pnl)}`,
+                      { label: 'Total balance', value: money2(bal) },
+                      { label: 'Total today', value: `${pnl > 0 ? '+' : ''}${money2(pnl)}`,
                         tone: pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'flat' },
                     ]}>
                     {o.groups.map((g) => (

@@ -12,6 +12,7 @@ import { Loader } from '@/components/shared/Loader';
 import { PositionGroup } from '@/components/positions/PositionGroup';
 import { OwnerSection } from '@/components/shared/OwnerSection';
 import { ViewingAs } from '@/components/shared/ViewingAs';
+import { DeskHealth, countMismatches } from '@/components/shared/DeskHealth';
 
 /**
  * Open positions, by group.
@@ -144,6 +145,10 @@ export default function PositionsPage() {
         <ViewingAs
           label={viewingLabel}
           detail="this is exactly what they see"
+          status={<DeskHealth
+            mismatches={countMismatches(groups as any[], positions as any[])}
+            failing={(visible as any[]).filter((a: any) => Number(a.consecutive_failures || 0) > 0).length}
+          />}
           onClear={() => setScope(ALL_ACCOUNTS)}
         />
       )}
@@ -171,13 +176,17 @@ export default function PositionsPage() {
                 return (
                   <OwnerSection key={o.ownerId} email={o.email}
                     subtitle={`${o.groups.length} group${o.groups.length === 1 ? '' : 's'} · ${accs.length} account${accs.length === 1 ? '' : 's'} · ${legs.length} open`}
+                    status={<DeskHealth
+                      mismatches={countMismatches(o.groups as any[], positions as any[])}
+                      failing={accs.filter((a: any) => Number(a.consecutive_failures || 0) > 0).length}
+                    />}
                     stats={[
-                      { label: 'Balance', value: money(bal) },
-                      { label: 'Realised', value: signed(real),
+                      { label: 'Total balance', value: money(bal) },
+                      { label: 'Total realised', value: signed(real),
                         tone: real > 0 ? 'pos' : real < 0 ? 'neg' : 'flat' },
-                      { label: 'Unreal.', value: legs.length ? signed(unreal) : '—',
+                      { label: 'Total unreal.', value: legs.length ? signed(unreal) : '—',
                         tone: unreal > 0 ? 'pos' : unreal < 0 ? 'neg' : 'flat' },
-                      { label: 'Today', value: signed(day), tone: day > 0 ? 'pos' : day < 0 ? 'neg' : 'flat' },
+                      { label: 'Total today', value: signed(day), tone: day > 0 ? 'pos' : day < 0 ? 'neg' : 'flat' },
                     ]}>
                     {o.groups.map((g) => (
                       <PositionGroup key={g.groupId} group={g} positions={positions as any[]}

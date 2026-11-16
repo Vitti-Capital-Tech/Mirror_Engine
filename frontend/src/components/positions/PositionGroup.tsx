@@ -52,10 +52,12 @@ const MAX_CHIPS = 4;
 const MAX_MISSING = 3;
 
 export const PCOL = {
-  balance: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
-  realised: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
-  unreal: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
-  today: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
+  // Wide enough to spell the group labels out. "Grp realised" saved twelve
+  // pixels and made the reader decode an abbreviation on a column of money.
+  balance: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
+  realised: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
+  unreal: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
+  today: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
 };
 
 /** A symbol the account is holding, and which way. Direction is the colour of
@@ -214,7 +216,7 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
           visit. A collapsed account is still not mounted, so collapsing one
           does stop it polling — it is just no longer the starting state. */}
       {open && (
-        <div className="px-3 sm:px-4 pb-4 pt-1 bg-bg-primary border-t border-bg-border">
+        <div className="px-3 sm:px-4 py-3 bg-bg-primary border-t border-bg-border">
           <AccountPositionCard acc={acc} compact />
         </div>
       )}
@@ -293,17 +295,17 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
             <div className="text-[13px] font-mono font-bold text-text-primary">{money(groupBalance)}</div>
           </div>
           <div className={PCOL.realised}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp realised</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group realised</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupRealised)}`}>{signed(groupRealised)}</div>
           </div>
           <div className={PCOL.unreal}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp unreal.</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group unreal.</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupUnreal)}`}>
               {groupLegs.length ? signed(groupUnreal) : '—'}
             </div>
           </div>
           <div className={PCOL.today}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp today</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group today</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupToday)}`}>{signed(groupToday)}</div>
           </div>
         </div>

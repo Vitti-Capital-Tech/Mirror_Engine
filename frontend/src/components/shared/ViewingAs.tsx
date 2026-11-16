@@ -16,9 +16,10 @@ import { Eye, X } from 'lucide-react';
  * a normal user is always looking at their own accounts and telling them so
  * would be telling them who they are.
  */
-export function ViewingAs({ label, detail, onClear }: {
+export function ViewingAs({ label, detail, status, onClear }: {
   label: string;
   detail?: string;
+  status?: React.ReactNode;
   onClear: () => void;
 }) {
   return (
@@ -29,6 +30,7 @@ export function ViewingAs({ label, detail, onClear }: {
         <span className="font-semibold text-text-primary">{label}</span>
         {detail ? <span className="text-text-muted"> · {detail}</span> : null}
       </div>
+      {status ? <span className="shrink-0">{status}</span> : null}
       <button type="button" onClick={onClear}
         className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-bg-border px-2 py-1 text-[11px] font-semibold text-text-secondary hover:text-text-primary hover:border-blue-500/50 transition-colors">
         <X className="w-3 h-3" /> All accounts
