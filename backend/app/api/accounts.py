@@ -1,5 +1,6 @@
 import logging
 from typing import List
+from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, BackgroundTasks, status, Depends
 from app.database import db
 from app.models.account import AccountCreate, AccountUpdate, AccountResponse, AccountTestResult
@@ -314,13 +315,36 @@ async def reset_account(id: str, user: CurrentUser = Depends(get_current_user)):
 
 @router.post("/{id}/promote", response_model=AccountResponse)
 async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)):
-    """Promote a follower to master. Demotes the current master to follower.
+    """Swap a copy and its master, WITHIN that copy's own group.
 
-    Only one master is ever allowed, so this is an atomic swap:
-      - current master  -> follower
-      - target account   -> master
-    WebSocket feeds are rewired: the new master listens for fills, the demoted
-    account switches to position monitoring.
+    This was written when an owner could hold only one master, and both of its
+    assumptions have since stopped being true:
+
+      * It found "the current master" by owner_id alone. An owner now holds up
+        to five, so that picked an arbitrary one — quite possibly the master of
+        a group the click had nothing to do with — and tore down its feed.
+      * It never touched master_id, because master_id did not exist. That is
+        what a group IS now, so leaving it alone left the new master pointing
+        at a follower, the old master pointing at nothing, and the sibling
+        copies still following an account that was no longer a master.
+
+    It also ran its writes in an order that failed unsafe. The old master was
+    demoted FIRST and its listener stopped, then the follower was promoted —
+    and that promotion is rejected outright by accounts_master_id_check, since
+    the follower still carried a master_id and a master may not have one. The
+    group was left with no master at all and copying simply stopped.
+
+    So the order below is deliberate, and every intermediate state is legal:
+
+      1. promote the target and clear its master_id, in one write;
+      2. move the remaining copies onto it (the target no longer matches,
+         having just had its own master_id cleared);
+      3. demote the old master and point it at the new one.
+
+    If any step fails the group still has a master — step 1 leaves the old
+    group whole, steps 2 and 3 leave the new master in charge. The feeds are
+    rewired only once the writes have gone through, so a rejected write can no
+    longer take a live listener down with it.
     """
     try:
         target = owned_account_or_404(id, user)
@@ -328,30 +352,44 @@ async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)
         if target.get("is_master"):
             raise HTTPException(status_code=400, detail="Account is already the master.")
 
-        # Find the current master for THIS owner (if any)
-        master_res = db.table("accounts").select("*").eq("is_master", True).eq("owner_id", target["owner_id"]).execute()
-        old_master = master_res.data[0] if master_res.data else None
+        # The group is whatever THIS copy follows — never "a master belonging
+        # to this owner". A copy that follows nothing simply becomes a master
+        # of its own, with no one to demote.
+        old_master_id = target.get("master_id")
+        old_master = None
+        if old_master_id:
+            res = db.table("accounts").select("*").eq("id", old_master_id).execute()
+            old_master = res.data[0] if res.data else None
 
-        # Tear down both feeds: old master's per-user listener + target's follower feed
-        if old_master:
-            await listener_manager.stop_master(old_master["id"])
-        await connection_manager.disconnect_account(id)
-
-        # Swap roles in the DB
-        if old_master:
-            db.table("accounts").update({"is_master": False}).eq("id", old_master["id"]).execute()
-        upd = db.table("accounts").update({"is_master": True}).eq("id", id).execute()
+        # 1. Promote. Clearing master_id in the SAME write is what keeps this
+        #    legal under accounts_master_id_check.
+        upd = db.table("accounts").update(
+            {"is_master": True, "master_id": None}).eq("id", id).execute()
         if not upd.data:
             raise HTTPException(status_code=500, detail="Failed to promote account.")
         new_master = upd.data[0]
+
+        if old_master:
+            # 2. The rest of the group follows the new master. The target is
+            #    already excluded — its own master_id was cleared in step 1.
+            db.table("accounts").update(
+                {"master_id": id}).eq("master_id", old_master_id).execute()
+
+            # 3. The old master joins its former group as a copy.
+            db.table("accounts").update(
+                {"is_master": False, "master_id": id}).eq("id", old_master_id).execute()
+
         # Role change: drop everything, not just this row.
         account_cache.invalidate()
 
-        # Rewire WebSocket feeds for the new roles
-        await start_account_ws(new_master)  # master -> on_fill callback
+        # Feeds last, so a refused write cannot leave a group silently
+        # disconnected. The new master needs the fill listener; the demoted one
+        # drops to position monitoring.
+        await connection_manager.disconnect_account(id)
+        await start_account_ws(new_master)
         if old_master:
-            demoted = {**old_master, "is_master": False}
-            await start_account_ws(demoted)  # follower -> position callback
+            await listener_manager.stop_master(old_master_id)
+            await start_account_ws({**old_master, "is_master": False, "master_id": id})
 
         resp_acc = dict(new_master)
         return _mask_secrets(resp_acc)
@@ -360,6 +398,54 @@ async def promote_account(id: str, user: CurrentUser = Depends(get_current_user)
     except Exception as e:
         logger.error(f"Error promoting account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+class VerifyCredentialsIn(BaseModel):
+    api_key: str
+    api_secret: str
+    environment: str = "live"
+
+
+@router.post("/verify")
+async def verify_credentials(body: VerifyCredentialsIn,
+                             user: CurrentUser = Depends(get_current_user)):
+    """Check a key/secret pair against Delta BEFORE an account is created.
+
+    The existing /{id}/test can only check an account that already exists, so
+    the only way to find out that a key was wrong was to save it and watch the
+    account sit there failing — a broken account on the list that looks exactly
+    like a working one until something needs to trade.
+
+    Nothing is written. The credentials are used once, in memory, to read the
+    wallet; the balance comes back so the person can confirm they connected the
+    account they meant to and not another one.
+    """
+    try:
+        client = DeltaClient(api_key=body.api_key, api_secret=body.api_secret,
+                             environment=body.environment or "live")
+        wallet = await client.get_wallet()
+    except Exception as e:
+        # Delta's own message is more useful than anything we could invent
+        # ("invalid api key", "ip not whitelisted"), but it is also the only
+        # thing we know — so pass it through rather than guessing a cause.
+        return {"ok": False, "message": f"These keys did not work: {str(e)[:200]}"}
+
+    rows = wallet.get("result", wallet) if isinstance(wallet, dict) else wallet
+    balance = None
+    if isinstance(rows, list):
+        settle = next((b for b in rows
+                       if (b.get("asset_symbol") or b.get("asset")) in ("USD", "USDT")), None)
+        if settle:
+            try:
+                balance = float(settle.get("balance") or settle.get("wallet_balance") or 0.0)
+            except (TypeError, ValueError):
+                balance = None
+    if balance is None:
+        # Reached Delta and it answered, but not with a wallet we recognise.
+        # Still a successful connection — say so without inventing a figure.
+        return {"ok": True, "balance": None, "message": "These keys work."}
+    return {"ok": True, "balance": balance,
+            "message": f"These keys work — {balance:,.2f} USDT on this account."}
+
 
 @router.post("/{id}/test", response_model=AccountTestResult)
 async def test_account(id: str, user: CurrentUser = Depends(get_current_user)):
