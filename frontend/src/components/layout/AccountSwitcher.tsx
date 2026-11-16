@@ -3,7 +3,7 @@ import React from 'react';
 import { ChevronDown, Check, Crown, CornerDownRight, Layers } from 'lucide-react';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useAuth } from '@/context/AuthContext';
-import { useAccountScope, groupByOwner, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, groupByMaster, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 
 /**
  * Pick which SET of accounts the dashboard is showing, or all of them.
@@ -39,7 +39,7 @@ export function AccountSwitcher() {
     return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
 
-  const groups = groupByOwner(accounts as any[]);
+  const groups = groupByMaster(accounts as any[]);
 
   // ADMIN ONLY. A normal user is scoped to their own accounts by the backend,
   // so there is exactly one group and the control can only ever be a no-op —
@@ -55,7 +55,7 @@ export function AccountSwitcher() {
   // label as much as the switch.
   if (user?.role !== 'admin' || !accounts.length) return null;
 
-  const selected = groups.find((g) => g.ownerId === scope);
+  const selected = groups.find((g) => g.groupId === scope);
   const label = selected ? selected.label : 'All accounts';
 
   const countLabel = (g: typeof groups[number]) => {
@@ -94,15 +94,15 @@ export function AccountSwitcher() {
 
           {groups.map((g) => (
             <button
-              key={g.ownerId}
+              key={g.groupId}
               type="button"
-              onClick={() => { setScope(g.ownerId); setOpen(false); }}
+              onClick={() => { setScope(g.groupId); setOpen(false); }}
               className="w-full px-3 py-2 text-left hover:bg-bg-secondary/70 transition-colors"
             >
               <span className="flex items-center gap-2">
                 <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span className="text-[12px] font-semibold text-text-primary truncate flex-1">{g.label}</span>
-                {scope === g.ownerId && <Check className="w-3.5 h-3.5 text-blue-400 shrink-0" />}
+                {scope === g.groupId && <Check className="w-3.5 h-3.5 text-blue-400 shrink-0" />}
               </span>
               <span className="block pl-[22px] text-[10px] text-text-muted mt-0.5">{countLabel(g)}</span>
               {/* What is inside the group, so picking it is not a guess. */}

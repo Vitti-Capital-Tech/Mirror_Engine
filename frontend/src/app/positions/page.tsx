@@ -3,7 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
 import { OwnerGroup } from '@/components/shared/OwnerGroup';
 import { useSocket } from '@/hooks/useSocket';
@@ -82,12 +82,12 @@ export default function PositionsPage() {
         // point, not just separating them.
         const isAdmin = user?.role === 'admin';
         if (isAdmin && effectiveScope(visible as any[], scope) === ALL_ACCOUNTS && visible.length > 0) {
-          const groups = groupByOwner(visible as any[]);
+          const groups = groupByMaster(visible as any[]);
           return (
             <div className="space-y-5">
               {groups.map((g) => (
                 <OwnerGroup
-                  key={g.ownerId}
+                  key={g.groupId}
                   email={(g.master as any)?.owner_email
                     ?? (g.followers[0] as any)?.owner_email}
                   master={g.master}

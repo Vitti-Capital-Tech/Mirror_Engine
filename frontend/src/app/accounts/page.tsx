@@ -1,7 +1,7 @@
 'use client';
 import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
 import { OwnerGroup } from '@/components/shared/OwnerGroup';
 import { AccountsTable } from '@/components/accounts/AccountsTable';
@@ -62,9 +62,9 @@ export default function AccountsPage() {
       {isLoading ? <Loader label="Loading accounts…" /> : (
         user?.role === 'admin' && effectiveScope(accounts, scope) === ALL_ACCOUNTS && accounts.length > 0 ? (
           <div className="space-y-5">
-            {groupByOwner(accounts).map((g) => (
+            {groupByMaster(accounts).map((g) => (
               <OwnerGroup
-                key={g.ownerId}
+                key={g.groupId}
                 email={(g.master as any)?.owner_email ?? (g.followers[0] as any)?.owner_email}
                 master={g.master}
                 followers={g.followers}

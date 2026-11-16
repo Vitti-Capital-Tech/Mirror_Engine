@@ -153,6 +153,7 @@ class TradeListener:
         payload = {
             "action": "reconcile_positions",
             "owner_id": self._owner_id(),
+            "master_account_id": self._master_id(),
             "positions": positions,
         }
         await self.redis.lpush("order_events", json.dumps(payload))
@@ -194,6 +195,20 @@ class TradeListener:
             except Exception as e:
                 logger.warning("Could not refresh master owner: %s", e)
         return (self.master_account or {}).get("owner_id")
+
+    def _master_id(self):
+        """WHICH master this listener speaks for.
+
+        owner_id alone used to identify the group, because an owner had exactly
+        one master. One owner may now run up to five independent groups, so an
+        event that says only "owner X" cannot tell the engine whose followers to
+        copy to — it would find every follower that owner holds, across all
+        their groups, and mirror one master's fills into another's accounts.
+
+        The account id is stable (unlike the owner, which can change hands), so
+        it is read straight from the snapshot.
+        """
+        return (self.master_account or {}).get("id")
 
     async def _reconcile_orders(self) -> None:
         if not self.client or not self.master_account:
@@ -264,6 +279,7 @@ class TradeListener:
             payload = {
                 "action": "sync_protection",
                 "owner_id": self._owner_id(),
+            "master_account_id": self._master_id(),
                 "master_protection": master_protection,
                 "master_symbols": master_symbols,
             }
@@ -393,6 +409,7 @@ class TradeListener:
         logger.info(f"Pushing TradeEvent to Redis queue: {trade_event.master_trade_id}")
         payload = trade_event.dict()
         payload["owner_id"] = self._owner_id()
+        payload["master_account_id"] = self._master_id()
         payload["ts"] = time.time()  # detection time, for latency measurement
         await self.redis.lpush("trade_events", json.dumps(payload))
 
@@ -445,6 +462,7 @@ class TradeListener:
             # leg went away. See _mirror_cancel.
             "reason": order.get("reason"),
             "owner_id": self._owner_id(),
+            "master_account_id": self._master_id(),
             "ts": time.time(),  # detection time, for latency measurement
         }
         logger.info(f"Pushing OrderEvent ({action}) to Redis: {payload['master_order_id']} {payload['symbol']}")

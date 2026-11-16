@@ -236,10 +236,18 @@ class PositionMonitor:
 
             owner_id = follower_account.get("owner_id")
 
-            # 2. The master OF THIS OWNER. Comparing against another tenant's
-            #    master is what produced "expected size=35" for a follower that
-            #    was holding exactly the 85 it should have been.
-            master_account = account_cache.master_for(self.db, owner_id)
+            # 2. THIS FOLLOWER'S OWN MASTER — the one it is assigned to, not
+            #    merely one its owner happens to hold.
+            #
+            #    Comparing against another tenant's master is what produced
+            #    "expected size=35" for a follower holding exactly the 85 it
+            #    should have been (2026-10-14). The same mistake is now possible
+            #    WITHIN one owner, who may run several independent groups, so
+            #    the follower's master_id is what decides it. Falls back to the
+            #    owner's master for a follower that predates groups.
+            _mid = follower_account.get("master_id")
+            master_account = (account_cache.get(self.db, _mid) if _mid
+                              else account_cache.master_for(self.db, owner_id))
             if not master_account:
                 return "unknown"
             master_id = master_account["id"]
@@ -465,10 +473,11 @@ class PositionMonitor:
         try:
             account_ids = [account_id]
             try:
+                acc = account_cache.get(self.db, account_id) or {}
                 if owner_id is None:
-                    acc = account_cache.get(self.db, account_id) or {}
                     owner_id = acc.get("owner_id")
-                mid = account_cache.master_id_for(self.db, owner_id)
+                # This follower's own master, for the same reason as above.
+                mid = acc.get("master_id") or account_cache.master_id_for(self.db, owner_id)
                 if mid:
                     account_ids.append(mid)
             except Exception:

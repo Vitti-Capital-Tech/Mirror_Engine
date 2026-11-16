@@ -327,11 +327,18 @@ class CopyEngine:
         # 2. Get active follower accounts (scoped to the master's owner)
         # One read for the followers AND the master (whose balance the ratio needs
         # a few lines below) — see _read_accounts for why the round trip matters.
+        # Which MASTER fired this. Events carry it now because owner_id alone
+        # no longer identifies a group — one owner may run several.
+        _master_acct_id = (event_dict or {}).get("master_account_id")
         accounts = await self._read_accounts(owner_id)
         if accounts is None:
             self.db.table("trades").update({"status": "failed"}).eq("id", trade_uuid).execute()
             return
-        master_row, followers, master_balance = self._split_accounts(accounts)
+        # Scoped to the MASTER that fired this event, not merely its owner: one
+        # owner may run several groups, and owner-scoping would copy this
+        # master's fills into the other groups' followers.
+        master_row, followers, master_balance = self._split_accounts(
+            accounts, master_id=_master_acct_id)
         master_balance = self._master_balance_or_last(master_balance, master_row)
 
         if not followers:
@@ -613,7 +620,7 @@ class CopyEngine:
     # offset exists to prevent.
     _SLOT_TTL_SEC = 10.0
 
-    async def _tp_sl_params(self, follower: dict, owner_id=None):
+    async def _tp_sl_params(self, follower: dict, owner_id=None, master_id=None):
         """(offset, slot) for this follower's SL/TP trigger.
 
         offset is the MASTER's configured tp_sl_offset, or None to keep the
@@ -621,20 +628,32 @@ class CopyEngine:
         active followers, which decides whether it sits above or below.
         """
         owner_id = owner_id or follower.get("owner_id")
+        master_id = master_id or follower.get("master_id")
         fid = str(follower.get("id") or "")
+        # Keyed by GROUP, not owner. The offset belongs to one master and the
+        # slot decides which side of THAT master a follower sits on — mixing two
+        # groups' followers into one ordering would put both of a master's
+        # copies on the same side while spreading the other group's.
+        cache_key = ("m", str(master_id)) if master_id else ("o", str(owner_id))
         try:
-            cached = self._slot_cache.get(owner_id)
+            cached = self._slot_cache.get(cache_key)
             if not cached or (time.time() - cached[0]) >= self._SLOT_TTL_SEC:
-                q = self.db.table("accounts").select("id, is_master, status, tp_sl_offset, created_at")
+                q = self.db.table("accounts").select("id, is_master, status, tp_sl_offset, created_at, master_id")
                 if owner_id:
                     q = q.eq("owner_id", owner_id)
                 rows = q.order("created_at").execute().data or []
-                master = next((r for r in rows if r.get("is_master")), None)
+                if master_id:
+                    master = next((r for r in rows if str(r.get("id")) == str(master_id)), None)
+                    ids = [str(r["id"]) for r in rows
+                           if not r.get("is_master") and r.get("status") == "active"
+                           and str(r.get("master_id") or "") == str(master_id)]
+                else:
+                    master = next((r for r in rows if r.get("is_master")), None)
+                    ids = [str(r["id"]) for r in rows
+                           if not r.get("is_master") and r.get("status") == "active"]
                 offset = (master or {}).get("tp_sl_offset")
-                ids = [str(r["id"]) for r in rows
-                       if not r.get("is_master") and r.get("status") == "active"]
                 cached = (time.time(), offset, ids)
-                self._slot_cache[owner_id] = cached
+                self._slot_cache[cache_key] = cached
             _, offset, ids = cached
             if offset in (None, ""):
                 return None, 0
@@ -1465,8 +1484,13 @@ class CopyEngine:
         if not symbol:
             return
         try:
+            # Scope to THIS MASTER's followers — owner_id was enough while an
+            # owner had one master; with several groups it would reach into the
+            # other groups' accounts.
             fq = self.db.table("accounts").select("id").eq("is_master", False).eq("status", "active")
-            if event.get("owner_id"):
+            if event.get("master_account_id"):
+                fq = fq.eq("master_id", event["master_account_id"])
+            elif event.get("owner_id"):
                 fq = fq.eq("owner_id", event["owner_id"])
             followers = fq.execute().data or []
         except Exception as e:
@@ -1615,12 +1639,19 @@ class CopyEngine:
         # master row itself so we can classify how the master closed a symbol.
         # Both roles from ONE read. This runs every 15s per master, so it was two
         # blocking round trips on a timer forever — see _read_accounts.
+        # Which MASTER fired this. Events carry it now because owner_id alone
+        # no longer identifies a group — one owner may run several.
+        _master_acct_id = (event or {}).get("master_account_id")
         accounts = await self._read_accounts(owner_id)
         if accounts is None:
             # Was the followers-query behaviour: an unreadable accounts table
             # leaves nothing safe to reconcile against.
             return
-        master_row, followers, master_balance = self._split_accounts(accounts)
+        # Scoped to the MASTER that fired this event, not merely its owner: one
+        # owner may run several groups, and owner-scoping would copy this
+        # master's fills into the other groups' followers.
+        master_row, followers, master_balance = self._split_accounts(
+            accounts, master_id=_master_acct_id)
         master_balance = self._master_balance_or_last(master_balance, master_row)
 
         now = time.time()
@@ -2170,8 +2201,12 @@ class CopyEngine:
         if not master_symbols:
             return
         try:
+            # Scope to THIS MASTER's followers (see _split_accounts).
             fq = self.db.table("accounts").select("*").eq("is_master", False).eq("status", "active")
-            if owner_id:
+            _mid = (event or {}).get("master_account_id")
+            if _mid:
+                fq = fq.eq("master_id", _mid)
+            elif owner_id:
                 fq = fq.eq("owner_id", owner_id)
             followers = fq.execute().data or []
         except Exception as e:
@@ -2260,7 +2295,7 @@ class CopyEngine:
                     if stop_price is None or not product_id:
                         continue
                     try:
-                        _off, _slot = await self._tp_sl_params(fol, owner_id)
+                        _off, _slot = await self._tp_sl_params(fol, owner_id, _mid)
                         jittered = self._jitter_trigger(float(stop_price), seed=str(fol.get("id")), offset=_off, slot=_slot)
                         otype = det.get("order_type") or "market_order"
                         leg = {"order_type": otype, "stop_price": str(jittered)}
@@ -2362,13 +2397,20 @@ class CopyEngine:
         # asyncio.to_thread is NOT the answer either: it was shipped and reverted
         # because the Supabase client is shared process-wide and driving it from
         # pool threads corrupts it (see the order_history module docstring).
+        # Which MASTER fired this. Events carry it now because owner_id alone
+        # no longer identifies a group — one owner may run several.
+        _master_acct_id = (event or {}).get("master_account_id")
         accounts = await self._read_accounts(owner_id)
         if accounts is None:
             # Matches the old followers-query behaviour, which was the stricter of
             # the two: without the accounts we can neither size nor address
             # anyone, so there is nothing safe to do. The 15s reconciler covers it.
             return
-        master_row, followers, master_balance = self._split_accounts(accounts)
+        # Scoped to the MASTER that fired this event, not merely its owner: one
+        # owner may run several groups, and owner-scoping would copy this
+        # master's fills into the other groups' followers.
+        master_row, followers, master_balance = self._split_accounts(
+            accounts, master_id=_master_acct_id)
         master_balance = self._master_balance_or_last(master_balance, master_row)
         if not followers:
             return
@@ -2854,7 +2896,7 @@ class CopyEngine:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], existing_foid)
                     except Exception as e:
                         logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
-                _off, _slot = await self._tp_sl_params(follower, owner_id)
+                _off, _slot = await self._tp_sl_params(follower, owner_id, (event or {}).get('master_account_id'))
                 jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
                 edited = False
                 if is_update and existing_foid:
@@ -2944,7 +2986,7 @@ class CopyEngine:
                 # same instant on the same price. Per-follower local — mutating the
                 # shared stop_price would compound the jitter for the next follower.
                 if stop_price is not None:
-                    _off, _slot = await self._tp_sl_params(follower, owner_id)
+                    _off, _slot = await self._tp_sl_params(follower, owner_id, (event or {}).get('master_account_id'))
                     place_stop_price = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
 
             elif reduce_only and not is_update:
@@ -3478,17 +3520,33 @@ class CopyEngine:
             return None
 
     @staticmethod
-    def _split_accounts(accounts, owner_id=None):
+    def _split_accounts(accounts, owner_id=None, master_id=None):
         """(master_row, active_followers, master_balance) from one account list.
 
-        Applies exactly the filters the separate queries used — master is
-        is_master=True, a follower is is_master=False AND status='active' — so
-        moving them from SQL into Python cannot select a different set. Pass
-        owner_id only where the original query was owner-scoped.
+        A GROUP IS A MASTER AND ITS OWN FOLLOWERS, and `master_id` is what says
+        which. Scoping by owner alone was correct only while an owner had a
+        single master; one owner may now run up to five independent groups, and
+        owner-scoping would hand every one of their followers to whichever
+        master fired — mirroring one group's fills into another group's
+        accounts.
+
+        Falls back to owner-scoping when no master_id is given, which keeps
+        every caller that predates groups working: with one master per owner the
+        two answers are identical.
         """
         rows = accounts or []
         if owner_id:
             rows = [a for a in rows if a.get("owner_id") == owner_id]
+        if master_id:
+            master = next((a for a in rows if str(a.get("id")) == str(master_id)), None)
+            followers = [a for a in rows
+                         if not a.get("is_master") and a.get("status") == "active"
+                         and str(a.get("master_id") or "") == str(master_id)]
+            balance = 0.0
+            if master:
+                balance = float(master.get("allocated_balance") or master.get("balance")
+                                or master.get("available_margin") or 0.0)
+            return master, followers, balance
         master = next((a for a in rows if a.get("is_master")), None)
         followers = [a for a in rows
                      if not a.get("is_master") and a.get("status") == "active"]
@@ -4029,9 +4087,12 @@ class CopyEngine:
                     f"away from price and will not fire; closing their legs now."
                 )
                 try:
+                    # Scope to THIS MASTER's followers (see _split_accounts).
                     fq = (self.db.table("accounts").select("*")
                           .eq("is_master", False).eq("status", "active"))
-                    if (event or {}).get("owner_id"):
+                    if (event or {}).get("master_account_id"):
+                        fq = fq.eq("master_id", event["master_account_id"])
+                    elif (event or {}).get("owner_id"):
                         fq = fq.eq("owner_id", event["owner_id"])
                     _followers = fq.execute().data or []
                 except Exception as e:

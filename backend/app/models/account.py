@@ -39,17 +39,24 @@ class AccountCreate(BaseModel):
     # -offset — so they do not all trigger in the same instant. Left unset, the
     # engine keeps its built-in deterministic +/-(0..20) hash jitter.
     tp_sl_offset: Optional[float] = Field(default=None, gt=0)
+    # FOLLOWERS only: which master this one mirrors. One owner may run several
+    # independent master/follower groups, so the group cannot be inferred from
+    # owner_id any more — it has to be stated. Required when creating a follower
+    # for an owner who has more than one master; inferred when there is only one.
+    master_id: Optional[str] = None
     # ADMIN ONLY, and ignored from anyone else. An admin sees every tenant's
     # accounts, so "add an account" is ambiguous: without this the new row was
     # always stamped with the ADMIN's own id, which quietly put it in a group of
     # its own with no master to mirror — a follower that could never copy
     # anything. Omitted means "mine", which is what a normal user always gets.
     tp_sl_offset: Optional[float] = None
+    master_id: Optional[str] = None
     owner_id: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
     tp_sl_offset: Optional[float] = Field(default=None, gt=0)
+    master_id: Optional[str] = None
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
@@ -86,6 +93,7 @@ class AccountResponse(BaseModel):
     # one tenant's accounts from another's and grouped them all together, which
     # looked correct only for as long as there was a single owner.
     tp_sl_offset: Optional[float] = None
+    master_id: Optional[str] = None
     owner_id: Optional[str] = None
     # Filled in for ADMIN callers only (api/accounts.py). A uuid is not a label;
     # this is what lets the UI head a group with the person it belongs to.

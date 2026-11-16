@@ -4,7 +4,7 @@ import { useCreateAccount, useAccounts } from '@/hooks/useAccounts';
 import { X, Eye, EyeOff, ShieldCheck, RefreshCw } from 'lucide-react';
 import { Select } from '@/components/shared/Select';
 import { useAuth } from '@/context/AuthContext';
-import { useAccountScope, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 
 export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount();
@@ -18,17 +18,45 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   // of its own with no master to mirror, i.e. a follower that could never copy.
   // Defaults to whichever group is currently in scope; on "All accounts" the
   // admin has to say, because there is no sensible guess.
-  const groups = React.useMemo(() => groupByOwner(accounts as any[]), [accounts]);
+  const groups = React.useMemo(() => groupByMaster(accounts as any[]), [accounts]);
   const scoped = effectiveScope(accounts as any[], scope);
-  const [ownerId, setOwnerId] = useState<string>(
-    scoped !== ALL_ACCOUNTS ? scoped : (groups.length === 1 ? groups[0].ownerId : ''));
 
-  // "Is there already a master?" is a question about the TARGET owner, not
-  // about everything the admin can see — otherwise one tenant having a master
-  // hides the option for every other tenant.
-  const targetOwner = isAdmin ? ownerId : (groups[0]?.ownerId ?? '');
-  const hasMaster = accounts.some(
-    (a: any) => a.is_master && (!targetOwner || a.owner_id === targetOwner));
+  // Distinct account HOLDERS (owners), for the admin's picker. Separate from
+  // groups now: one holder may run several master/follower groups.
+  const owners = React.useMemo(() => {
+    const seen: Record<string, string> = {};
+    for (const a of accounts as any[]) {
+      const oid = a.owner_id ? String(a.owner_id) : '';
+      if (oid && !(oid in seen)) seen[oid] = a.owner_email || oid;
+    }
+    return Object.keys(seen).map((id) => ({ id, label: seen[id] }));
+  }, [accounts]);
+
+  const scopedOwner = (accounts as any[]).find((a) =>
+    scoped !== ALL_ACCOUNTS && (a.is_master ? String(a.id) : String(a.master_id || '')) === scoped)?.owner_id;
+  const [ownerId, setOwnerId] = useState<string>(
+    String(scopedOwner || (owners.length === 1 ? owners[0].id : '')));
+
+  const targetOwner = isAdmin ? ownerId : (owners[0]?.id ?? '');
+
+  // Which master a new FOLLOWER will copy. One owner may run up to 5 masters,
+  // so this can no longer be inferred — picking the wrong one puts the copy in
+  // someone else's group. Defaults to the group in scope, or the only one.
+  const ownerMasters = (accounts as any[]).filter(
+    (a) => a.is_master && (!targetOwner || String(a.owner_id) === String(targetOwner)));
+  const scopedMaster = ownerMasters.find((m) => String(m.id) === scoped);
+  const [masterId, setMasterId] = useState<string>('');
+  const effMasterId = masterId
+    || (scopedMaster ? String(scopedMaster.id) : '')
+    || (ownerMasters.length === 1 ? String(ownerMasters[0].id) : '');
+
+  // Masters are capped per owner; followers per master.
+  const MAX_MASTERS = 5, MAX_FOLLOWERS = 2;
+  const masterLimitReached = ownerMasters.length >= MAX_MASTERS;
+  const followersOfTarget = (accounts as any[]).filter(
+    (a) => !a.is_master && String(a.master_id || '') === effMasterId);
+  const followerLimitReached = !!effMasterId && followersOfTarget.length >= MAX_FOLLOWERS;
+  const hasMaster = masterLimitReached;
 
   // Form states
   const [name, setName] = useState('');
@@ -60,6 +88,18 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
       setErrorMsg('Choose which account holder this belongs to.');
       return;
     }
+    if (!isMaster && !effMasterId) {
+      setErrorMsg('Choose which master this follower should copy.');
+      return;
+    }
+    if (!isMaster && followerLimitReached) {
+      setErrorMsg(`That master already has ${MAX_FOLLOWERS} followers.`);
+      return;
+    }
+    if (isMaster && masterLimitReached) {
+      setErrorMsg(`That account holder already has ${MAX_MASTERS} masters.`);
+      return;
+    }
     setIsSaving(true);
     setErrorMsg('');
 
@@ -74,6 +114,9 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
 
       // Only an admin may set this; the backend ignores it from anyone else.
       if (isAdmin && ownerId) payload.owner_id = ownerId;
+      // Which master a follower joins. One owner may run several groups, so
+      // the backend refuses to guess when there is more than one.
+      if (!isMaster && effMasterId) payload.master_id = effMasterId;
 
       if (leverageLimit) {
         payload.leverage_limit = parseInt(leverageLimit);
@@ -194,18 +237,46 @@ export function AddAccountModal({ isOpen, onClose }: { isOpen: boolean; onClose:
                 onChange={(v) => setOwnerId(v)}
                 options={[
                   ...(ownerId ? [] : [{ value: '', label: 'Select an account holder…' }]),
-                  ...groups.map((g) => ({
-                    value: g.ownerId,
-                    label: `${(g.master as any)?.owner_email
-                      ?? (g.followers[0] as any)?.owner_email
-                      ?? g.label}  —  ${g.master ? g.master.name : 'no master'}`,
-                  })),
+                  ...owners.map((o) => ({ value: o.id, label: o.label })),
                   { value: user?.id || '', label: `${user?.email || 'Me'} (admin) — new group` },
                 ]}
               />
               <span className="text-[10px] text-text-muted">
                 A follower copies the master of the holder you pick. Adding it under a
                 holder with no master means it will never copy anything.
+              </span>
+            </div>
+          )}
+
+          {/* Which master a FOLLOWER joins. Not inferable any more: one holder
+              may run several groups, and the wrong pick puts this account in
+              someone else's. */}
+          {!isMaster && (
+            <div className="flex flex-col gap-1.5">
+              <label className="text-text-muted uppercase tracking-wider text-[10px]">
+                Copies which master
+              </label>
+              <Select
+                value={effMasterId}
+                onChange={(v) => setMasterId(v)}
+                options={[
+                  ...(effMasterId ? [] : [{ value: '', label: 'Select a master…' }]),
+                  ...ownerMasters.map((m: any) => {
+                    const n = (accounts as any[]).filter(
+                      (f) => !f.is_master && String(f.master_id || '') === String(m.id)).length;
+                    return {
+                      value: String(m.id),
+                      label: `${m.name} — ${n}/${MAX_FOLLOWERS} follower${n === 1 ? '' : 's'}${n >= MAX_FOLLOWERS ? ' (full)' : ''}`,
+                    };
+                  }),
+                ]}
+              />
+              <span className="text-[10px] text-text-muted">
+                {ownerMasters.length === 0
+                  ? 'No master yet — add one first, a follower has nothing to mirror.'
+                  : followerLimitReached
+                    ? `That master already has ${MAX_FOLLOWERS} followers.`
+                    : `Each master can have up to ${MAX_FOLLOWERS} followers.`}
               </span>
             </div>
           )}

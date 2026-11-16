@@ -41,8 +41,14 @@ export function OwnerGroup({
 
         <span className="min-w-0 flex-1">
           <span className="block text-[13px] font-bold text-text-primary truncate">
-            {email || 'Unassigned'}
+            {/* Named after the MASTER, because that is the group now: one login
+                may run several, and heading them all with the same email made
+                two separate desks look like one. The holder is the subtitle. */}
+            {master?.name || email || 'Unassigned'}
           </span>
+          {email && master?.name && (
+            <span className="block text-[10px] text-text-muted truncate">{email}</span>
+          )}
           <span className="flex items-center gap-2.5 mt-0.5 text-[10.5px] text-text-muted">
             {master
               ? <span className="inline-flex items-center gap-1">

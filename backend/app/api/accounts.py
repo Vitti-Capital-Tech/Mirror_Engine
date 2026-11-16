@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
+# One login may run several independent master/follower groups. Capped so a
+# mistake cannot quietly multiply the number of live accounts being traded.
+MAX_MASTERS_PER_OWNER = 5
+MAX_FOLLOWERS_PER_MASTER = 2
+
 async def start_account_ws(account: dict) -> None:
     """Connect an account's WS feed based on its role.
 
@@ -103,13 +108,51 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
             if not db.table("profiles").select("id").eq("id", target_owner).execute().data:
                 raise HTTPException(status_code=400, detail="That owner does not exist.")
 
-        # One master per owner — checked against the TARGET owner, not the
-        # caller, or an admin adding a master for someone else would be blocked
-        # by their own (or waved through onto a tenant that already has one).
+        # GROUP LIMITS — counted against the TARGET owner, not the caller, or an
+        # admin adding an account for someone else would be measured against
+        # their own accounts.
+        #
+        # One owner may now run several independent master/follower groups. Both
+        # limits are enforced here rather than in the schema because each is a
+        # count over sibling rows, which a CHECK constraint cannot express
+        # without a trigger — and the person adding an account deserves a
+        # readable reason rather than a constraint violation.
         if account_data.is_master:
-            existing_master = db.table("accounts").select("id").eq("is_master", True).eq("owner_id", target_owner).execute()
-            if existing_master.data:
-                raise HTTPException(status_code=400, detail="That owner already has a master account. Only one master per user is supported.")
+            masters = db.table("accounts").select("id").eq("is_master", True).eq("owner_id", target_owner).execute().data or []
+            if len(masters) >= MAX_MASTERS_PER_OWNER:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"That owner already has {len(masters)} master accounts "
+                           f"(limit {MAX_MASTERS_PER_OWNER}).")
+        else:
+            # WHICH master does this follower mirror? With one master per owner
+            # that was implicit. With several it has to be stated, or the
+            # follower silently joins whichever group is found first.
+            master_id = account_data.master_id
+            owner_masters = db.table("accounts").select("id, name").eq("is_master", True).eq("owner_id", target_owner).execute().data or []
+            if not master_id:
+                if len(owner_masters) == 1:
+                    master_id = owner_masters[0]["id"]      # no ambiguity to resolve
+                elif not owner_masters:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Add a master account first — a follower has nothing to mirror.")
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Choose which master this follower should copy.")
+            target = next((m for m in owner_masters if str(m["id"]) == str(master_id)), None)
+            if target is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="That master does not exist, or belongs to someone else.")
+            siblings = db.table("accounts").select("id").eq("master_id", master_id).execute().data or []
+            if len(siblings) >= MAX_FOLLOWERS_PER_MASTER:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{target['name']} already has {len(siblings)} followers "
+                           f"(limit {MAX_FOLLOWERS_PER_MASTER}).")
+            account_data.master_id = master_id
 
         # Save to DB (stamped with owner; secrets encrypted at rest)
         from app.core.crypto import encrypt

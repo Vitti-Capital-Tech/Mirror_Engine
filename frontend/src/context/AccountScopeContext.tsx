@@ -58,12 +58,27 @@ export function useAccountScope(): AccountScope {
   return ctx ?? { scope: ALL_ACCOUNTS, setScope: () => {} };
 }
 
-/** Narrow a list of accounts to the selected owner's group. */
-export function applyScope<T extends { owner_id?: string | null }>(
+/** The group an account belongs to: its master's id.
+ *
+ *  A master is the head of its own group; a follower belongs to the master it
+ *  mirrors. One login may run several independent groups, so the owner is no
+ *  longer the unit — two of an owner's masters are two separate things and must
+ *  never be shown, or scoped, as one.
+ *
+ *  A follower with no master yet falls back to an owner-level key so it is
+ *  still visible somewhere rather than silently dropped. */
+export function groupKeyOf(a: { id?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }): string {
+  if (a.is_master) return String(a.id);
+  if (a.master_id) return String(a.master_id);
+  return `owner:${a.owner_id ?? 'unassigned'}`;
+}
+
+/** Narrow a list of accounts to the selected group. */
+export function applyScope<T extends { id?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }>(
   accounts: T[], scope: string,
 ): T[] {
   if (!scope || scope === ALL_ACCOUNTS) return accounts;
-  const hit = accounts.filter((a) => a.owner_id === scope);
+  const hit = accounts.filter((a) => groupKeyOf(a) === scope);
   // A scope pointing at a group that no longer exists — its accounts deleted,
   // or transferred to someone else — must not render an empty dashboard with
   // no explanation. Fall back to showing everything.
@@ -82,40 +97,55 @@ export function applyScope<T extends { owner_id?: string | null }>(
  * answer or the header would read "All accounts" while the view quietly stayed
  * ungrouped.
  */
-export function effectiveScope<T extends { owner_id?: string | null }>(
+export function effectiveScope<T extends { id?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }>(
   accounts: T[], scope: string,
 ): string {
   if (!scope || scope === ALL_ACCOUNTS) return ALL_ACCOUNTS;
-  return accounts.some((a) => a.owner_id === scope) ? scope : ALL_ACCOUNTS;
+  return accounts.some((a) => groupKeyOf(a) === scope) ? scope : ALL_ACCOUNTS;
 }
 
-/** Group accounts by owner: one entry per set of master + its followers. */
+/** One group: a master and the followers assigned to it. */
 export interface AccountGroup<T> {
-  ownerId: string;
+  groupId: string;          // the master's id (or an owner key for unassigned)
+  ownerId?: string | null;  // who the group belongs to, for the heading
   master?: T;
   followers: T[];
   label: string;
 }
 
-export function groupByOwner<T extends { id: string; name?: string; is_master?: boolean; owner_id?: string | null }>(
+/**
+ * Group accounts by MASTER, not by owner.
+ *
+ * One login may run several independent master/follower groups, so an owner is
+ * no longer one thing to show. Grouping by owner would stack two unrelated
+ * masters under a single heading with nothing saying they are separate desks —
+ * and on /accounts, where the rows carry pause and delete, that is how the
+ * wrong account gets acted on.
+ *
+ * Followers with no master yet are collected under an owner-level key so they
+ * remain visible and obviously unassigned, rather than disappearing.
+ */
+export function groupByMaster<T extends { id: string; name?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }>(
   accounts: T[],
 ): AccountGroup<T>[] {
-  // Plain object + Array.from rather than spreading a Map: the tsconfig here
-  // targets below es2015, where spreading a Map iterator does not compile.
-  const byOwner: Record<string, T[]> = {};
+  // Plain object + explicit ordering rather than spreading a Map: the tsconfig
+  // here targets below es2015, where spreading a Map iterator does not compile.
+  const byGroup: Record<string, T[]> = {};
   const order: string[] = [];
-  for (const a of accounts) {
-    const key = String(a.owner_id ?? 'unassigned');
-    if (!byOwner[key]) { byOwner[key] = []; order.push(key); }
-    byOwner[key].push(a);
+  // Masters first, so a group is keyed and ordered by its master even when a
+  // follower happens to come earlier in the list.
+  const sorted = [...accounts].sort((a, b) => Number(!!b.is_master) - Number(!!a.is_master));
+  for (const a of sorted) {
+    const key = groupKeyOf(a);
+    if (!byGroup[key]) { byGroup[key] = []; order.push(key); }
+    byGroup[key].push(a);
   }
-  return order.map((ownerId) => {
-    const list: T[] = byOwner[ownerId];
+  return order.map((groupId) => {
+    const list: T[] = byGroup[groupId];
     const master = list.find((a: T) => a.is_master);
     const followers = list.filter((a: T) => !a.is_master);
-    // Named after the master, because that is what anyone recognises — the
-    // owner_id is a uuid and the accounts API does not return the email.
+    // Named after the master — that is what anyone recognises. ids are uuids.
     const label = master?.name || followers[0]?.name || 'Unassigned';
-    return { ownerId, master, followers, label };
+    return { groupId, ownerId: (master ?? followers[0])?.owner_id, master, followers, label };
   });
 }
