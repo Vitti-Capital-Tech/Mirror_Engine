@@ -78,9 +78,12 @@ export default function PositionsPage() {
   // Today's P&L is the account's own figure, not something derived from the
   // open legs — it includes trades already closed today, which is exactly the
   // part unrealised cannot see.
-  const totalToday = (visible as any[]).reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+  // Summed from the two figures beside it, not read from today_pnl — see
+  // PositionGroup: the stored value folds in an older unrealised and would
+  // leave the header visibly not adding up.
   const totalBalance = (visible as any[]).reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
   const totalRealised = (visible as any[]).reduce((s: number, a: any) => s + Number(a.realized_pnl_today || 0), 0);
+  const totalToday = totalRealised + totalUnreal;
   const pnlClass = (v: number) =>
     v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-text-muted';
   const signed = (v: number) => `${v > 0 ? '+' : ''}${money(v)}`;
@@ -171,8 +174,9 @@ export default function PositionsPage() {
                 const legs = (positions as any[]).filter((p) => ids.has(String(p.account_id)));
                 const unreal = legs.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
                 const bal = accs.reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
-                const day = accs.reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+
                 const real = accs.reduce((s: number, a: any) => s + Number(a.realized_pnl_today || 0), 0);
+                const day = real + unreal;
                 return (
                   <OwnerSection key={o.ownerId} email={o.email}
                     subtitle={`${o.groups.length} group${o.groups.length === 1 ? '' : 's'} · ${accs.length} account${accs.length === 1 ? '' : 's'} · ${legs.length} open`}

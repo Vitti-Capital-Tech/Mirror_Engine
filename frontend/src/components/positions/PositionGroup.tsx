@@ -120,11 +120,18 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
 
   const shown = liveLegs ?? legs;
   const unreal = shown.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
-  // today_pnl is realised + unrealised, so showing it beside the unrealised
-  // total double counts. The realised half is now stored on its own by the
-  // same sync pass, and the three read as what they are: closed + open = day.
+  // today_pnl is realised + unrealised. The realised half is stored on its
+  // own now, so the three columns can read as closed + open = day.
+  //
+  // Today is SUMMED FROM THE TWO FIGURES ON SCREEN rather than read from
+  // today_pnl, which is the same number but computed from the backend's sync
+  // snapshot — while the unrealised beside it comes from the fresher live
+  // view. Printing the stored one left the row visibly failing to add up by a
+  // few paise, which on a column of money reads as a bug whichever number is
+  // "right". Summing what is displayed makes the identity true by
+  // construction, and makes today's figure as live as the mark it is based on.
   const realised = Number(acc.realized_pnl_today || 0);
-  const today = Number(acc.today_pnl || 0);
+  const today = realised + unreal;
 
   return (
     <div className={isMaster ? '' : 'border-t border-bg-border'}>
@@ -241,8 +248,9 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
   const members = [...(master ? [master] : []), ...followers];
   const groupLegs = members.flatMap((a) => legsOf(a.id));
   const groupUnreal = groupLegs.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0);
-  const groupToday = members.reduce((s, a) => s + Number(a.today_pnl || 0), 0);
+  // Same identity at group level, for the same reason.
   const groupRealised = members.reduce((s, a) => s + Number(a.realized_pnl_today || 0), 0);
+  const groupToday = groupRealised + groupUnreal;
   const groupBalance = members.reduce((s, a) => s + Number(a.balance || 0), 0);
 
   // A copy that is missing something its master holds is the failure this desk
