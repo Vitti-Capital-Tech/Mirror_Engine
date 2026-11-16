@@ -42,8 +42,8 @@ export const COL = {
   // out of existence — at phone width the fixed widths left about twenty
   // pixels for the account name. What they hold reappears under the name.
   mid: 'hidden lg:flex items-center w-44 shrink-0 min-w-0',
-  balance: 'hidden sm:flex items-center justify-end w-32 shrink-0',
-  pnl: 'hidden sm:flex items-center justify-end w-28 shrink-0',
+  balance: 'hidden sm:block w-32 shrink-0 text-right',
+  pnl: 'hidden sm:block w-28 shrink-0 text-right',
   tail: 'w-[5.5rem] shrink-0',
 };
 
@@ -318,11 +318,19 @@ export function AccountGroupCard({
         </div>
 
         <div className={COL.mid} />
-        <div className={`${COL.balance} text-[13px] font-mono font-bold text-text-primary`}>
-          {money(master?.balance)}
+        {/* The label sits on the number, not once at the top of the page. A
+            single header stops explaining anything as soon as you scroll past
+            it, and a bare 7,450.24 beside +132.88 says nothing about which is
+            which. */}
+        <div className={COL.balance}>
+          <div className="text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Balance</div>
+          <div className="text-[13px] font-mono font-bold text-text-primary">{money(master?.balance)}</div>
         </div>
-        <div className={`${COL.pnl} text-[13px] font-mono font-bold ${pnlClass(Number(master?.today_pnl || 0))}`}>
-          {master ? signed(master.today_pnl) : '—'}
+        <div className={COL.pnl}>
+          <div className="text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Today</div>
+          <div className={`text-[13px] font-mono font-bold ${pnlClass(Number(master?.today_pnl || 0))}`}>
+            {master ? signed(master.today_pnl) : '—'}
+          </div>
         </div>
         <div className={`${COL.tail} flex items-center justify-end gap-1`}>
           {master && <RunSwitch acc={master} />}
@@ -380,11 +388,15 @@ export function AccountGroupCard({
                       <div className={`${COL.mid} py-3 text-[11px] text-text-muted truncate`}>
                         {allocationText(f)}
                       </div>
-                      <div className={`${COL.balance} py-3 text-[13px] font-mono text-text-primary`}>
-                        {money(f.balance)}
+                      <div className={`${COL.balance} py-3`}>
+                        <div className="text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Balance</div>
+                        <div className="text-[13px] font-mono text-text-primary">{money(f.balance)}</div>
                       </div>
-                      <div className={`${COL.pnl} py-3 text-[13px] font-mono ${pnlClass(Number(f.today_pnl || 0))}`}>
-                        {signed(f.today_pnl)}
+                      <div className={`${COL.pnl} py-3`}>
+                        <div className="text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Today</div>
+                        <div className={`text-[13px] font-mono ${pnlClass(Number(f.today_pnl || 0))}`}>
+                          {signed(f.today_pnl)}
+                        </div>
                       </div>
                       <div className={`${COL.tail} py-3 flex items-center justify-end gap-1`}>
                         <RunSwitch acc={f} />

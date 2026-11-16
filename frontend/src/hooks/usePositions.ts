@@ -17,7 +17,11 @@ export function useAccountLiveView(accountId: string, enabled = true) {
     queryKey: ['account-live-view', accountId],
     queryFn: () => api.positions.liveView(accountId),
     enabled: enabled && !!accountId,
-    refetchInterval: 4000,
+    // Same cadence as the positions list. They are separate endpoints that
+    // each compute the unrealised figure from their own snapshot, so running
+    // one at 3s and the other at 4s meant the row and the table under it were
+    // showing two different moments and drifting apart between refreshes.
+    refetchInterval: 3000,
   });
 }
 

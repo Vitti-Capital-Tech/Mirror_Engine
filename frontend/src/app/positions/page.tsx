@@ -9,7 +9,7 @@ import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
 import { Loader } from '@/components/shared/Loader';
-import { PositionGroup, PCOL } from '@/components/positions/PositionGroup';
+import { PositionGroup } from '@/components/positions/PositionGroup';
 
 /**
  * Open positions, by group.
@@ -130,15 +130,6 @@ export default function PositionsPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {/* Column labels, once, on the widths the rows use. On a phone the
-              rows carry their own small labels instead — there is no room for
-              a header that would sit over nothing. */}
-          <div className="hidden sm:flex items-center gap-6 pr-5 text-[10px] uppercase tracking-wider text-text-muted/70">
-            <div className="flex-1" />
-            <div className={PCOL.balance}>Balance</div>
-            <div className={PCOL.today}>Today</div>
-            <div className={PCOL.unreal}>Unrealised</div>
-          </div>
           {groups.map((g) => (
             <PositionGroup key={g.groupId} group={g} positions={positions as any[]}
               showOwner={isAdmin} />

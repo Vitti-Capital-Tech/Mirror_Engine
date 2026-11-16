@@ -11,6 +11,17 @@ const fmtNum = (v: any, d = 2) => {
   const n = num(v);
   return n == null ? '—' : n.toLocaleString(undefined, { maximumFractionDigits: d });
 };
+/** Money, always to two places.
+ *
+ *  fmtNum drops trailing zeros, so the same figure appeared as "+15.2" in this
+ *  table and "+15.20" on the group row above it. The values were identical;
+ *  only the rendering differed, which on a trading screen reads as two
+ *  different numbers for the same position. */
+const fmtMoney = (v: any) => {
+  const n = num(v);
+  return n == null ? '—' : n.toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
 const fmtTs = (t?: string) => {
   if (!t) return '—';
   try {
@@ -342,7 +353,7 @@ function DeltaPositionsTab({ positions, stopOrders, accountId, accountName }: { 
                 <td className="text-right font-mono text-text-secondary">{fmtNum(mark)}</td>
                 <td className="text-right font-mono text-text-primary">{margin != null && margin > 0 ? `$${fmtNum(margin)}` : '—'}</td>
                 <td className={`text-right font-mono ${pnlCls(pnl)}`}>
-                  {pnl >= 0 ? '+' : ''}{fmtNum(pnl)}
+                  {pnl >= 0 ? '+' : ''}{fmtMoney(pnl)}
                   {pnlPct != null && <span className={`block text-[10px] ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnl >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</span>}
                 </td>
                 <td className={`text-right font-mono ${cashflow == null ? 'text-text-muted' : pnlCls(cashflow)}`}>{cashflow != null ? `${cashflow >= 0 ? '+' : ''}${fmtNum(cashflow)}` : '—'}</td>

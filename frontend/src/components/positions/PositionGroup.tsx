@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { ChevronDown, Crown, AlertTriangle } from 'lucide-react';
 import { AccountPositionCard } from './AccountPositionCard';
+import { useAccountLiveView } from '@/hooks/usePositions';
 
 /**
  * One master and its copies, as a single collapsible block.
@@ -77,7 +78,45 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
   acc: any; legs: any[]; missing: string[]; isMaster: boolean; defaultOpen: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
-  const unreal = legs.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0);
+
+  // ONE SNAPSHOT, not two.
+  //
+  // The chips and the total used to come from GET /api/positions while the
+  // table directly underneath them came from the per-account live view. Two
+  // endpoints, each computing the unrealised figure from whatever it read from
+  // Delta at its own moment — so for a second or two after every refresh the
+  // row and the table under it showed different numbers for the same position.
+  // Matching the poll intervals narrows that window but cannot close it: they
+  // are still two requests landing at two times.
+  //
+  // This is the same query key the card below uses, so React Query serves both
+  // from one cache entry. One request, one snapshot, and the row cannot
+  // disagree with its own table. Collapsed, the card is not mounted and there
+  // is nothing to disagree with, so the list figures are used instead.
+  const { data: live } = useAccountLiveView(acc.id, open);
+  const liveLegs = React.useMemo(() => {
+    if (!open || !live?.risk) return null;
+    return live.risk
+      .filter((p: any) => Number(p.size) !== 0)
+      .map((p: any) => {
+        const size = Number(p.size) || 0;
+        const cv = Number(p.product?.contract_value ?? 0.001) || 0.001;
+        const entry = Number(p.entry_price);
+        const mark = Number(p.mark_price);
+        const pnl = Number.isFinite(entry) && Number.isFinite(mark)
+          ? size * cv * (mark - entry)
+          : Number(p.unrealized_pnl || 0);
+        return {
+          id: p.product_id ?? p.product_symbol,
+          symbol: p.product_symbol,
+          side: size >= 0 ? 'long' : 'short',
+          unrealized_pnl: pnl,
+        };
+      });
+  }, [open, live]);
+
+  const shown = liveLegs ?? legs;
+  const unreal = shown.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
   const today = Number(acc.today_pnl || 0);
 
   return (
@@ -118,15 +157,15 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
               +{missing.length - MAX_MISSING} more missing
             </span>
           )}
-          {legs.length === 0
+          {shown.length === 0
             ? <span className="text-[11px] text-text-muted">Nothing open</span>
-            : legs.slice(0, Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING)))
-                  .map((p) => <Leg key={p.id} p={p} />)}
+            : shown.slice(0, Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING)))
+                   .map((p: any) => <Leg key={p.id} p={p} />)}
           {(() => {
-            const shown = Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING));
-            return legs.length > shown ? (
+            const cap = Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING));
+            return shown.length > cap ? (
               <span className="shrink-0 rounded-md border border-bg-border bg-bg-primary/60 px-1.5 py-0.5 text-[10px] font-semibold text-text-muted">
-                +{legs.length - shown} more
+                +{shown.length - cap} more
               </span>
             ) : null;
           })()}
@@ -136,21 +175,24 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
             take a line of their own rather than crushing it. */}
         <span className="basis-full sm:basis-auto ml-auto sm:ml-0 shrink-0 flex items-center justify-end gap-3 sm:gap-6 pl-6 sm:pl-0">
           <span className={PCOL.balance}>
-            {/* Labels only on narrow screens, where the column header above the
-                groups is not shown. */}
-            <span className="sm:hidden block text-[8.5px] uppercase tracking-wider text-text-muted leading-none mb-0.5">Balance</span>
+            {/* On the number itself, always. A single header at the top of
+                the page stops explaining anything once the tables are open —
+                by the third account the labels are hundreds of pixels away,
+                and a bare 7,450.24 beside +132.88 says nothing about which is
+                which. */}
+            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Balance</span>
             <span className="text-[12.5px] font-mono text-text-secondary">
               {acc.balance != null ? money(Number(acc.balance)) : '—'}
             </span>
           </span>
           <span className={PCOL.today}>
-            <span className="sm:hidden block text-[8.5px] uppercase tracking-wider text-text-muted leading-none mb-0.5">Today</span>
+            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Today</span>
             <span className={`text-[12.5px] font-mono ${pnlClass(today)}`}>{signed(today)}</span>
           </span>
           <span className={PCOL.unreal}>
-            <span className="sm:hidden block text-[8.5px] uppercase tracking-wider text-text-muted leading-none mb-0.5">Unreal.</span>
+            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Unreal.</span>
             <span className={`text-[12.5px] font-mono font-bold ${pnlClass(unreal)}`}>
-              {legs.length ? signed(unreal) : '—'}
+              {shown.length ? signed(unreal) : '—'}
             </span>
           </span>
         </span>
@@ -235,15 +277,15 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
               these totals sat directly on top of the master's own pair with
               nothing to say which was which. */}
           <div className={PCOL.balance}>
-            <div className="text-[8.5px] uppercase tracking-wider text-text-muted/80 leading-none mb-0.5">Group</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group balance</div>
             <div className="text-[13px] font-mono font-bold text-text-primary">{money(groupBalance)}</div>
           </div>
           <div className={PCOL.today}>
-            <div className="text-[8.5px] uppercase tracking-wider text-text-muted/80 leading-none mb-0.5">Group</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group today</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupToday)}`}>{signed(groupToday)}</div>
           </div>
           <div className={PCOL.unreal}>
-            <div className="text-[8.5px] uppercase tracking-wider text-text-muted/80 leading-none mb-0.5">Group</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group unreal.</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupUnreal)}`}>
               {groupLegs.length ? signed(groupUnreal) : '—'}
             </div>

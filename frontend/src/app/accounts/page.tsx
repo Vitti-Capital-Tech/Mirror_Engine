@@ -3,7 +3,7 @@ import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
-import { AccountGroupCard, COL } from '@/components/accounts/AccountGroupCard';
+import { AccountGroupCard } from '@/components/accounts/AccountGroupCard';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
 import { Plus } from 'lucide-react';
@@ -100,18 +100,6 @@ export default function AccountsPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {/* Column labels, once. They used to be reprinted above every
-              number on every row — six times on a page of six accounts — and
-              still did not line up, because each row sized its own columns.
-              These sit on the same shared widths the rows use. */}
-          <div className="hidden sm:flex items-center gap-3 px-4 sm:px-5 text-[10px] uppercase tracking-wider text-text-muted/70">
-            <div className={COL.rail} />
-            <div className="min-w-0 flex-1">Account</div>
-            <div className={COL.mid}>Copies at</div>
-            <div className={COL.balance}>Balance</div>
-            <div className={COL.pnl}>Today</div>
-            <div className={`${COL.tail} pr-7 text-right whitespace-nowrap`}>Running</div>
-          </div>
           {groups.map((g) => (
             <AccountGroupCard
               key={g.groupId}
