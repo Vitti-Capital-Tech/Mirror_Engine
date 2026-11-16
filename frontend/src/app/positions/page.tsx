@@ -3,13 +3,15 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByMaster } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByMaster, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
 import { Loader } from '@/components/shared/Loader';
 import { PositionGroup } from '@/components/positions/PositionGroup';
+import { OwnerSection } from '@/components/shared/OwnerSection';
+import { ViewingAs } from '@/components/shared/ViewingAs';
 
 /**
  * Open positions, by group.
@@ -27,7 +29,7 @@ export default function PositionsPage() {
   const queryClient = useQueryClient();
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
   const { data: positions = [], isLoading: positionsLoading } = usePositions();
-  const { scope } = useAccountScope();
+  const { scope, setScope } = useAccountScope();
   const { user } = useAuth();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
@@ -62,6 +64,12 @@ export default function PositionsPage() {
     (accounts as any[]).filter((a: any) => a.status !== 'paused'), scope);
   const groups = groupByMaster(visible as any[]);
   const isAdmin = user?.role === 'admin';
+  // Whose desk is on screen. A holder scope names the person directly; a group
+  // scope names a master, so the person is read off that group's accounts.
+  const viewingLabel = (() => {
+    const inScope = visible as any[];
+    return inScope[0]?.owner_email || inScope[0]?.name || 'this holder';
+  })();
 
   const scoped = (positions as any[]).filter((p: any) =>
     visible.some((a: any) => String(a.id) === String(p.account_id)));
@@ -71,6 +79,7 @@ export default function PositionsPage() {
   // part unrealised cannot see.
   const totalToday = (visible as any[]).reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
   const totalBalance = (visible as any[]).reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
+  const totalRealised = (visible as any[]).reduce((s: number, a: any) => s + Number(a.realized_pnl_today || 0), 0);
   const pnlClass = (v: number) =>
     v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-text-muted';
   const signed = (v: number) => `${v > 0 ? '+' : ''}${money(v)}`;
@@ -101,15 +110,22 @@ export default function PositionsPage() {
             </div>
           </div>
           <div>
-            <div className="text-[10px] uppercase tracking-wider text-text-muted">Today</div>
-            <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalToday)}`}>
-              {signed(totalToday)}
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Realised today</div>
+            <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalRealised)}`}>
+              {signed(totalRealised)}
             </div>
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-text-muted">Unrealised</div>
             <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalUnreal)}`}>
               {scoped.length ? signed(totalUnreal) : '—'}
+            </div>
+          </div>
+          <div>
+            {/* The whole, after its two halves — realised + unrealised. */}
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Today</div>
+            <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalToday)}`}>
+              {signed(totalToday)}
             </div>
           </div>
         </div>
@@ -121,6 +137,17 @@ export default function PositionsPage() {
         </button>
       </div>
 
+      {/* Scoped to one person, this page is identical to that person's own —
+          which is the point, and the reason it has to say whose it is before
+          anyone adds an account on it. */}
+      {isAdmin && effectiveScope(visible as any[], scope) !== ALL_ACCOUNTS && (
+        <ViewingAs
+          label={viewingLabel}
+          detail="this is exactly what they see"
+          onClear={() => setScope(ALL_ACCOUNTS)}
+        />
+      )}
+
       {loading ? <Loader label="Loading positions…" /> : groups.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-bg-border py-14 text-center">
           <p className="text-[13px] font-semibold text-text-primary">Nothing to show</p>
@@ -129,11 +156,40 @@ export default function PositionsPage() {
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
-          {groups.map((g) => (
-            <PositionGroup key={g.groupId} group={g} positions={positions as any[]}
-              showOwner={isAdmin} />
-          ))}
+        <div className="space-y-5">
+          {/* Same rule as the accounts list: holders only when an admin is
+              looking at everyone at once. */}
+          {isAdmin && effectiveScope(visible as any[], scope) === ALL_ACCOUNTS
+            ? groupByOwner(groups).map((o) => {
+                const accs = o.groups.flatMap((g) => [...(g.master ? [g.master] : []), ...g.followers]) as any[];
+                const ids = new Set(accs.map((a: any) => String(a.id)));
+                const legs = (positions as any[]).filter((p) => ids.has(String(p.account_id)));
+                const unreal = legs.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
+                const bal = accs.reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
+                const day = accs.reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+                const real = accs.reduce((s: number, a: any) => s + Number(a.realized_pnl_today || 0), 0);
+                return (
+                  <OwnerSection key={o.ownerId} email={o.email}
+                    subtitle={`${o.groups.length} group${o.groups.length === 1 ? '' : 's'} · ${accs.length} account${accs.length === 1 ? '' : 's'} · ${legs.length} open`}
+                    stats={[
+                      { label: 'Balance', value: money(bal) },
+                      { label: 'Realised', value: signed(real),
+                        tone: real > 0 ? 'pos' : real < 0 ? 'neg' : 'flat' },
+                      { label: 'Unreal.', value: legs.length ? signed(unreal) : '—',
+                        tone: unreal > 0 ? 'pos' : unreal < 0 ? 'neg' : 'flat' },
+                      { label: 'Today', value: signed(day), tone: day > 0 ? 'pos' : day < 0 ? 'neg' : 'flat' },
+                    ]}>
+                    {o.groups.map((g) => (
+                      <PositionGroup key={g.groupId} group={g} positions={positions as any[]}
+                        showOwner={false} />
+                    ))}
+                  </OwnerSection>
+                );
+              })
+            : groups.map((g) => (
+                <PositionGroup key={g.groupId} group={g} positions={positions as any[]}
+                  showOwner={false} />
+              ))}
         </div>
       )}
     </div>

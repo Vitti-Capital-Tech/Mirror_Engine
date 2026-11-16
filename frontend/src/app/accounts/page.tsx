@@ -1,11 +1,13 @@
 'use client';
 import React, { useState } from 'react';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByMaster, groupByOwner, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
 import { AccountGroupCard } from '@/components/accounts/AccountGroupCard';
 import { AddAccountModal } from '@/components/accounts/AddAccountModal';
 import { Loader } from '@/components/shared/Loader';
+import { OwnerSection } from '@/components/shared/OwnerSection';
+import { ViewingAs } from '@/components/shared/ViewingAs';
 import { Plus } from 'lucide-react';
 
 export default function AccountsPage() {
@@ -14,7 +16,7 @@ export default function AccountsPage() {
   // set of controls — add, edit, pause, resume, test, promote, delete — on all
   // of them regardless of who owns them. The header switcher narrows WHICH
   // owner's accounts are listed; it never removes a control.
-  const { scope } = useAccountScope();
+  const { scope, setScope } = useAccountScope();
   const { user } = useAuth();
   const accounts = applyScope(allAccounts as any[], scope);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -28,6 +30,12 @@ export default function AccountsPage() {
 
   const groups = groupByMaster(accounts);
   const isAdmin = user?.role === 'admin';
+  // Whose desk is on screen. A holder scope names the person directly; a group
+  // scope names a master, so the person is read off that group's accounts.
+  const viewingLabel = (() => {
+    const inScope = accounts as any[];
+    return inScope[0]?.owner_email || inScope[0]?.name || 'this holder';
+  })();
   const MAX_MASTERS = 5, MAX_FOLLOWERS = 2;
   const masterCount = accounts.filter((a: any) => a.is_master).length;
   // The button now opens a form that can add either kind, so it may only be
@@ -86,6 +94,17 @@ export default function AccountsPage() {
         </button>
       </div>
 
+      {/* Scoped to one person, this page is identical to that person's own —
+          which is the point, and the reason it has to say whose it is before
+          anyone adds an account on it. */}
+      {isAdmin && effectiveScope(accounts as any[], scope) !== ALL_ACCOUNTS && (
+        <ViewingAs
+          label={viewingLabel}
+          detail="this is exactly what they see"
+          onClear={() => setScope(ALL_ACCOUNTS)}
+        />
+      )}
+
       {isLoading ? <Loader label="Loading accounts…" /> : groups.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-bg-border py-14 text-center">
           <p className="text-[13px] font-semibold text-text-primary">No accounts yet</p>
@@ -99,16 +118,38 @@ export default function AccountsPage() {
           </button>
         </div>
       ) : (
-        <div className="space-y-3">
-          {groups.map((g) => (
-            <AccountGroupCard
-              key={g.groupId}
-              group={g}
-              maxFollowers={MAX_FOLLOWERS}
-              onAddCopy={(mid) => openAdd(mid)}
-              showOwner={isAdmin}
-            />
-          ))}
+        <div className="space-y-5">
+          {/* An admin on "all accounts" gets the groups wrapped per holder.
+              Picked down to one holder, this is exactly a normal user's view —
+              nobody needs a band telling them their own email address. */}
+          {isAdmin && effectiveScope(accounts as any[], scope) === ALL_ACCOUNTS
+            ? groupByOwner(groups).map((o) => {
+                const accs = o.groups.flatMap((g) => [...(g.master ? [g.master] : []), ...g.followers]) as any[];
+                const bal = accs.reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
+                const pnl = accs.reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+                const off = accs.filter((a: any) => a.status !== 'active').length;
+                return (
+                  <OwnerSection key={o.ownerId} email={o.email}
+                    subtitle={`${o.groups.length} group${o.groups.length === 1 ? '' : 's'} · ${accs.length} account${accs.length === 1 ? '' : 's'}${off ? ` · ${off} paused` : ''}`}
+                    stats={[
+                      { label: 'Balance', value: money2(bal) },
+                      { label: 'Today', value: `${pnl > 0 ? '+' : ''}${money2(pnl)}`,
+                        tone: pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'flat' },
+                    ]}>
+                    {o.groups.map((g) => (
+                      <AccountGroupCard key={g.groupId} group={g} maxFollowers={MAX_FOLLOWERS}
+                        onAddCopy={(mid) => openAdd(mid)} showOwner={false} />
+                    ))}
+                  </OwnerSection>
+                );
+              })
+            : groups.map((g) => (
+                // No owner line on the cards here: either this is the holder's
+                // own view, or it is an admin scoped to one person and the
+                // banner above has already said whose desk this is.
+                <AccountGroupCard key={g.groupId} group={g} maxFollowers={MAX_FOLLOWERS}
+                  onAddCopy={(mid) => openAdd(mid)} showOwner={false} />
+              ))}
         </div>
       )}
 

@@ -417,7 +417,31 @@ async def _sync_accounts(accounts: list) -> list:
                 realized_today = await _realized_pnl_today(client)
                 today_pnl += realized_today
 
-                db.table("accounts").update({"today_pnl": round(today_pnl, 2)}).eq("id", acc["id"]).execute()
+                # Both halves, written by the same pass. The screen used to
+                # show today_pnl beside the unrealised total, which double
+                # counts — the second is already inside the first. Deriving
+                # the realised half on the client by subtracting would mean
+                # subtracting two readings taken at different moments, so a
+                # figure that only moves when a trade closes would jitter on
+                # every refresh. Here the two agree by construction.
+                try:
+                    db.table("accounts").update({
+                        "today_pnl": round(today_pnl, 2),
+                        "realized_pnl_today": round(realized_today, 2),
+                    }).eq("id", acc["id"]).execute()
+                except Exception as col_err:
+                    # realized_pnl_today arrives with migration 007. If the code
+                    # is deployed before the migration is run, this write would
+                    # fail on the unknown column and take the whole position
+                    # sync down with it — today_pnl would stop updating and the
+                    # dashboard would quietly freeze. Deployment order is not
+                    # worth an outage, so fall back to the old shape.
+                    logger.warning(
+                        "realized_pnl_today not written for %s (%s); "
+                        "run migration 007 to split today's P&L.",
+                        acc.get("name"), col_err)
+                    db.table("accounts").update(
+                        {"today_pnl": round(today_pnl, 2)}).eq("id", acc["id"]).execute()
 
                 # Deletion is intentionally omitted here.
                 # WebSocket handles position closes (size=0 messages) in real time.

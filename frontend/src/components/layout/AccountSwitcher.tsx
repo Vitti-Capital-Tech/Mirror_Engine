@@ -1,9 +1,9 @@
 'use client';
 import React from 'react';
-import { ChevronDown, Check, Crown, CornerDownRight, Layers } from 'lucide-react';
+import { ChevronDown, Check, Crown, Layers, User } from 'lucide-react';
 import { useAccounts } from '@/hooks/useAccounts';
 import { useAuth } from '@/context/AuthContext';
-import { useAccountScope, groupByMaster, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, groupByMaster, groupByOwner, holderScope, isHolderScope, holderOf, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 
 /**
  * Pick which SET of accounts the dashboard is showing, or all of them.
@@ -55,13 +55,13 @@ export function AccountSwitcher() {
   // label as much as the switch.
   if (user?.role !== 'admin' || !accounts.length) return null;
 
+  const holders = groupByOwner(groups);
   const selected = groups.find((g) => g.groupId === scope);
-  const label = selected ? selected.label : 'All accounts';
-
-  const countLabel = (g: typeof groups[number]) => {
-    const n = g.followers.length;
-    return `${g.master ? 'master' : 'no master'} · ${n} follower${n === 1 ? '' : 's'}`;
-  };
+  const selectedHolder = isHolderScope(scope)
+    ? holders.find((h) => h.ownerId === holderOf(scope)) : undefined;
+  const label = selectedHolder
+    ? (selectedHolder.email || 'Unassigned')
+    : selected ? selected.label : 'All accounts';
 
   return (
     <div className="relative" ref={ref}>
@@ -92,32 +92,31 @@ export function AccountSwitcher() {
 
           <div className="my-1 h-px bg-bg-border" />
 
-          {groups.map((g) => (
-            <button
-              key={g.groupId}
-              type="button"
-              onClick={() => { setScope(g.groupId); setOpen(false); }}
-              className="w-full px-3 py-2 text-left hover:bg-bg-secondary/70 transition-colors"
-            >
-              <span className="flex items-center gap-2">
-                <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <span className="text-[12px] font-semibold text-text-primary truncate flex-1">{g.label}</span>
-                {scope === g.groupId && <Check className="w-3.5 h-3.5 text-blue-400 shrink-0" />}
-              </span>
-              <span className="block pl-[22px] text-[10px] text-text-muted mt-0.5">{countLabel(g)}</span>
-              {/* What is inside the group, so picking it is not a guess. */}
-              {g.followers.map((f: any) => (
-                <span key={f.id} className="flex items-center gap-1.5 pl-[22px] mt-1">
-                  <CornerDownRight className="w-3 h-3 text-text-muted shrink-0" />
-                  <span className="text-[11px] text-text-secondary truncate">{f.name}</span>
-                  {f.status === 'paused' && (
-                    <span className="text-[9px] font-bold tracking-wider text-text-muted border border-bg-border rounded px-1 py-px shrink-0">
-                      PAUSED
-                    </span>
-                  )}
+          {/* People, not masters. An admin picks WHO they are looking at;
+              which of that person's groups to read is then a question for the
+              page, where every group is already on screen and collapsible.
+              Listing each master here made the control long, made ownership
+              the small print, and offered a narrowing nobody needed. */}
+          {holders.map((h) => (
+            <div key={h.ownerId}>
+              <button
+                type="button"
+                onClick={() => { setScope(holderScope(h.ownerId)); setOpen(false); }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-bg-secondary/70 transition-colors"
+              >
+                <User className="w-3.5 h-3.5 text-text-muted shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[12px] font-semibold text-text-primary truncate">
+                    {h.email || 'Unassigned'}
+                  </span>
+                  <span className="block text-[10px] text-text-muted">
+                    {h.groups.length} group{h.groups.length === 1 ? '' : 's'} ·{' '}
+                    {h.groups.reduce((n, g) => n + (g.master ? 1 : 0) + g.followers.length, 0)} accounts
+                  </span>
                 </span>
-              ))}
-            </button>
+                {scope === holderScope(h.ownerId) && <Check className="w-3.5 h-3.5 text-blue-400 shrink-0" />}
+              </button>
+            </div>
           ))}
         </div>
       )}

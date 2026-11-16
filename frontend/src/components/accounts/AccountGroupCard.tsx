@@ -44,7 +44,7 @@ export const COL = {
   mid: 'hidden lg:flex items-center w-44 shrink-0 min-w-0',
   balance: 'hidden sm:block w-32 shrink-0 text-right',
   pnl: 'hidden sm:block w-28 shrink-0 text-right',
-  tail: 'w-[5.5rem] shrink-0',
+  tail: 'w-[6.5rem] shrink-0',
 };
 
 function confirmToast(message: string, onConfirm: () => void) {
@@ -133,13 +133,33 @@ function RunSwitch({ acc }: { acc: any }) {
 
   const toggle = () => {
     const m = running ? pause : resume;
+    // What the word "paused" actually means differs by role, and the thing
+    // people most want to know is whether their open positions just got
+    // closed. They did not — pausing stops the mirroring, it does not flatten
+    // anything — so the message says so rather than leaving it to be guessed.
+    const done = running
+      ? (acc.is_master
+          ? `Paused “${acc.name}”. Its trades will no longer be copied to its followers. Open positions are left exactly as they are.`
+          : `Paused “${acc.name}”. It will no longer mirror its master. Open positions are left exactly as they are.`)
+      : (acc.is_master
+          ? `Resumed “${acc.name}”. Its new trades will be copied to its followers again.`
+          : `Resumed “${acc.name}”. It will mirror its master’s new trades again.`);
     m.mutate(acc.id, {
-      onSuccess: () => toast.success(`“${acc.name}” ${running ? 'paused' : 'resumed'}.`),
-      onError: (e: any) => toast.error(e.message || 'Could not change that.'),
+      onSuccess: () => toast.success(done, { duration: 6000 }),
+      onError: (e: any) => toast.error(
+        `Could not ${running ? 'pause' : 'resume'} “${acc.name}”. ${e.message || 'The server did not say why.'}`,
+        { duration: 7000 }),
     });
   };
 
   return (
+    <span className="inline-flex flex-col items-center gap-0.5">
+      {/* Labelled like every other column. The page-level header that used to
+          name this one is gone, and an unlabelled switch on a page about live
+          money is a control you have to try in order to learn. */}
+      <span className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none">
+        {running ? 'Running' : 'Paused'}
+      </span>
     <button
       type="button" role="switch" aria-checked={running} disabled={busy}
       onClick={toggle}
@@ -153,6 +173,7 @@ function RunSwitch({ acc }: { acc: any }) {
       <span className={`absolute h-3 w-3 rounded-full transition-all ${
         running ? 'left-[15px] bg-emerald-400' : 'left-[2px] bg-text-muted'}`} />
     </button>
+    </span>
   );
 }
 
@@ -214,8 +235,12 @@ function RowActions({ acc, onEdit, onTest, testing }: any) {
               setOpen(false);
               confirmToast(`Make “${acc.name}” the master? The current master becomes a copy.`, () =>
                 promoteAcc.mutate(acc.id, {
-                  onSuccess: () => toast.success(`“${acc.name}” is now the master.`),
-                  onError: (e: any) => toast.error(e.message || 'Failed.'),
+                  onSuccess: () => toast.success(
+                    `“${acc.name}” is now the master of its group. The previous master is now one of its followers.`,
+                    { duration: 6000 }),
+                  onError: (e: any) => toast.error(
+                    `Could not promote “${acc.name}”. ${e.message || 'The server did not say why.'}`,
+                    { duration: 7000 }),
                 }));
             }}>
               <Crown className="w-3.5 h-3.5 text-amber-400" /> Make this the master
@@ -226,8 +251,12 @@ function RowActions({ acc, onEdit, onTest, testing }: any) {
             setOpen(false);
             confirmToast(`Delete “${acc.name}”? This cannot be undone.`, () =>
               deleteAcc.mutate(acc.id, {
-                onSuccess: () => toast.success(`“${acc.name}” deleted.`),
-                onError: (e: any) => toast.error(e.message || 'Failed.'),
+                onSuccess: () => toast.success(
+                  `“${acc.name}” deleted. Its keys are gone from Mirror Engine; nothing was changed on the exchange.`,
+                  { duration: 6000 }),
+                onError: (e: any) => toast.error(
+                  `Could not delete “${acc.name}”. ${e.message || 'The server did not say why.'}`,
+                  { duration: 7000 }),
               }));
           }}>
             <Trash2 className="w-3.5 h-3.5" /> Delete account
@@ -280,10 +309,16 @@ export function AccountGroupCard({
     /* No overflow-hidden: it clipped the row menus against the card edge, so
        half of "Delete account" simply was not there. The corners are rounded
        on the pieces that touch them instead. */
-    <div className={`rounded-2xl border border-bg-border bg-bg-panel/40 transition-opacity ${
+    /* Real steps, not 4% overlays. The palette's greys are all within a few
+       percent of black, so layering them at /20 and /40 produced borders
+       separating two shades of the same nothing. Page is bg-primary, the card
+       is bg-panel above it, its header bg-elevated above that, and an opened
+       table drops back to bg-primary — so depth is readable without having to
+       find the hairline. */
+    <div className={`rounded-2xl border border-bg-border bg-bg-panel shadow-lg shadow-black/30 transition-opacity ${
       paused ? 'opacity-60' : ''}`}>
       {/* ── Group head: the master ───────────────────────────────── */}
-      <div className="flex items-center gap-3 px-4 sm:px-5 py-3.5 bg-bg-secondary/20 rounded-t-2xl">
+      <div className="flex items-center gap-3 px-4 sm:px-5 py-3.5 bg-bg-elevated rounded-t-2xl border-b border-bg-border">
         <div className={`${COL.rail} flex items-center`}>
           <button type="button" onClick={() => setOpen((o) => !o)}
             title={open ? 'Collapse' : 'Expand'}
@@ -337,7 +372,7 @@ export function AccountGroupCard({
             {master ? signed(master.today_pnl) : '—'}
           </div>
         </div>
-        <div className={`${COL.tail} flex items-center justify-end gap-1`}>
+        <div className={`${COL.tail} flex items-center justify-end gap-3`}>
           {master && <RunSwitch acc={master} />}
           {master && <RowActions acc={master} onEdit={setEditing} onTest={onTest} testing={testingId === master.id} />}
         </div>
@@ -358,13 +393,13 @@ export function AccountGroupCard({
             </div>
           ) : (
             <>
-              <div className="divide-y divide-white/[0.04]">
+              <div className="divide-y divide-bg-border/70">
                 {followers.map((f, i) => {
                   const last = i === followers.length - 1;
                   const off = f.status !== 'active';
                   return (
                     <div key={f.id}
-                      className={`flex items-stretch gap-3 px-4 sm:px-5 hover:bg-bg-secondary/20 transition-colors ${
+                      className={`flex items-stretch gap-3 px-4 sm:px-5 hover:bg-bg-secondary transition-colors ${
                         off ? 'opacity-55' : ''}`}>
                       {/* The rail is what says "this one copies the one above"
                           — an indent alone does not. */}
@@ -406,7 +441,7 @@ export function AccountGroupCard({
                           {signed(f.today_pnl)}
                         </div>
                       </div>
-                      <div className={`${COL.tail} py-3 flex items-center justify-end gap-1`}>
+                      <div className={`${COL.tail} py-3 flex items-center justify-end gap-3`}>
                         <RunSwitch acc={f} />
                         <RowActions acc={f} onEdit={setEditing} onTest={onTest} testing={testingId === f.id} />
                       </div>

@@ -86,6 +86,9 @@ class AccountResponse(BaseModel):
     balance: Optional[float] = None
     available_margin: Optional[float] = None
     today_pnl: float
+    # today_pnl is realised + unrealised; this is the realised half on its own,
+    # so the dashboard can show the two without one hiding inside the other.
+    realized_pnl_today: float = 0.0
     created_at: datetime
     updated_at: datetime
     # Who owns this account. Declared here because response_model silently drops

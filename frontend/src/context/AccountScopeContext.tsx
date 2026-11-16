@@ -73,12 +73,30 @@ export function groupKeyOf(a: { id?: string; is_master?: boolean; master_id?: st
   return `owner:${a.owner_id ?? 'unassigned'}`;
 }
 
-/** Narrow a list of accounts to the selected group. */
+/** A scope naming a PERSON rather than one of their groups.
+ *
+ *  Picking a holder is how an admin says "show me exactly what this person
+ *  sees" — all of that person's groups, laid out the way they get them, with
+ *  no holder bands and nothing asking which email anything belongs to. */
+export const holderScope = (ownerId: string | null | undefined) =>
+  `holder:${ownerId ?? 'unassigned'}`;
+
+export const isHolderScope = (scope: string) => !!scope && scope.startsWith('holder:');
+
+export const holderOf = (scope: string) =>
+  isHolderScope(scope) ? scope.slice('holder:'.length) : null;
+
+const matchesScope = (a: { owner_id?: string | null }, scope: string) =>
+  isHolderScope(scope)
+    ? String(a.owner_id ?? 'unassigned') === holderOf(scope)
+    : groupKeyOf(a as any) === scope;
+
+/** Narrow a list of accounts to the selected group, or to one holder. */
 export function applyScope<T extends { id?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }>(
   accounts: T[], scope: string,
 ): T[] {
   if (!scope || scope === ALL_ACCOUNTS) return accounts;
-  const hit = accounts.filter((a) => groupKeyOf(a) === scope);
+  const hit = accounts.filter((a) => matchesScope(a, scope));
   // A scope pointing at a group that no longer exists — its accounts deleted,
   // or transferred to someone else — must not render an empty dashboard with
   // no explanation. Fall back to showing everything.
@@ -101,7 +119,7 @@ export function effectiveScope<T extends { id?: string; is_master?: boolean; mas
   accounts: T[], scope: string,
 ): string {
   if (!scope || scope === ALL_ACCOUNTS) return ALL_ACCOUNTS;
-  return accounts.some((a) => groupKeyOf(a) === scope) ? scope : ALL_ACCOUNTS;
+  return accounts.some((a) => matchesScope(a, scope)) ? scope : ALL_ACCOUNTS;
 }
 
 /** One group: a master and the followers assigned to it. */
@@ -169,4 +187,40 @@ export function groupByMaster<T extends { id: string; name?: string; is_master?:
     const label = master?.name || followers[0]?.name || 'Unassigned';
     return { groupId, ownerId: (master ?? followers[0])?.owner_id, master, followers, label };
   });
+}
+
+
+/**
+ * Bucket master-groups by the person who holds them.
+ *
+ * Only an admin looking at EVERY account needs this. Grouping by master is
+ * right for the person who owns the accounts — it is their desk and they know
+ * whose it is. An admin looking at all of them sees a flat run of groups whose
+ * only clue to ownership is a line of small print in each header, so two
+ * holders' groups sit shoulder to shoulder and read as one book.
+ *
+ * This does not replace the master grouping; it wraps it. A holder contains
+ * their groups, each group still contains its master and followers.
+ */
+export interface OwnerBucket<T> {
+  ownerId: string;
+  email?: string;
+  groups: AccountGroup<T>[];
+}
+
+export function groupByOwner<T extends { owner_id?: string | null; owner_email?: string }>(
+  groups: AccountGroup<T>[],
+): OwnerBucket<T>[] {
+  const order: string[] = [];
+  const by: Record<string, OwnerBucket<T>> = {};
+  for (const g of groups) {
+    const key = String(g.ownerId ?? 'unassigned');
+    if (!(key in by)) {
+      const any = (g.master ?? g.followers[0]) as any;
+      by[key] = { ownerId: key, email: any?.owner_email, groups: [] };
+      order.push(key);
+    }
+    by[key].groups.push(g);
+  }
+  return order.map((k) => by[k]);
 }

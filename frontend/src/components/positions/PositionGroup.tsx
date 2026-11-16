@@ -52,9 +52,10 @@ const MAX_CHIPS = 4;
 const MAX_MISSING = 3;
 
 export const PCOL = {
-  balance: 'w-[4.75rem] sm:w-28 shrink-0 text-right',
-  today: 'w-[4.75rem] sm:w-28 shrink-0 text-right',
-  unreal: 'w-[4.75rem] sm:w-28 shrink-0 text-right',
+  balance: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
+  realised: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
+  unreal: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
+  today: 'w-[4.5rem] sm:w-24 shrink-0 text-right',
 };
 
 /** A symbol the account is holding, and which way. Direction is the colour of
@@ -117,6 +118,10 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
 
   const shown = liveLegs ?? legs;
   const unreal = shown.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
+  // today_pnl is realised + unrealised, so showing it beside the unrealised
+  // total double counts. The realised half is now stored on its own by the
+  // same sync pass, and the three read as what they are: closed + open = day.
+  const realised = Number(acc.realized_pnl_today || 0);
   const today = Number(acc.today_pnl || 0);
 
   return (
@@ -126,7 +131,7 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
           right — two numbers printed on top of each other. The chips take a
           line of their own below the name instead. */}
       <button type="button" onClick={() => setOpen((o) => !o)}
-        className="w-full flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2 px-4 sm:px-5 py-3 text-left hover:bg-bg-secondary/20 transition-colors">
+        className="w-full flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2 px-4 sm:px-5 py-3 text-left hover:bg-bg-secondary transition-colors">
         <ChevronDown className={`w-3.5 h-3.5 shrink-0 text-text-muted transition-transform ${open ? '' : '-rotate-90'}`} />
 
         <span className="min-w-0 flex items-center gap-2 shrink-0">
@@ -187,15 +192,19 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
               {acc.balance != null ? money(Number(acc.balance)) : '—'}
             </span>
           </span>
-          <span className={PCOL.today}>
-            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Today</span>
-            <span className={`text-[12.5px] font-mono ${pnlClass(today)}`}>{signed(today)}</span>
+          <span className={PCOL.realised}>
+            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Realised</span>
+            <span className={`text-[12.5px] font-mono ${pnlClass(realised)}`}>{signed(realised)}</span>
           </span>
           <span className={PCOL.unreal}>
             <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Unreal.</span>
-            <span className={`text-[12.5px] font-mono font-bold ${pnlClass(unreal)}`}>
+            <span className={`text-[12.5px] font-mono ${pnlClass(unreal)}`}>
               {shown.length ? signed(unreal) : '—'}
             </span>
+          </span>
+          <span className={PCOL.today}>
+            <span className="block text-[8.5px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5">Today</span>
+            <span className={`text-[12.5px] font-mono font-bold ${pnlClass(today)}`}>{signed(today)}</span>
           </span>
         </span>
       </button>
@@ -205,7 +214,7 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
           visit. A collapsed account is still not mounted, so collapsing one
           does stop it polling — it is just no longer the starting state. */}
       {open && (
-        <div className="px-3 sm:px-4 pb-4">
+        <div className="px-3 sm:px-4 pb-4 pt-1 bg-bg-primary border-t border-bg-border">
           <AccountPositionCard acc={acc} compact />
         </div>
       )}
@@ -231,6 +240,7 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
   const groupLegs = members.flatMap((a) => legsOf(a.id));
   const groupUnreal = groupLegs.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0);
   const groupToday = members.reduce((s, a) => s + Number(a.today_pnl || 0), 0);
+  const groupRealised = members.reduce((s, a) => s + Number(a.realized_pnl_today || 0), 0);
   const groupBalance = members.reduce((s, a) => s + Number(a.balance || 0), 0);
 
   // A copy that is missing something its master holds is the failure this desk
@@ -243,11 +253,11 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
   const anyMissing = followers.some((f) => missingFor(f).length > 0);
 
   return (
-    <div className="rounded-2xl border border-bg-border bg-bg-panel/40">
+    <div className="rounded-2xl border border-bg-border bg-bg-panel shadow-lg shadow-black/30">
       {/* Stacks on a phone. Side by side, the two money columns left the
           master's name about ten pixels of room — the group was identified by
           a truncated badge and nothing else. */}
-      <div className="flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2 px-4 sm:px-5 py-3.5 bg-bg-secondary/20 rounded-t-2xl">
+      <div className="flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2 px-4 sm:px-5 py-3.5 bg-bg-elevated rounded-t-2xl border-b border-bg-border">
         <button type="button" onClick={() => setOpen((o) => !o)}
           title={open ? 'Collapse' : 'Expand'}
           className="p-1 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-secondary/60 transition-colors shrink-0">
@@ -282,21 +292,25 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
             <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group balance</div>
             <div className="text-[13px] font-mono font-bold text-text-primary">{money(groupBalance)}</div>
           </div>
-          <div className={PCOL.today}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group today</div>
-            <div className={`text-[13px] font-mono font-bold ${pnlClass(groupToday)}`}>{signed(groupToday)}</div>
+          <div className={PCOL.realised}>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp realised</div>
+            <div className={`text-[13px] font-mono font-bold ${pnlClass(groupRealised)}`}>{signed(groupRealised)}</div>
           </div>
           <div className={PCOL.unreal}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group unreal.</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp unreal.</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupUnreal)}`}>
               {groupLegs.length ? signed(groupUnreal) : '—'}
             </div>
+          </div>
+          <div className={PCOL.today}>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Grp today</div>
+            <div className={`text-[13px] font-mono font-bold ${pnlClass(groupToday)}`}>{signed(groupToday)}</div>
           </div>
         </div>
       </div>
 
       {open && (
-        <div className="border-t border-bg-border rounded-b-2xl bg-bg-primary/20">
+        <div className="rounded-b-2xl">
           {master
             ? <AccountRow acc={master} legs={masterLegs} missing={[]} isMaster defaultOpen />
             : (

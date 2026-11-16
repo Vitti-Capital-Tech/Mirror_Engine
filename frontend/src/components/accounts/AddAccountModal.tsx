@@ -2,9 +2,9 @@
 import React, { useState } from 'react';
 import { useCreateAccount, useAccounts, verifyCredentials } from '@/hooks/useAccounts';
 import { useAuth } from '@/context/AuthContext';
-import { useAccountScope, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, effectiveScope, isHolderScope, holderOf, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
 import { Select } from '@/components/shared/Select';
-import { X, Eye, EyeOff, ChevronDown, Crown, CornerDownRight, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
+import { X, Eye, EyeOff, ChevronDown, Crown, CornerDownRight, RefreshCw, ShieldCheck, AlertTriangle, User } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 /**
@@ -82,8 +82,16 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   }, [accounts]);
 
   const scoped = effectiveScope(accounts as any[], scope);
-  const scopedOwner = (accounts as any[]).find(
-    (a) => scoped !== ALL_ACCOUNTS && (a.is_master ? String(a.id) : String(a.master_id || '')) === scoped)?.owner_id;
+  // Whose accounts are on screen. Picking a holder — or one of their groups —
+  // in the header has already answered "for whom", so the form must not ask
+  // again: scoped to a person, an admin gets exactly that person's form.
+  const scopedOwner = scoped === ALL_ACCOUNTS
+    ? undefined
+    : isHolderScope(scoped)
+      ? holderOf(scoped)
+      : (accounts as any[]).find(
+          (a) => (a.is_master ? String(a.id) : String(a.master_id || '')) === scoped)?.owner_id;
+  const holderDecided = scoped !== ALL_ACCOUNTS && !!scopedOwner;
   const [ownerId, setOwnerId] = useState<string>(String(scopedOwner || (owners.length === 1 ? owners[0].id : '')));
   const targetOwner = isAdmin ? ownerId : (owners[0]?.id ?? '');
 
@@ -258,12 +266,24 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
           )}
 
           {isAdmin && owners.length > 0 && (
-            <div className="flex flex-col gap-1.5">
-              <label className={LABEL}>Account holder</label>
-              <Select size="lg" value={ownerId} onChange={setOwnerId}
-                placeholder="Select a holder…"
-                options={owners.map((o) => ({ value: o.id, label: o.label }))} />
-            </div>
+            holderDecided ? (
+              // Stated, not asked. The header already says whose desk this is.
+              <div className="flex items-center gap-2 text-[11.5px] text-text-muted">
+                <User className="w-3.5 h-3.5 shrink-0" />
+                <span>Adding to{' '}
+                  <span className="text-text-primary font-semibold">
+                    {owners.find((o) => String(o.id) === String(targetOwner))?.label ?? 'this holder'}
+                  </span>
+                </span>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                <label className={LABEL}>Account holder</label>
+                <Select size="lg" value={ownerId} onChange={setOwnerId}
+                  placeholder="Select a holder…"
+                  options={owners.map((o) => ({ value: o.id, label: o.label }))} />
+              </div>
+            )
           )}
 
           {!isMaster && !cameFromGroup && (
