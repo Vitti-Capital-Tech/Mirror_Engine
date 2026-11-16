@@ -185,7 +185,7 @@ export function AccountPositionCard({ acc, compact = false }: { acc: any; compac
       {/* Tab bar (Delta-style, horizontal). The Order History date filter rides
           on the right of this same row so it never costs an extra line. */}
       <div className="flex items-center gap-2 border-b border-bg-border px-2 sm:px-4">
-        <div className="flex items-stretch gap-1 overflow-x-auto flex-1 min-w-0">
+        <div className="flex items-stretch gap-1 overflow-x-auto no-scrollbar flex-1 min-w-0">
           {tabs.map((t) => (
             <button
               key={t.key}

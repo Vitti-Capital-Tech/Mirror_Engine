@@ -143,7 +143,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   // so the title says it. Otherwise the Master/Copy picker below answers that
   // question and the title should not try to answer it twice.
   const title = cameFromGroup && chosenMaster
-    ? `Add a copy to “${chosenMaster.name}”`
+    ? `Add a follower to “${chosenMaster.name}”`
     : 'Add account';
 
   const runVerify = async () => {
@@ -168,7 +168,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   const save = async () => {
     if (isAdmin && !ownerId) return setError('Choose which account holder this belongs to.');
     if (!isMaster && !effMasterId) return setError('Choose which master this copy should follow.');
-    if (!isMaster && followerLimitReached) return setError(`That master already has ${MAX_FOLLOWERS} copies.`);
+    if (!isMaster && followerLimitReached) return setError(`That master already has ${MAX_FOLLOWERS} followers.`);
     if (isMaster && masterLimitReached) return setError(`You already have ${MAX_MASTERS} master accounts.`);
 
     const payload: any = { name, api_key: apiKey, api_secret: apiSecret, is_master: isMaster, environment };
@@ -224,7 +224,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
               {isMaster
                 ? 'The account you trade yourself. Copies mirror what it does.'
                 : chosenMaster
-                  ? `Mirrors ${chosenMaster.name}. ${countFor(effMasterId)} of ${MAX_FOLLOWERS} copies used.`
+                  ? `Mirrors ${chosenMaster.name}. ${countFor(effMasterId)} of ${MAX_FOLLOWERS} followers used.`
                   : 'Mirrors a master account you choose.'}
             </p>
           </div>
@@ -240,7 +240,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
             <div className="grid grid-cols-2 gap-2">
               {[
                 { v: true, icon: Crown, t: 'Master', d: 'You trade it' },
-                { v: false, icon: CornerDownRight, t: 'Copy', d: 'Mirrors a master' },
+                { v: false, icon: CornerDownRight, t: 'Follower', d: 'Mirrors a master' },
               ].map(({ v, icon: Icon, t, d }) => (
                 <button key={t} type="button" onClick={() => setIsMaster(v)}
                   className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors ${
@@ -268,7 +268,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
 
           {!isMaster && !cameFromGroup && (
             <div className="flex flex-col gap-1.5">
-              <label className={LABEL}>Copies which master</label>
+              <label className={LABEL}>Follows which master</label>
               <Select size="lg" value={effMasterId} onChange={setMasterId}
                 placeholder="Select a master…"
                 options={ownerMasters.map((m: any) => {
@@ -276,7 +276,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                   const full = n >= MAX_FOLLOWERS;
                   return {
                     value: String(m.id),
-                    label: `${m.name} — ${n} of ${MAX_FOLLOWERS} copies used`,
+                    label: `${m.name} — ${n} of ${MAX_FOLLOWERS} followers used`,
                     // Still listed, so it is clear the master exists and why it
                     // cannot take another copy — but faded and not pickable.
                     disabled: full,
@@ -285,7 +285,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                 })} />
               {ownerMasters.length === 0 && (
                 <span className="text-[10.5px] text-amber-400">
-                  No master yet — add one first, a copy has nothing to mirror.
+                  No master yet — add one first, a follower has nothing to mirror.
                 </span>
               )}
             </div>
@@ -298,7 +298,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
             <div className="flex flex-col gap-1.5">
               <label className={LABEL}>Account name</label>
               <input required value={name} onChange={(e) => setName(e.target.value)}
-                placeholder={isMaster ? 'e.g. BTC scalper' : 'e.g. BTC scalper copy'} className={INPUT} />
+                placeholder={isMaster ? 'e.g. BTC scalper' : 'e.g. BTC scalper follower'} className={INPUT} />
             </div>
 
             {/* Environment comes before the keys because it decides which
@@ -470,7 +470,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                     ? 'bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-60'
                     : 'bg-bg-primary border border-bg-border text-text-muted hover:text-text-secondary cursor-not-allowed'}`}>
                 {saving && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                {isMaster ? 'Add master' : 'Add copy'}
+                {isMaster ? 'Add master' : 'Add follower'}
               </button>
             </div>
             {!verified && (

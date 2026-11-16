@@ -88,6 +88,21 @@ body {
   background-clip: padding-box;
 }
 
+/* A strip that scrolls but must not show a bar.
+   The global scrollbar above is 8px, which is fine down the side of a table
+   and far too loud under a 40px row of tabs — it read as a second, broken
+   element sitting under the header. The strip still scrolls and still swipes;
+   only the bar is hidden. */
+.no-scrollbar {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* old Edge */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 /* Text selection */
 ::selection {
   background: rgba(59, 130, 246, 0.28);

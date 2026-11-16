@@ -136,9 +136,11 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
             : 'text-[12.5px] font-semibold text-text-secondary'}`}>
             {acc.name}
           </span>
-          <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-text-muted/70">
-            {isMaster ? 'Master' : 'Copy'}
-          </span>
+          {/* A bordered chip, not bare text. Loose uppercase letters beside a
+              name read as something that fell off another element. */}
+          {isMaster
+            ? <span className="shrink-0 inline-flex items-center rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-amber-300/90">Master</span>
+            : <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">Follower</span>}
         </span>
 
         {/* What it is holding, without expanding anything. */}
@@ -147,7 +149,7 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
               that on a busy account the clipping ate the one chip the row
               exists to surface — a copy missing a leg its master holds. */}
           {missing.slice(0, MAX_MISSING).map((sym) => (
-            <span key={sym} title={`The master holds ${sym} and this copy does not`}
+            <span key={sym} title={`The master holds ${sym} and this follower does not`}
               className="shrink-0 inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
               <AlertTriangle className="w-3 h-3" /> no {sym}
             </span>
@@ -308,7 +310,7 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
           ))}
           {followers.length === 0 && master && (
             <div className="px-5 py-3 border-t border-bg-border text-[11.5px] text-text-muted">
-              No copies — this master is trading on its own.
+              No followers — this master is trading on its own.
             </div>
           )}
         </div>

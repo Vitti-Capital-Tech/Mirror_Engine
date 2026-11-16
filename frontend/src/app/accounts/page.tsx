@@ -77,7 +77,7 @@ export default function AccountsPage() {
           onClick={() => openAdd(undefined)}
           disabled={everythingFull}
           title={everythingFull
-            ? `All ${MAX_MASTERS} masters are set up and each has its ${MAX_FOLLOWERS} copies`
+            ? `All ${MAX_MASTERS} masters are set up and each has its ${MAX_FOLLOWERS} followers`
             : undefined}
           className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-bg-panel disabled:text-text-muted disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-colors"
         >
@@ -91,7 +91,7 @@ export default function AccountsPage() {
           <p className="text-[13px] font-semibold text-text-primary">No accounts yet</p>
           <p className="text-[12px] text-text-muted mt-1 max-w-sm mx-auto">
             Start with a master — the account you trade yourself. You can then add
-            up to {MAX_FOLLOWERS} copies that mirror it.
+            up to {MAX_FOLLOWERS} followers that mirror it.
           </p>
           <button onClick={() => openAdd(undefined)}
             className="mt-4 inline-flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors">

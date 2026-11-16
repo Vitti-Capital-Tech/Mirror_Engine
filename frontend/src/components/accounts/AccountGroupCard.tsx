@@ -272,7 +272,7 @@ export function AccountGroupCard({
   const addCopyButton = master && !full && (
     <button type="button" onClick={() => onAddCopy?.(String(master.id))}
       className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-blue-400 hover:text-blue-300 transition-colors">
-      <Plus className="w-3.5 h-3.5" /> Add a copy
+      <Plus className="w-3.5 h-3.5" /> Add a follower
     </button>
   );
 
@@ -298,12 +298,17 @@ export function AccountGroupCard({
             <span className="text-[14px] font-bold text-text-primary truncate">
               {master?.name || group.label}
             </span>
+            {master && (
+              <span className="shrink-0 inline-flex items-center rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-amber-300/90">
+                Master
+              </span>
+            )}
             {master && <RunState acc={master} />}
             <TestnetTag acc={master} />
           </div>
           <div className="text-[11px] text-text-muted mt-0.5 truncate">
             {showOwner && email ? <>{email} · </> : null}
-            {followers.length} of {maxFollowers} {maxFollowers === 1 ? 'copy' : 'copies'}
+            {followers.length} of {maxFollowers} {maxFollowers === 1 ? 'follower' : 'followers'}
             {/* An advanced setting, and the first thing to go when the line
                 is short — the balance behind it matters more. */}
             {master?.tp_sl_offset
@@ -346,7 +351,7 @@ export function AccountGroupCard({
             <div className="flex items-center justify-between gap-3 px-5 py-4">
               <span className="text-[12px] text-text-muted">
                 {master
-                  ? 'No copies yet — this master is trading on its own.'
+                  ? 'No followers yet — this master is trading on its own.'
                   : 'Not attached to a master yet — nothing is being copied.'}
               </span>
               {addCopyButton}
@@ -371,6 +376,9 @@ export function AccountGroupCard({
                       <div className="min-w-0 flex-1 py-3">
                         <div className="flex items-center gap-2">
                           <span className="text-[13px] font-semibold text-text-primary truncate">{f.name}</span>
+                          <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">
+                            Follower
+                          </span>
                           <RunState acc={f} />
                           <TestnetTag acc={f} />
                         </div>
