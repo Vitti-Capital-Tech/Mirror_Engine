@@ -3,25 +3,36 @@ import React, { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePositions } from '@/hooks/usePositions';
 import { useAccounts } from '@/hooks/useAccounts';
-import { useAccountScope, applyScope, groupByMaster, effectiveScope, ALL_ACCOUNTS } from '@/context/AccountScopeContext';
+import { useAccountScope, applyScope, groupByMaster } from '@/context/AccountScopeContext';
 import { useAuth } from '@/context/AuthContext';
-import { OwnerGroup } from '@/components/shared/OwnerGroup';
 import { useSocket } from '@/hooks/useSocket';
 import { api } from '@/lib/api';
 import { RefreshCw } from 'lucide-react';
 import { Loader } from '@/components/shared/Loader';
-import { AccountPositionCard } from '@/components/positions/AccountPositionCard';
+import { PositionGroup, PCOL } from '@/components/positions/PositionGroup';
 
+/**
+ * Open positions, by group.
+ *
+ * This used to render two flat lists for a normal user — "Master Account" and
+ * "Follower Accounts (n)" — and a different, grouped layout for an admin. Two
+ * layouts meant the view most people saw was the one that showed least: with
+ * several masters under one login, a flat follower list says nothing about
+ * which copy belongs to which master.
+ *
+ * Everyone now gets the same grouped view. The admin difference is one line of
+ * extra information — whose accounts these are — not a different page.
+ */
 export default function PositionsPage() {
   const queryClient = useQueryClient();
   const { data: accounts = [], isLoading: accountsLoading } = useAccounts();
+  const { data: positions = [], isLoading: positionsLoading } = usePositions();
   const { scope } = useAccountScope();
   const { user } = useAuth();
-  const { isLoading: positionsLoading } = usePositions();
   const { latestPosition } = useSocket();
   const [syncing, setSyncing] = useState(false);
 
-  // Refresh React Query data on WS position event
+  // Refresh on a WS position event.
   useEffect(() => {
     if (latestPosition) {
       queryClient.invalidateQueries({ queryKey: ['positions'] });
@@ -29,12 +40,7 @@ export default function PositionsPage() {
     }
   }, [latestPosition, queryClient]);
 
-  // Automatically sync positions from live exchange on initial page mount
-  useEffect(() => {
-    handleSyncLive();
-  }, []);
-
-  const handleSyncLive = async () => {
+  const handleSyncLive = React.useCallback(async () => {
     try {
       setSyncing(true);
       await api.positions.syncLive();
@@ -46,96 +52,99 @@ export default function PositionsPage() {
     } finally {
       setSyncing(false);
     }
-  };
+  }, [queryClient]);
+
+  useEffect(() => { handleSyncLive(); }, [handleSyncLive]);
+
+  // Paused accounts are intentionally hidden here; the header switcher then
+  // narrows to one owner when one has been picked.
+  const visible = applyScope(
+    (accounts as any[]).filter((a: any) => a.status !== 'paused'), scope);
+  const groups = groupByMaster(visible as any[]);
+  const isAdmin = user?.role === 'admin';
+
+  const scoped = (positions as any[]).filter((p: any) =>
+    visible.some((a: any) => String(a.id) === String(p.account_id)));
+  const totalUnreal = scoped.reduce((s: number, p: any) => s + Number(p.unrealized_pnl || 0), 0);
+  // Today's P&L is the account's own figure, not something derived from the
+  // open legs — it includes trades already closed today, which is exactly the
+  // part unrealised cannot see.
+  const totalToday = (visible as any[]).reduce((s: number, a: any) => s + Number(a.today_pnl || 0), 0);
+  const totalBalance = (visible as any[]).reduce((s: number, a: any) => s + Number(a.balance || 0), 0);
+  const pnlClass = (v: number) =>
+    v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-text-muted';
+  const signed = (v: number) => `${v > 0 ? '+' : ''}${money(v)}`;
+  const money = (v: number) =>
+    v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const loading = (accountsLoading || positionsLoading) && accounts.length === 0;
 
   return (
-    <div className="space-y-8 select-none">
-      {/* Header action button */}
-      <div className="flex items-center justify-end">
-        <button
-          onClick={handleSyncLive}
-          disabled={syncing}
-          className="group relative inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white overflow-hidden border border-blue-400/30 bg-gradient-to-b from-blue-500 to-blue-600 hover:from-blue-400 hover:to-blue-500 shadow-lg shadow-blue-500/25 transition-all disabled:opacity-70 disabled:cursor-not-allowed"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : 'group-hover:rotate-90 transition-transform duration-300'}`} />
-          {syncing ? 'Syncing…' : 'Sync Now'}
+    <div className="space-y-5 select-none">
+      <div className="flex items-end justify-between gap-4 flex-wrap">
+        {/* Wraps: four figures do not fit across a phone, and the last of
+            them was being cut off at the edge. */}
+        <div className="flex items-end flex-wrap gap-x-6 gap-y-3">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Open positions</div>
+            <div className="text-[15px] font-bold text-text-primary leading-tight">
+              {scoped.length}
+              <span className="text-[12px] font-normal text-text-muted">
+                {' '}across {groups.length} {groups.length === 1 ? 'group' : 'groups'}
+              </span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Balance</div>
+            <div className="text-[15px] font-mono font-bold text-text-primary leading-tight">
+              {money(totalBalance)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Today</div>
+            <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalToday)}`}>
+              {signed(totalToday)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-text-muted">Unrealised</div>
+            <div className={`text-[15px] font-mono font-bold leading-tight ${pnlClass(totalUnreal)}`}>
+              {scoped.length ? signed(totalUnreal) : '—'}
+            </div>
+          </div>
+        </div>
+
+        <button onClick={handleSyncLive} disabled={syncing}
+          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-60 disabled:cursor-not-allowed text-white text-xs font-semibold transition-colors">
+          <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
+          {syncing ? 'Syncing…' : 'Sync now'}
         </button>
       </div>
 
-      {/* Grouped account cards: master on top, active followers below.
-          Paused accounts are intentionally hidden from the positions view. */}
-      {(accountsLoading || positionsLoading) && accounts.length === 0 ? <Loader label="Loading positions…" /> : (() => {
-        // Paused accounts are intentionally hidden here; the TopBar switcher
-        // then narrows to one account when the user has picked one.
-        const visible = applyScope(
-          accounts.filter((a: any) => a.status !== 'paused'), scope);
-        const masterAccts = visible.filter((a: any) => a.is_master);
-        const followerAccts = visible.filter((a: any) => !a.is_master);
-
-        const renderCard = (acc: any) => <AccountPositionCard key={acc.id} acc={acc} />;
-
-        // An admin looking at everything needs to see WHOSE accounts these are.
-        // Flat "Master / Followers" headings read as one desk, which is exactly
-        // the confusion: it looks like you are signed in as a single user. So
-        // group by owner, each card headed by the person, master and followers
-        // together inside. Done even for a single owner — naming them is the
-        // point, not just separating them.
-        const isAdmin = user?.role === 'admin';
-        if (isAdmin && effectiveScope(visible as any[], scope) === ALL_ACCOUNTS && visible.length > 0) {
-          const groups = groupByMaster(visible as any[]);
-          return (
-            <div className="space-y-5">
-              {groups.map((g) => (
-                <OwnerGroup
-                  key={g.groupId}
-                  email={(g.master as any)?.owner_email
-                    ?? (g.followers[0] as any)?.owner_email}
-                  master={g.master}
-                  followers={g.followers}
-                >
-                  {g.master && renderCard(g.master)}
-                  {g.followers.map(renderCard)}
-                  {!g.master && (
-                    <div className="card-premium py-5 text-center text-text-muted text-xs">
-                      No active master account for this owner.
-                    </div>
-                  )}
-                </OwnerGroup>
-              ))}
-            </div>
-          );
-        }
-
-        return (
-          <div className="space-y-10">
-            {/* Master section */}
-            <div className="space-y-3">
-              <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">Master Account</h3>
-              {masterAccts.length > 0 ? (
-                <div className="space-y-6">{masterAccts.map(renderCard)}</div>
-              ) : (
-                <div className="card-premium py-6 text-center text-text-muted text-xs">
-                  No active master account.
-                </div>
-              )}
-            </div>
-
-            {/* Followers section */}
-            <div className="space-y-3">
-              <h3 className="text-[11px] font-bold text-text-muted uppercase tracking-[0.15em]">
-                Follower Accounts ({followerAccts.length})
-              </h3>
-              {followerAccts.length > 0 ? (
-                <div className="space-y-6">{followerAccts.map(renderCard)}</div>
-              ) : (
-                <div className="card-premium py-6 text-center text-text-muted text-xs">
-                  No active follower accounts.
-                </div>
-              )}
-            </div>
+      {loading ? <Loader label="Loading positions…" /> : groups.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-bg-border py-14 text-center">
+          <p className="text-[13px] font-semibold text-text-primary">Nothing to show</p>
+          <p className="text-[12px] text-text-muted mt-1">
+            No active accounts. Paused accounts are not listed here.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {/* Column labels, once, on the widths the rows use. On a phone the
+              rows carry their own small labels instead — there is no room for
+              a header that would sit over nothing. */}
+          <div className="hidden sm:flex items-center gap-6 pr-5 text-[10px] uppercase tracking-wider text-text-muted/70">
+            <div className="flex-1" />
+            <div className={PCOL.balance}>Balance</div>
+            <div className={PCOL.today}>Today</div>
+            <div className={PCOL.unreal}>Unrealised</div>
           </div>
-        );
-      })()}
+          {groups.map((g) => (
+            <PositionGroup key={g.groupId} group={g} positions={positions as any[]}
+              showOwner={isAdmin} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -74,7 +74,10 @@ function Paginator({ page, setPage, pageSize, setPageSize, total, start, end, ma
   );
 }
 
-export function AccountPositionCard({ acc }: { acc: any }) {
+export function AccountPositionCard({ acc, compact = false }: { acc: any; compact?: boolean }) {
+  // `compact` is for the grouped Positions page, where the row above this card
+  // already names the account and draws its own box. Repeating the name forty
+  // pixels below itself, inside a second border, is two of each.
   // Each card fetches its own full live Delta view, so master AND follower
   // accounts render the identical Delta-style tabs.
   const { data, isLoading } = useAccountLiveView(acc.id);
@@ -105,36 +108,59 @@ export function AccountPositionCard({ acc }: { acc: any }) {
   const loadingFirst = isLoading && !data;
 
   return (
-    <div className="card-premium overflow-hidden shadow-md">
+    <div className={compact
+      ? 'rounded-xl border border-bg-border bg-bg-primary/20 overflow-hidden'
+      : 'card-premium overflow-hidden shadow-md'}>
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-bg-border bg-bg-panel/40 px-4 sm:px-6 py-4">
-        <div className="flex items-center gap-3 min-w-0">
-          <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
-            {acc.name?.charAt(0)?.toUpperCase() || '?'}
-            {acc.is_master && (
-              <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm rotate-[18deg]">
-                <Crown className="w-2.5 h-2.5 text-[#1a1205]" fill="currentColor" />
-              </span>
-            )}
-          </span>
-          <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
-          {loadingFirst && <Loader2 className="w-3.5 h-3.5 text-text-muted animate-spin shrink-0" />}
-        </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs font-bold">
-          <div className="flex items-center gap-2">
-            <span className="text-text-muted text-[10px] uppercase font-semibold">Today P&L:</span>
-            <span className={pnlCls(Number(acc.today_pnl || 0))}>
-              {Number(acc.today_pnl || 0) >= 0 ? '+' : ''}{Number(acc.today_pnl || 0).toFixed(2)} USDT
+      {/* In compact mode the row above the card carries balance, today's P&L
+          and the unrealised figure, so the header is down to nothing but an
+          allocation override — which most accounts do not have. Rendering an
+          empty bar for them is a border and a gap saying nothing, so it is
+          only rendered when it has something left to say. */}
+      {(!compact || acc.allocated_balance != null || loadingFirst) && (
+      <div className={`flex flex-wrap items-center justify-between gap-3 border-b border-bg-border bg-bg-panel/40 ${
+        compact ? 'px-4 py-2' : 'px-4 sm:px-6 py-4'}`}>
+        {compact ? (
+          loadingFirst ? <Loader2 className="w-3.5 h-3.5 text-text-muted animate-spin shrink-0" /> : null
+        ) : (
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500/25 to-emerald-500/20 ring-1 ring-bg-border text-sm font-bold text-text-primary shrink-0">
+              {acc.name?.charAt(0)?.toUpperCase() || '?'}
+              {acc.is_master && (
+                <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 ring-2 ring-bg-panel shadow-sm rotate-[18deg]">
+                  <Crown className="w-2.5 h-2.5 text-[#1a1205]" fill="currentColor" />
+                </span>
+              )}
             </span>
+            <h3 className="font-bold text-text-primary text-sm tracking-tight leading-tight truncate">{acc.name}</h3>
+            {loadingFirst && <Loader2 className="w-3.5 h-3.5 text-text-muted animate-spin shrink-0" />}
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-text-muted text-[10px] uppercase font-semibold">Active P&L:</span>
-            <span className={pnlCls(activePnL)}>{activePnL >= 0 ? '+' : ''}{activePnL.toFixed(2)} USDT</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-text-muted text-[10px] uppercase font-semibold">Balance:</span>
-            <span className="text-text-primary">{acc.balance != null ? `${Number(acc.balance).toFixed(2)} USDT` : '-'}</span>
-          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs font-bold">
+          {/* Not in compact mode: the group row directly above this card
+              already carries today's and the unrealised figure, and printing
+              them again a few pixels lower is the same number twice. Balance
+              is not up there, so it stays. */}
+          {!compact && (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-text-muted text-[10px] uppercase font-semibold">Today P&L:</span>
+                <span className={pnlCls(Number(acc.today_pnl || 0))}>
+                  {Number(acc.today_pnl || 0) >= 0 ? '+' : ''}{Number(acc.today_pnl || 0).toFixed(2)} USDT
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-text-muted text-[10px] uppercase font-semibold">Active P&L:</span>
+                <span className={pnlCls(activePnL)}>{activePnL >= 0 ? '+' : ''}{activePnL.toFixed(2)} USDT</span>
+              </div>
+            </>
+          )}
+          {!compact && (
+            <div className="flex items-center gap-2">
+              <span className="text-text-muted text-[10px] uppercase font-semibold">Balance:</span>
+              <span className="text-text-primary">{acc.balance != null ? `${Number(acc.balance).toFixed(2)} USDT` : '-'}</span>
+            </div>
+          )}
           {acc.allocated_balance != null && (
             <div className="flex items-center gap-2">
               <span className="text-text-muted text-[10px] uppercase font-semibold">Alloc:</span>
@@ -143,6 +169,7 @@ export function AccountPositionCard({ acc }: { acc: any }) {
           )}
         </div>
       </div>
+      )}
 
       {/* Tab bar (Delta-style, horizontal). The Order History date filter rides
           on the right of this same row so it never costs an extra line. */}
@@ -169,7 +196,7 @@ export function AccountPositionCard({ acc }: { acc: any }) {
       </div>
 
       {/* Tab content */}
-      <div className="p-4 sm:p-6">
+      <div className={compact ? 'p-3 sm:p-4' : 'p-4 sm:p-6'}>
         {loadingFirst ? (
           <div className="py-8 flex items-center justify-center gap-2 text-text-muted text-xs">
             <Loader2 className="w-4 h-4 animate-spin" /> Loading live data from Delta…
