@@ -135,8 +135,29 @@ export function groupByMaster<T extends { id: string; name?: string; is_master?:
   // Masters first, so a group is keyed and ordered by its master even when a
   // follower happens to come earlier in the list.
   const sorted = [...accounts].sort((a, b) => Number(!!b.is_master) - Number(!!a.is_master));
+
+  // A follower whose master_id is not set yet must still land WITH its master,
+  // not in a group of its own. That happens for any row the backfill has not
+  // reached, and for every row served by a backend that predates master_id —
+  // during a rolling deploy, for instance. If its owner has exactly one master
+  // there is no ambiguity, so adopt it; with several, leave it unassigned
+  // rather than guessing which desk it belongs to.
+  const mastersByOwner: Record<string, string[]> = {};
   for (const a of sorted) {
-    const key = groupKeyOf(a);
+    if (!a.is_master) continue;
+    const o = String(a.owner_id ?? '');
+    (mastersByOwner[o] = mastersByOwner[o] || []).push(String(a.id));
+  }
+  const keyFor = (a: typeof sorted[number]) => {
+    if (!a.is_master && !a.master_id) {
+      const mine = mastersByOwner[String(a.owner_id ?? '')] || [];
+      if (mine.length === 1) return mine[0];
+    }
+    return groupKeyOf(a);
+  };
+
+  for (const a of sorted) {
+    const key = keyFor(a);
     if (!byGroup[key]) { byGroup[key] = []; order.push(key); }
     byGroup[key].push(a);
   }
