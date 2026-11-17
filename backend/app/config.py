@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # Telegram alert notifications (optional). Set both to enable.
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    # Per-holder alert routing, as JSON: {"<owner_id>": "<chat_id>"}.
+    # An owner listed here gets their accounts' alerts in THEIR chat and
+    # nowhere else; everyone else keeps going to TELEGRAM_CHAT_ID. Keyed on
+    # owner_id rather than account name so renaming an account cannot silently
+    # send someone's alerts to the wrong desk.
+    TELEGRAM_CHAT_ROUTES: str = ""
 
     # Daily master-vs-follower fill match report, posted to the Telegram chat
     # above. Time is IST, because the day it reports on is an IST trading day.

@@ -1,6 +1,7 @@
 """Telegram Bot notifications for alerts. Inert unless TELEGRAM_BOT_TOKEN and
 TELEGRAM_CHAT_ID are configured."""
 
+import json
 import logging
 import time
 import httpx
@@ -76,8 +77,66 @@ def _chat_id():
     return _migrated_chat_id or settings.TELEGRAM_CHAT_ID
 
 
-async def send_message(text: str) -> bool:
-    """Send a plain-text message to the configured Telegram chat. Best-effort."""
+# ── Per-holder routing ───────────────────────────────────────────────────
+#
+# One desk watches everyone's accounts; a client should see their own and
+# nothing else — not the other holders' symbols, sizes or balances, which is
+# what a shared alert group leaks.
+#
+# Keyed on owner_id, never on account name. Pratik's accounts are called
+# "Dhwani" and "Dhwani1": matching on the name would be unreadable, and a
+# rename would quietly route his alerts back to the main group with nobody
+# noticing until he asked why he had stopped hearing anything.
+_routes_cache: dict | None = None
+_owner_of: dict = {}          # account name -> owner_id
+_owner_by_id: dict = {}       # account id   -> owner_id
+_owner_of_ts: float = 0.0
+_OWNER_TTL = 60.0
+
+
+def _routes() -> dict:
+    global _routes_cache
+    if _routes_cache is None:
+        raw = (settings.TELEGRAM_CHAT_ROUTES or "").strip()
+        try:
+            _routes_cache = json.loads(raw) if raw else {}
+        except Exception as e:
+            logger.error("TELEGRAM_CHAT_ROUTES is not valid JSON (%s) — "
+                         "every alert will go to the main chat", e)
+            _routes_cache = {}
+    return _routes_cache
+
+
+async def _chat_for(account: str | None = None, account_id: str | None = None) -> str:
+    """The chat this account's alerts belong in; the main chat by default.
+
+    Any failure here falls back to the main chat. An alert in the wrong group
+    is a privacy problem; an alert in NO group is a trading problem, and the
+    second is worse.
+    """
+    routes = _routes()
+    if not routes or not (account or account_id):
+        return _chat_id()
+    global _owner_of, _owner_by_id, _owner_of_ts
+    try:
+        if time.time() - _owner_of_ts > _OWNER_TTL:
+            from app.database import db
+            rows = (db.table("accounts").select("id,name,owner_id").execute().data) or []
+            _owner_of = {r["name"]: str(r.get("owner_id") or "") for r in rows}
+            _owner_by_id = {str(r["id"]): str(r.get("owner_id") or "") for r in rows}
+            _owner_of_ts = time.time()
+        owner = (_owner_by_id.get(str(account_id)) if account_id
+                 else _owner_of.get(account, ""))
+        return routes.get(owner or "", _chat_id())
+    except Exception as e:
+        logger.warning("Alert routing lookup failed for %s (%s) — using the main chat",
+                       account, e)
+        return _chat_id()
+
+
+async def send_message(text: str, account: str | None = None,
+                       account_id: str | None = None) -> bool:
+    """Send a plain-text message to the chat this account belongs to."""
     if not telegram_enabled():
         return False
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -92,7 +151,7 @@ async def send_message(text: str) -> bool:
             })
 
     try:
-        r = await _post(_chat_id())
+        r = await _post(await _chat_for(account, account_id))
         if r.status_code >= 400:
             # Follow a supergroup migration once, then retry this same message.
             new_id = None
@@ -264,7 +323,7 @@ async def notify_open(account: str, symbol: str, side: str, lots, price=None) ->
     text = (f"{icon} <b>Position Opened</b> · {account}\n"
             f"<code>{symbol}</code>\n"
             f"{direction} · {_num(lots)} lot(s)" + (f" @ {_num(price)}" if price is not None else ""))
-    await send_message(text)
+    await send_message(text, account=account)
 
 
 async def notify_close(account: str, symbol: str, lots, price=None) -> None:
@@ -276,7 +335,7 @@ async def notify_close(account: str, symbol: str, lots, price=None) -> None:
     text = (f"✅ <b>Position Closed</b> · {account}\n"
             f"<code>{symbol}</code>\n"
             f"{_num(lots)} lot(s)" + (f" @ {_num(price)}" if price is not None else ""))
-    await send_message(text)
+    await send_message(text, account=account)
 
 
 async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
@@ -308,7 +367,7 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
         text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
                 f"<code>{symbol}</code>\n"
                 f"{str(side).title()}{lot_str} — {reason}")
-    await send_message(text)
+    await send_message(text, account=account)
 
 
 async def notify_correction(
@@ -396,4 +455,4 @@ async def send_alert(alert: dict) -> None:
     if text == _last["text"] and (now - _last["ts"]) < _DEDUPE_WINDOW:
         return
     _last["text"], _last["ts"] = text, now
-    await send_message(text)
+    await send_message(text, account_id=alert.get("account_id"))
