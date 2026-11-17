@@ -5,8 +5,38 @@ Checks performed (in order):
 1. Account status must be 'active'
 2. Consecutive failures must be < 5 (circuit-breaker guard)
 3. Quantity must be positive
-4. Estimated margin (qty * price / leverage) must not exceed available_margin
-5. Position size must not exceed account's max_position_size (if set)
+4. Position size must not exceed account's max_position_size (if set)
+
+THERE IS NO MARGIN CHECK, DELIBERATELY. There was one — `qty * price /
+leverage` against a stored available_margin — and it was removed on
+2026-11-17 after it blocked a follower's entire book.
+
+It was wrong twice over:
+
+  * It omitted the CONTRACT VALUE. A BTC option lot is 0.001 BTC, so a leg
+    costing ~117 USD was read as 11,700. Every other part of the codebase
+    multiplies by it; this did not.
+  * `available_margin or _FALLBACK` treated 0.0 as "unknown" and substituted
+    10,000 USD. An account with genuinely nothing free was waved straight
+    through, which is the one case the check existed for.
+
+Between them the guard had it exactly backwards: it blocked accounts that
+HAD free margin to report, and switched itself off for accounts running at
+full tilt. One desk had been trading for months with it effectively disabled
+and copying cleanly — a live demonstration that nothing depends on it.
+
+Fixing the arithmetic would not have been enough. Option margin is risk-based:
+it depends on the whole cross-margin portfolio, on direction (buying costs the
+premium, selling needs far more), and on unrealised P&L. The exchange computes
+it exactly; anything we calculate from qty and price is a guess at a number
+Delta already knows. So the authority on margin is Delta: send the order, and
+if it cannot be afforded Delta refuses it, the desk is alerted, and the
+reconciler retries.
+
+That is also the safer direction to be wrong in. A refused order is visible
+and recoverable. A locally blocked one is silent, and leaves the follower
+diverging from its master — the exact failure this whole system exists to
+prevent.
 """
 
 import logging
@@ -14,8 +44,6 @@ from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-# If available margin cannot be determined, allow trades up to this notional USD
-_FALLBACK_MAX_MARGIN_USD = 10_000.0
 _MAX_CONSECUTIVE_FAILURES = 5
 
 
@@ -26,10 +54,15 @@ class RiskEngine:
         self,
         account: dict,
         quantity: float,
-        entry_price: float,
+        entry_price: float = 0.0,
     ) -> Tuple[bool, str]:
         """
-        Run all risk checks for *account* and the proposed *quantity* / *entry_price*.
+        Run all risk checks for *account* and the proposed *quantity*.
+
+        `entry_price` is no longer read — the margin check that used it is gone
+        (see the module docstring). It stays on the signature because the one
+        caller passes it positionally, and because a price is the obvious thing
+        a future check would want; removing and re-adding it is churn.
 
         Returns
         -------
@@ -53,21 +86,7 @@ class RiskEngine:
         if quantity <= 0:
             return False, f"Invalid quantity: {quantity}"
 
-        # 4. Margin check
-        leverage_limit: int = account.get("leverage_limit", 50) or 50
-        estimated_margin = (quantity * entry_price) / leverage_limit
-        available_margin: float = account.get("available_margin") or _FALLBACK_MAX_MARGIN_USD
-
-        if estimated_margin > available_margin:
-            return (
-                False,
-                (
-                    f"Insufficient margin: need ~{estimated_margin:.2f} USD "
-                    f"but only {available_margin:.2f} USD available"
-                ),
-            )
-
-        # 5. Max position-size guard
+        # 4. Max position-size guard
         max_position_size: float | None = account.get("max_position_size")
         if max_position_size is not None and quantity > max_position_size:
             return (
