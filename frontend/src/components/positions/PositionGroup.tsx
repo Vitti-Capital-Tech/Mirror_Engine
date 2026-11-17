@@ -42,13 +42,6 @@ const pnlClass = (v: number) =>
 /** Shared column widths — the header row on the page renders its labels
  *  against these, which is the only reason the labels sit over their
  *  columns. */
-/** How many symbol chips a row shows before it stops and says how many more
- *  there are. A dozen legs wrapped to three lines, pushed the money out of its
- *  columns onto a line of its own, and stopped being glanceable — which was
- *  the entire reason for showing the symbols up here. Four is what fits beside
- *  a name and two figures without wrapping; the rest are one click away in the
- *  table that already lists them properly. */
-const MAX_CHIPS = 4;
 const MAX_MISSING = 3;
 
 export const PCOL = {
@@ -59,23 +52,6 @@ export const PCOL = {
   unreal: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
   today: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
 };
-
-/** A symbol the account is holding, and which way. Direction is the colour of
- *  the rail AND the word, never the colour alone. */
-function Leg({ p }: { p: any }) {
-  const long = String(p.side).toLowerCase() === 'long';
-  const pnl = Number(p.unrealized_pnl || 0);
-  return (
-    <span className="inline-flex items-center gap-1.5 rounded-md border border-bg-border bg-bg-primary/60 pl-1.5 pr-2 py-0.5">
-      <span className={`w-[3px] h-3 rounded-full ${long ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-      <span className="text-[10.5px] font-semibold text-text-primary">{p.symbol}</span>
-      <span className="text-[9.5px] font-bold uppercase tracking-wide text-text-muted">
-        {long ? 'Long' : 'Short'}
-      </span>
-      <span className={`text-[10.5px] font-mono ${pnlClass(pnl)}`}>{signed(pnl)}</span>
-    </span>
-  );
-}
 
 function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
   acc: any; legs: any[]; missing: string[]; isMaster: boolean; defaultOpen: boolean;
@@ -173,18 +149,13 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
               +{missing.length - MAX_MISSING} more missing
             </span>
           )}
-          {shown.length === 0
-            ? <span className="text-[11px] text-text-muted">Nothing open</span>
-            : shown.slice(0, Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING)))
-                   .map((p: any) => <Leg key={p.id} p={p} />)}
-          {(() => {
-            const cap = Math.max(1, MAX_CHIPS - Math.min(missing.length, MAX_MISSING));
-            return shown.length > cap ? (
-              <span className="shrink-0 rounded-md border border-bg-border bg-bg-primary/60 px-1.5 py-0.5 text-[10px] font-semibold text-text-muted">
-                +{shown.length - cap} more
-              </span>
-            ) : null;
-          })()}
+          {/* No per-symbol chips. They restated the table below — same
+              symbols, same sides, same figures, in less detail — and open is
+              how the page starts. What stays is the thing a table cannot
+              show: a leg the master holds and this follower does not. */}
+          {!open && shown.length === 0 && (
+            <span className="text-[11px] text-text-muted">Nothing open</span>
+          )}
         </span>
 
         {/* Three figures do not fit beside a name on a phone, so there they
