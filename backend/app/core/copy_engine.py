@@ -1446,8 +1446,17 @@ class CopyEngine:
                     reason="confirm-copy correction",
                 )
                 asyncio.create_task(tg.notify_correction(
+                    # pos_target, NOT target. The alert prints "held X -> Y" as a
+                    # before-and-after of the POSITION, and `target` is this one
+                    # order's share of it. Pairing them read as a reduction when
+                    # the follower had in fact been topped up: on 2026-11-17 a
+                    # correction that took the position from 1791 to 2926 was
+                    # announced as "held 1791 -> 1135", 1135 being the lots just
+                    # added. Harmless only while held is 0, which is why it
+                    # survived — every other alert that morning started from a
+                    # follower holding nothing.
                     follower.get("name"), symbol, "CONFIRM-COPY", int(short),
-                    held=held, target=int(target), master=msz,
+                    held=held, target=int(pos_target), master=msz,
                     why=(f"master order {master_order_id} filled "
                          f"{master_filled:.0f}; follower was short {short}"),
                 ))
