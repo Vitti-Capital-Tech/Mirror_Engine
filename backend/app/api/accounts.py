@@ -160,6 +160,15 @@ async def create_account(account_data: AccountCreate, user: CurrentUser = Depend
         data = account_data.model_dump()
         data.pop("owner_id", None)
         data["owner_id"] = target_owner
+        # A NEW ACCOUNT STARTS PAUSED. The column default is 'active', which
+        # meant a freshly added follower began mirroring live trades the
+        # instant it was saved — before anyone had looked at its allocation,
+        # its limits, or which master it had been attached to. The first thing
+        # you knew about a mistake was a position.
+        #
+        # Adding an account and turning it on are two decisions, so they are
+        # two actions now. The row carries a switch; resuming is one click.
+        data["status"] = "paused"
         if data.get("api_key"):
             data["api_key"] = encrypt(data["api_key"])
         if data.get("api_secret"):

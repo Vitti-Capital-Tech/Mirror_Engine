@@ -194,7 +194,11 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
     setSaving(true);
     try {
       await createAccount.mutateAsync(payload);
-      toast.success(`“${name}” added.`);
+      // It is added PAUSED, and saying so is the difference between a
+      // deliberate second step and an account that looks broken on arrival.
+      toast.success(
+        `“${name}” added — it starts paused. Turn it on with the switch on its row when you are ready.`,
+        { duration: 7000 });
       onClose();
     } catch (err: any) {
       setError(err.message || 'Could not add the account.');
