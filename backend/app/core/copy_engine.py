@@ -88,6 +88,11 @@ STALE_ORPHAN_SEC = float(os.getenv("STALE_ORPHAN_SEC", "60"))  # 1 minute (desk 
 # confirming what a completed master order actually copied. Our fills land 1-2s
 # behind (measured 2026-09-02), so 3s is enough without delaying a real fix.
 ORDER_CONFIRM_SETTLE_SEC = float(os.getenv("ORDER_CONFIRM_SETTLE_SEC", "3"))
+# How long a discrepancy may stand before a human is told. The reconcile pass
+# is 10s and needs two passes to confirm, so a correction normally lands inside
+# ~20-30s; 60 gives it a comfortable margin before crying wolf, and still beats
+# the hours it took a person to notice on 2026-11-19.
+STUCK_AFTER_SEC = float(os.getenv("STUCK_AFTER_SEC", "60"))
 
 
 # Deadband before the reconciler will resize a follower that is on the correct
@@ -233,6 +238,11 @@ class CopyEngine:
         # 480 -> 280), and it also blocked legitimate top-ups for 15 minutes after
         # any small wobble even when the master was back at full size. The peak has
         # no expiry to run out and no false positives at full size.
+        # When each unresolved discrepancy was FIRST seen, so one that outlives
+        # the reconciler's normal correction time can be escalated to a human
+        # instead of being re-detected in silence every ten seconds.
+        # {(master_id, kind, follower_id, symbol): first_seen_ts}
+        self._recon_stuck_since: dict = {}
         self._master_size_peak: dict = {}
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
@@ -1774,6 +1784,9 @@ class CopyEngine:
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
         current_trim: set = set()   # (follower_id, sym, excess) over-exposed THIS pass
         current_topup: dict = {}    # {(follower_id, sym): short_by} under-exposed THIS pass
+        # What to SAY about each candidate if it turns out to be stuck.
+        # {(kind, follower_id, sym): (name, held, target, master_size)}
+        _stuck_detail: dict = {}
         # Lazily fetched once per pass (shared across followers): {sym: last master
         # fill epoch}. Gates recovery-opens so we never re-enter a stale leg.
         master_fresh_ts = None
@@ -1972,6 +1985,8 @@ class CopyEngine:
                             # can only ever under-open, never overshoot.
                             ukey = (fid, sym)
                             current_topup[ukey] = short_by
+                            _stuck_detail[("topup", fid, sym)] = (
+                                fol.get("name"), held, int(target), msz)
                             prev_short = self._recon_topup_prev.get(_mkey, {}).get(ukey)
                             if prev_short is None:
                                 logger.info(
@@ -2063,6 +2078,8 @@ class CopyEngine:
                             continue
                         tkey = (fid, sym, excess)
                         current_trim.add(tkey)
+                        _stuck_detail[("trim", fid, sym)] = (
+                            fol.get("name"), held, int(target), msz)
                         if tkey not in self._recon_trim_prev.get(_mkey, set()):
                             logger.info(
                                 f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
@@ -2145,6 +2162,8 @@ class CopyEngine:
                             )
                     key = (fid, sym)
                     current_close.add(key)
+                    _stuck_detail[("close", fid, sym)] = (
+                        fol.get("name"), held, 0, msz)
                     if key not in self._recon_close_prev.get(_mkey, set()):
                         continue  # first sighting — confirm next pass before acting
                     side = "sell" if fsz > 0 else "buy"
@@ -2181,6 +2200,8 @@ class CopyEngine:
                         continue  # live copy already has a resting order here
                     key = (fid, sym)
                     current_open.add(key)
+                    _stuck_detail[("open", fid, sym)] = (
+                        fol.get("name"), 0, int(target), msz)
                     if key not in self._recon_open_prev.get(_mkey, set()):
                         continue  # first sighting — a just-filled mirror may not be
                                   # reflected yet; confirm on the next pass (avoids a
@@ -2263,6 +2284,47 @@ class CopyEngine:
                 logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
 
         # Remember this pass's candidates so the next pass can confirm them.
+        # ── Escalate anything the reconciler has SEEN but not settled ──
+        #
+        # Every alert this engine sends announces something it DID. Nothing
+        # announced what it failed to do, and on 2026-11-19 that cost a whole
+        # day: a follower doubled to 5539 against a target of 2771, detected
+        # eight seconds later, logged thirteen times over two minutes, and
+        # never mentioned. The client found it himself on the exchange.
+        #
+        # So: remember when each discrepancy was first seen, and once one
+        # outlives the normal correction time, say so. A book caught mid-flight
+        # settles inside STUCK_AFTER_SEC and stays quiet; anything still wrong
+        # after it means the reconciler has tried and not succeeded, which is
+        # precisely when a human should look.
+        _now = time.time()
+        _live = set()
+        for _kind, _cands in (("open", current_open), ("close", current_close),
+                              ("trim", {(k[0], k[1]) for k in current_trim}),
+                              ("topup", set(current_topup))):
+            for _fid, _sym in _cands:
+                _sk = (_mkey, _kind, _fid, _sym)
+                _live.add(_sk)
+                _since = self._recon_stuck_since.setdefault(_sk, _now)
+                _age = _now - _since
+                if _age < STUCK_AFTER_SEC:
+                    continue
+                _name, _held, _target, _msz = _stuck_detail.get(
+                    (_kind, _fid, _sym), (None, None, None, None))
+                if not _name:
+                    continue
+                try:
+                    asyncio.create_task(tg.notify_stuck(
+                        _name, _sym, _kind, _held, _target,
+                        master=_msz, seconds=_age,
+                    ))
+                except Exception as _e:
+                    logger.warning(f"could not raise a stuck alert for {_name} {_sym}: {_e}")
+        # Anything that settled stops being tracked, so a later recurrence is
+        # timed from scratch rather than inheriting an old clock.
+        for _sk in [k for k in self._recon_stuck_since if k[0] == _mkey and k not in _live]:
+            self._recon_stuck_since.pop(_sk, None)
+
         # This master's bucket only — never the whole map.
         self._recon_open_prev[_mkey] = current_open
         self._recon_close_prev[_mkey] = current_close

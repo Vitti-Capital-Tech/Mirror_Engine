@@ -27,6 +27,10 @@ DUP_EVENT_WINDOW = 45.0
 # the state can hold for hours — you want one message, not one per pass. Paired
 # with clear_alert() so the next genuine occurrence still gets through.
 STATE_ALERT_WINDOW = 6 * 3600.0
+# A STUCK position is re-detected every 10s, so it needs a window — but six
+# hours would hide a second episode the same day. Half an hour: loud enough to
+# act on, quiet enough to ignore while someone is already dealing with it.
+STUCK_ALERT_WINDOW = 1800.0
 
 # ONE message per episode, not one per hour.
 #
@@ -430,6 +434,55 @@ async def notify_correction(
     if cause:
         lines.append(f"↳ earlier failure: <code>{cause}</code>")
     await send_message("\n".join(lines))
+
+
+async def notify_stuck(account: str, symbol: str, kind: str, held, target,
+                       master=None, seconds: float = 0, why: str | None = None) -> None:
+    """A discrepancy the reconciler has SEEN but not resolved.
+
+    Every alert before this one announced something the engine DID. Nothing
+    announced what it failed to do, which is how four separate faults in one
+    day were found by people staring at the exchange instead of by us.
+
+    The worst of them, 2026-11-19: a follower was doubled to 5539 against a
+    target of 2771 and the engine knew eight seconds later —
+
+        04:10:52  over-exposed — holds 5539, target 2789 (excess 2750)
+
+    — then logged that same line thirteen times across two minutes and told
+    nobody. The information existed; it never left the box. The client found it
+    himself.
+
+    Fired only once a discrepancy OUTLIVES the reconciler's normal correction
+    time, so a book caught mid-flight stays quiet. By then it means the
+    reconciler has tried and not succeeded, which is exactly when a human
+    should look.
+    """
+    if not telegram_enabled():
+        return
+    # One per (account, symbol, kind) per window — a stuck position re-detects
+    # every 10s and must not become a stream nobody reads.
+    if not await _should_send(f"stuck:{account}:{symbol}:{kind}", STUCK_ALERT_WINDOW):
+        return
+
+    _k = {
+        "trim": "HOLDS TOO MUCH",
+        "topup": "HOLDS TOO LITTLE",
+        "open": "LEG MISSING",
+        "close": "LEG THE MASTER HAS EXITED",
+    }.get(kind, kind.upper())
+
+    lines = [
+        f"⏳ <b>Not corrected</b> · {account}",
+        f"<code>{symbol}</code>",
+        f"<b>{_k}</b> — holds {_num(held)}, should hold {_num(target)}"
+        + (f" (master {_num(master)})" if master is not None else ""),
+        f"<i>unresolved for {int(seconds)}s — the reconciler has tried and not "
+        f"settled it</i>",
+    ]
+    if why:
+        lines.append(f"↳ {why}")
+    await send_message("\n".join(lines), account=account)
 
 
 async def send_alert(alert: dict) -> None:

@@ -133,6 +133,22 @@ class OrderExecutor:
                 "status": "skipped",
                 "failure_reason": reason
             }).eq("id", copy_id).execute()
+            # SAY SO. A refusal here means the order never reaches the exchange,
+            # so there is no rejection for anyone to see: the copy simply does
+            # not happen and the follower drifts from its master in silence.
+            #
+            # A client spent a day on 2026-11-19 reporting "no error, no copy"
+            # while every leg of his book was being refused on this line. The
+            # failure was a WARNING in a log nobody reads.
+            try:
+                import asyncio
+                from app.services import telegram_client as tg
+                asyncio.create_task(tg.notify_fail(
+                    account_name, symbol, side, quantity,
+                    f"not sent — {reason}",
+                ))
+            except Exception as _e:
+                logger.warning(f"could not alert the skipped copy for {account_name}: {_e}")
             
             return {
                 "account_id": account_id,
