@@ -2433,6 +2433,23 @@ class CopyEngine:
         if ts:
             logger.info(f"[LATENCY] {symbol} order-mirror: {(time.time() - ts):.2f}s from master order detection to mirror start")
 
+        # The master already cancelled this order. The event in hand is a stale
+        # re-mirror from the 30s reconcile's snapshot; placing it would give the
+        # follower an order with no master counterpart, which no later cancel
+        # can clear. See the tombstone in _mirror_cancel.
+        try:
+            if await self.redis.get(f"ocancel:{master_order_id}"):
+                logger.info(
+                    f"Not mirroring {symbol} for master order {master_order_id} — "
+                    f"the master cancelled it; this is a stale re-mirror"
+                )
+                return
+        except Exception as e:
+            logger.warning(
+                f"Could not check the cancel tombstone for {master_order_id} "
+                f"({e}) — mirroring anyway rather than dropping a live order"
+            )
+
 
         # The active followers AND the master, in ONE read.
         #
@@ -4030,6 +4047,32 @@ class CopyEngine:
             ))
 
     async def _mirror_cancel(self, master_order_id: str, event: dict | None = None) -> None:
+        # TOMBSTONE THE MASTER ORDER FIRST.
+        #
+        # The 30s order reconcile re-mirrors the master's resting limits from a
+        # snapshot it took moments earlier. If the master cancels between that
+        # snapshot and the event being handled, the reconcile resurrects a dead
+        # order — and the follower is left holding one nothing will ever cancel,
+        # because the master's order is gone and no further cancel event will
+        # ever name it.
+        #
+        # 2026-11-19 14:57:51 on C-BTC-69000-201126, Pratik's desk:
+        #   :51.121  master cancelled 1696147383
+        #   :51.242  "Reconcile: re-mirrored 1 resting limit order(s)"
+        #   :51.656  Cancelled mirrored order 1696147507   (the cancel worked)
+        #   :54.036  Mirrored 1696147383 -> Dhwani1 1696325930 (2996)  (resurrected)
+        # It sat in his book until he cancelled it by hand ~3.5 hours later.
+        #
+        # Written before anything else here, because the cancel is handled
+        # before the stale place — so by the time _mirror_place looks, the
+        # tombstone is already there.
+        try:
+            await self.redis.setex(f"ocancel:{master_order_id}", 600, "1")
+        except Exception as e:
+            logger.warning(
+                f"Could not tombstone cancelled master order {master_order_id} "
+                f"({e}) — a stale re-mirror could resurrect it"
+            )
         key = f"ordermap:{master_order_id}"
         try:
             mapping = await self.redis.hgetall(key)
