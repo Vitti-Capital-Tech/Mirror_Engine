@@ -183,17 +183,32 @@ class CopyEngine:
         # A mismatch must persist across TWO consecutive 10s reconcile passes
         # before we act — so a transient race (a just-filled mirror whose position
         # hasn't shown in get_positions yet) can never trigger a duplicate.
-        self._recon_open_prev: set = set()
-        self._recon_close_prev: set = set()
+        # KEYED PER MASTER. These hold the previous pass's candidates so the
+        # next pass can confirm them before acting. The reconcile loop runs once
+        # per master against a SHARED engine, so a single set here meant each
+        # master's pass overwrote the other's pending confirmations: JD algo4's
+        # pass would record a trim candidate, Dhwani's pass moments later would
+        # find nothing and wipe it, and the next JD algo4 pass would start over.
+        #
+        # Nothing was ever confirmed, so nothing was ever acted on. Observed
+        # live 2026-11-19 04:10:52 — a follower sat 2,750 lots over-exposed
+        # while the reconciler logged "confirming next pass before trimming"
+        # thirteen times across 2m07s and never trimmed. It worked for months
+        # because there was only ever one active master; it broke the moment a
+        # second came online (2026-11-18 13:53).
+        #
+        # {master_id: set/dict of that master's candidates}
+        self._recon_open_prev: dict = {}
+        self._recon_close_prev: dict = {}
         # Same two-pass confirmation for a TRIM (follower on the correct side but
         # holding more than its share of the master's remaining position — i.e. a
         # partial exit that never got copied). Keyed on the excess too, so a size
         # that's still moving restarts the confirmation instead of acting mid-flight.
-        self._recon_trim_prev: set = set()
+        self._recon_trim_prev: dict = {}
         # Same, for a TOP-UP (follower on the correct side but holding LESS than its
         # share — a partially-missed entry). Adds exposure, so it gets the same
         # two-pass confirmation, the open debounce, and a price-drift guard.
-        self._recon_topup_prev: set = set()
+        self._recon_topup_prev: dict = {}
         # {symbol: abs master size seen last pass} and {symbol: ts until which the
         # master counts as REDUCING on that symbol. While a master is unwinding, a
         # follower must never be adding — see the top-up branch.
@@ -1292,6 +1307,37 @@ class CopyEngine:
 
         await asyncio.sleep(ORDER_CONFIRM_SETTLE_SEC)
 
+        # RE-READ THE MAP. It was read BEFORE the settle above, and the whole
+        # point of that sleep is to let the live mirror land — so deciding on
+        # the pre-sleep snapshot defeats it. A mirror placed during those
+        # seconds was invisible, the map still read empty, and this method
+        # concluded "nothing was mirrored" about an order that was resting on
+        # the exchange.
+        #
+        # Everything downstream already handles it correctly once the map is
+        # right: the per-follower loop below asks _order_is_live and defers to
+        # escalation rather than topping up on top of a resting mirror. That
+        # guard simply never had anything to look at.
+        #
+        # 2026-11-19 04:10, P-BTC-61600-191126. Read at :38.36 — empty. Mirror
+        # recorded at :40.57. Woke at :41.50, still holding the empty snapshot,
+        # declared nothing mirrored, and marketed 2771 at :42.73. The resting
+        # 2768 limit then filled at :44.04, leaving the follower with 5539
+        # against a target of 2771.
+        #
+        # Merged rather than replaced: a caller may have passed a mapping in,
+        # and other followers' entries may have landed mid-sleep too.
+        try:
+            _fresh = await self.redis.hgetall(f"ordermap:{master_order_id}")
+            if _fresh:
+                mapping = {**(mapping or {}), **_fresh}
+        except Exception as e:
+            logger.warning(
+                f"confirm-copy: could not re-read the order map for "
+                f"{master_order_id} after the settle ({e}) — going on with the "
+                f"pre-settle view"
+            )
+
         accounts = await self._read_accounts()
         by_id = {a.get("id"): a for a in (accounts or []) if a.get("id")}
         _oid = event.get("owner_id")
@@ -1651,6 +1697,10 @@ class CopyEngine:
         # Which MASTER fired this. Events carry it now because owner_id alone
         # no longer identifies a group — one owner may run several.
         _master_acct_id = (event or {}).get("master_account_id")
+        # Which bucket of two-pass state this pass owns. Falls back to the owner
+        # for an event predating master_account_id — still better than sharing
+        # one bucket across every master.
+        _mkey = str(_master_acct_id or owner_id or "")
         accounts = await self._read_accounts(owner_id)
         if accounts is None:
             # Was the followers-query behaviour: an unreadable accounts table
@@ -1885,7 +1935,7 @@ class CopyEngine:
                             # can only ever under-open, never overshoot.
                             ukey = (fid, sym)
                             current_topup[ukey] = short_by
-                            prev_short = self._recon_topup_prev.get(ukey)
+                            prev_short = self._recon_topup_prev.get(_mkey, {}).get(ukey)
                             if prev_short is None:
                                 logger.info(
                                     f"reconcile: {fol.get('name')} under-exposed on {sym} — holds "
@@ -1976,7 +2026,7 @@ class CopyEngine:
                             continue
                         tkey = (fid, sym, excess)
                         current_trim.add(tkey)
-                        if tkey not in self._recon_trim_prev:
+                        if tkey not in self._recon_trim_prev.get(_mkey, set()):
                             logger.info(
                                 f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
                                 f"{held}, target {int(target)} for master {msz:+.0f} "
@@ -2058,7 +2108,7 @@ class CopyEngine:
                             )
                     key = (fid, sym)
                     current_close.add(key)
-                    if key not in self._recon_close_prev:
+                    if key not in self._recon_close_prev.get(_mkey, set()):
                         continue  # first sighting — confirm next pass before acting
                     side = "sell" if fsz > 0 else "buy"
                     try:
@@ -2094,7 +2144,7 @@ class CopyEngine:
                         continue  # live copy already has a resting order here
                     key = (fid, sym)
                     current_open.add(key)
-                    if key not in self._recon_open_prev:
+                    if key not in self._recon_open_prev.get(_mkey, set()):
                         continue  # first sighting — a just-filled mirror may not be
                                   # reflected yet; confirm on the next pass (avoids a
                                   # duplicate entry racing the live copy)
@@ -2176,10 +2226,11 @@ class CopyEngine:
                 logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
 
         # Remember this pass's candidates so the next pass can confirm them.
-        self._recon_open_prev = current_open
-        self._recon_close_prev = current_close
-        self._recon_trim_prev = current_trim
-        self._recon_topup_prev = current_topup
+        # This master's bucket only — never the whole map.
+        self._recon_open_prev[_mkey] = current_open
+        self._recon_close_prev[_mkey] = current_close
+        self._recon_trim_prev[_mkey] = current_trim
+        self._recon_topup_prev[_mkey] = current_topup
 
     async def _sync_protection(self, event: dict) -> None:
         """Cancel any follower SL/TP whose master counterpart no longer exists.
