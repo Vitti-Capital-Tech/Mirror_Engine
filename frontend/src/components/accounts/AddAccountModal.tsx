@@ -45,14 +45,25 @@ const INPUT =
   'w-full bg-bg-primary border border-bg-border rounded-lg px-3 py-2.5 text-[13px] ' +
   'text-text-primary placeholder:text-text-muted/70 outline-none focus:border-blue-500/70 transition-colors';
 
-/** How a copy is sized. One dropdown rather than four stacked cards: it is a
+/** How a copy is sized. One dropdown rather than stacked cards: it is a
  *  single decision, the recommended answer is right for almost everyone, and
  *  the cards made the least interesting part of the form the tallest. */
+// "Percentage of capital" was removed on 2026-11-19. Its sizing was wrong in
+// two ways and silently so: it divided the master's price by the leverage limit
+// without the CONTRACT VALUE (a BTC option lot is 0.001 BTC), sizing options at
+// roughly a hundredth of the intention; and it budgeted from available_margin
+// with `or 0.0`, so an account deliberately trading at full margin — which is
+// how this desk runs — budgeted ZERO and copied nothing at all.
+//
+// Nobody had selected it, but it sat one click away in this list, and a
+// follower that silently copies nothing is the exact failure that cost a client
+// a day that week. Taken out rather than fixed, because the two working modes
+// cover what the desk uses and a mode nobody asked for is not worth the maths.
+// The backend still accepts the value for any row that already has it.
 const COPY_MODES = [
   { id: 'auto_ratio', title: 'Match balance automatically', hint: 'Sizes each copy by the balance ratio between the two accounts. Right for most setups.', unit: null, recommended: true },
   { id: 'multiplier', title: 'Multiple of the master', hint: 'e.g. 2 copies twice the master’s size, whatever that size is.', unit: '×', recommended: false },
   { id: 'fixed', title: 'Fixed size', hint: 'The same number of contracts every time, ignoring the master’s size.', unit: 'lots', recommended: false },
-  { id: 'capital_pct', title: 'Percentage of capital', hint: 'Sizes by a share of this account’s own balance.', unit: '%', recommended: false },
 ] as const;
 
 export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
