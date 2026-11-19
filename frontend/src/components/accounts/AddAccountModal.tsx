@@ -34,10 +34,13 @@ import toast from 'react-hot-toast';
 const MAX_MASTERS = 5;
 const MAX_FOLLOWERS = 2;
 const DEFAULT_TP_SL_OFFSET = '50';
-// What the backend stores when the form leaves it blank (AccountCreate's own
-// default), shown as a real value so the number in force is the number on
-// screen rather than a greyed-out hint.
-const DEFAULT_LEVERAGE_LIMIT = '10';
+// There is no leverage field any more. It was never sent to Delta and never
+// changed anything on the exchange — it only fed a local margin estimate, and
+// the two things that read it are both gone: the pre-trade margin check
+// (removed 2026-11-17, it refused a follower's whole book) and the
+// percentage-of-capital sizing (removed 2026-11-19). Asking for a number that
+// does nothing invites someone to tune it and wonder why nothing changes.
+// The column stays for rows that already carry a value.
 
 const LABEL = 'text-[10px] font-semibold uppercase tracking-wider text-text-muted';
 const HINT = 'text-[10.5px] text-text-muted';
@@ -150,7 +153,6 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   const [advOpen, setAdvOpen] = useState(false);
   const [allocatedBalance, setAllocatedBalance] = useState('');
   const [maxPositionSize, setMaxPositionSize] = useState('');
-  const [leverageLimit, setLeverageLimit] = useState(DEFAULT_LEVERAGE_LIMIT);
   const [tpSlOffset, setTpSlOffset] = useState(DEFAULT_TP_SL_OFFSET);
 
   const [saving, setSaving] = useState(false);
@@ -200,7 +202,6 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
     }
     if (isMaster && tpSlOffset) payload.tp_sl_offset = parseFloat(tpSlOffset);
     if (allocatedBalance) payload.allocated_balance = parseFloat(allocatedBalance);
-    if (leverageLimit) payload.leverage_limit = parseInt(leverageLimit);
 
     setSaving(true);
     try {
@@ -466,17 +467,6 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                   </div>
                 )}
 
-                <div className="flex flex-col gap-1.5">
-                  <label className={LABEL}>Leverage limit</label>
-                  <input type="number" min="1" max="200" value={leverageLimit}
-                    onChange={(e) => setLeverageLimit(e.target.value)}
-                    className={`${INPUT} font-mono`} />
-                  <span className={HINT}>
-                    Only used here, to estimate the margin a copied trade needs before
-                    placing it. It is not sent to Delta and does not change the leverage
-                    set on the exchange.
-                  </span>
-                </div>
               </div>
             )}
           </div>
