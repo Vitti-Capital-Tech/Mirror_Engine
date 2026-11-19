@@ -124,6 +124,36 @@ def test_the_engine_really_keys_this_per_master():
           "self._recon_trim_prev.get(_mkey" in body, True)
 
 
+def test_every_two_pass_memory_is_per_master():
+    """All SIX of them, not just the ones that happened to be noticed.
+
+    The reconcile sweep has four (open / close / trim / top-up) and the
+    protection sweep has two (orphaned SL/TP, and MISSING SL/TP). The first
+    four were keyed per master on 2026-11-19 and the other two were missed in
+    the same pass, which is exactly how a fix leaves half a bug behind.
+
+    _prot_missing is the worst of the six: it gates PLACING protection a
+    follower lacks, so while it could not confirm, a follower with no stop-loss
+    would never be given one. That is a live position left unprotected, not a
+    cosmetic gap.
+    """
+    print("\n0c. all six confirmations are per-master")
+    import inspect
+    from app.core import copy_engine as ce
+    src = inspect.getsource(ce.CopyEngine.__init__)
+    for attr in ("_recon_open_prev", "_recon_close_prev", "_recon_trim_prev",
+                 "_recon_topup_prev", "_prot_orphans_prev", "_prot_missing_prev"):
+        check(f"{attr} is a dict", f"self.{attr}: dict = {{}}" in src, True)
+
+    prot = inspect.getsource(ce.CopyEngine._sync_protection)
+    check("protection reads its own bucket",
+          "_prot_missing_prev.get(_pkey" in prot, True)
+    check("protection writes its own bucket",
+          "self._prot_missing_prev[_pkey] = current_missing" in prot, True)
+    check("orphan sweep reads its own bucket",
+          "_prot_orphans_prev.get(_pkey" in prot, True)
+
+
 def test_one_master_confirms_on_the_second_pass():
     print("\n1. the rule itself: never act on the first sighting")
     e = engine()
@@ -189,6 +219,7 @@ def test_a_changed_excess_restarts_the_confirmation():
 if __name__ == "__main__":
     for t in (test_the_old_shared_state_loses_it,
               test_the_engine_really_keys_this_per_master,
+              test_every_two_pass_memory_is_per_master,
               test_one_master_confirms_on_the_second_pass,
               test_a_second_master_cannot_erase_the_first_s_memory,
               test_it_survives_many_interleavings,

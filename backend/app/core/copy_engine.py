@@ -169,7 +169,17 @@ class CopyEngine:
         # PREVIOUS sync sweep. We only cancel a follower's SL/TP after it's been an
         # orphan for two consecutive sweeps, so a master bracket edit
         # (cancel-and-replace, momentarily no stop) can't cause a wrong cancel.
-        self._prot_orphans_prev: set = set()
+        # KEYED PER MASTER, for the reason given on _recon_open_prev above:
+        # the protection sweep also runs once per master against this shared
+        # engine, so a single set here let each master's pass wipe the other's
+        # pending confirmation and nothing was ever confirmed twice.
+        #
+        # This one is worse than the reconcile case it mirrors. _prot_missing
+        # gates PLACING protection a follower lacks, so a follower with no
+        # stop-loss could never get one while two masters were active — a live
+        # position left unprotected, not merely an unmade adjustment.
+        # {master_id: set}
+        self._prot_orphans_prev: dict = {}
         # Debounce for the 10s position reconciler's OPEN action, per
         # (follower_id, symbol): don't re-fire a recovery open within this window
         # (avoids spamming a margin-rejected open every cycle, and gives a fill
@@ -227,7 +237,7 @@ class CopyEngine:
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
         # so a partial order read can never cause a duplicate stop.
-        self._prot_missing_prev: set = set()
+        self._prot_missing_prev: dict = {}   # {master_id: set}
         # {account_id: (set_of_resting_order_ids, ts)} — see _order_is_live. Short
         # TTL: this only shortcuts the "yes, still live" answer, never "gone".
         self._open_orders_cache: dict = {}
@@ -2244,6 +2254,10 @@ class CopyEngine:
         We only touch symbols the master still holds (a flat master is handled by
         the exit-close path), so we never strip protection the master still wants."""
         owner_id = event.get("owner_id")
+        # Which master's bucket of two-pass state this pass owns — see
+        # _prot_orphans_prev. Falls back to the owner when an older event
+        # carries no master id, which is still better than one shared bucket.
+        _pkey = str(event.get("master_account_id") or owner_id or "")
         # Payload is now a list of dicts (symbol + trigger detail) so we can PLACE
         # missing protection, not just cancel orphans. Older queued events used
         # [symbol, type] pairs — accept both so a deploy mid-flight can't break.
@@ -2306,7 +2320,7 @@ class CopyEngine:
                     # transient mid-edit snapshot can't trigger a wrong cancel.
                     okey = (fol.get("id"), sym, stype)
                     current_orphans.add(okey)
-                    if okey not in self._prot_orphans_prev:
+                    if okey not in self._prot_orphans_prev.get(_pkey, set()):
                         logger.info(f"sync_protection: {stype} on {sym} for {fol.get('name')} looks orphaned — confirming next sweep before cancelling")
                         continue
                     try:
@@ -2344,7 +2358,7 @@ class CopyEngine:
                         continue  # already protected
                     mkey = (fol.get("id"), sym, stype)
                     current_missing.add(mkey)
-                    if mkey not in self._prot_missing_prev:
+                    if mkey not in self._prot_missing_prev.get(_pkey, set()):
                         logger.info(
                             f"sync_protection: {fol.get('name')} holds {sym} with no {stype} "
                             f"— confirming next sweep before placing"
@@ -2406,8 +2420,9 @@ class CopyEngine:
             except Exception as e:
                 logger.warning(f"sync_protection: error for {fol.get('name')}: {e}")
         # Remember this sweep's candidates so the next sweep can confirm them.
-        self._prot_orphans_prev = current_orphans
-        self._prot_missing_prev = current_missing
+        # This master's bucket only — never the whole map.
+        self._prot_orphans_prev[_pkey] = current_orphans
+        self._prot_missing_prev[_pkey] = current_missing
 
     async def _sync_followers_to_master_exit(self, event: dict) -> None:
         """Retired by strategy decision: we no longer force-close followers when a
