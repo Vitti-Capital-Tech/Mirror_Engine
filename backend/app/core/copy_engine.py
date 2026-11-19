@@ -151,7 +151,7 @@ class CopyEngine:
         # Short-lived cache of master position sizes {symbol: (size, ts)} so a
         # burst of protective cancels doesn't fire a get_positions REST call each.
         self._master_pos_cache: dict = {}
-        self._master_signed_cache: dict = {}  # {symbol: (signed_size, ts)}
+        self._master_signed_cache: dict = {}  # {(master_id, symbol): (signed, ts)}
         self._MASTER_POS_TTL = 3.0  # seconds
         # {symbol: ([(order_id, size)], ts)} — the master's resting reduce-only
         # limits per symbol. A laddered exit arrives as a burst (the three rungs on
@@ -249,7 +249,7 @@ class CopyEngine:
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
         self._last_master_balance = 0.0   # see _master_balance_or_last
-        self._master_exit_cache: dict = {}  # {symbol: (reason, ts)}
+        self._master_exit_cache: dict = {}  # {(master_id, symbol): (reason, ts)}
         self._MASTER_EXIT_TTL = 20.0  # seconds
 
     def _record_skipped_copy(self, trade_uuid, follower: dict, reason: str, requested=None) -> None:
@@ -881,6 +881,27 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Failed to close {name} position on {symbol}: {e}")
 
+    @staticmethod
+    def _mid(master_row: dict | None) -> str:
+        """Which master a cached answer belongs to.
+
+        These caches were keyed on the SYMBOL alone while one engine serves
+        every master, so two desks trading the same contract overwrote each
+        other's answers. Both held P-BTC-61600-191126 on 2026-11-19, and within
+        the TTL whichever asked second was handed the other's position size.
+
+        The 20s exit classification was the dangerous one: it decides whether a
+        follower's orphan is force-closed (the master closed by hand) or left to
+        its own stop (the master's SL/TP hit). Answered from the wrong master,
+        it closes a position that should have been left alone, or leaves one
+        that should have gone.
+
+        No evidence it has mis-fired yet — found by looking for the shape rather
+        than from a symptom. Falling back to "" on a missing row keeps the old
+        behaviour for that one call rather than raising on the order path.
+        """
+        return str((master_row or {}).get("id") or "")
+
     async def _classify_master_exit(self, master_row: dict, symbol: str) -> str:
         """How did the master most recently CLOSE its position on `symbol`?
 
@@ -904,7 +925,7 @@ class CopyEngine:
         every pass while waiting."""
         if not master_row:
             return "unknown"
-        cached = self._master_exit_cache.get(symbol)
+        cached = self._master_exit_cache.get((self._mid(master_row), symbol))
         if cached and (time.time() - cached[1]) < self._MASTER_EXIT_TTL:
             return cached[0]
         try:
@@ -938,7 +959,7 @@ class CopyEngine:
             result = "sl_tp" if o.get("stop_order_type") else "manual"
             break
         if result != "unknown":
-            self._master_exit_cache[symbol] = (result, time.time())
+            self._master_exit_cache[(self._mid(master_row), symbol)] = (result, time.time())
             logger.info(f"classify_master_exit: {symbol} -> {result}")
         return result
 
@@ -1025,12 +1046,12 @@ class CopyEngine:
         if not master_row:
             return None
         if not fresh:
-            cached = self._master_pos_cache.get(symbol)
+            cached = self._master_pos_cache.get((self._mid(master_row), symbol))
             if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
                 return cached[0]
         try:
             size = await self._position_size(self._get_master_client(master_row), symbol)
-            self._master_pos_cache[symbol] = (size, time.time())
+            self._master_pos_cache[(self._mid(master_row), symbol)] = (size, time.time())
             return size
         except Exception as e:
             logger.error(f"Master position size fetch failed for {symbol}: {e}")
@@ -1077,7 +1098,7 @@ class CopyEngine:
         """
         if not master_row or not symbol:
             return None
-        ck = (symbol, bool(reduce_only))
+        ck = (self._mid(master_row), symbol, bool(reduce_only))
         cached = self._master_exits_cache.get(ck)
         if not fresh and cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
             return cached[0]
@@ -1142,7 +1163,7 @@ class CopyEngine:
         client = self._get_master_client(master_row)
         if client is None:
             return None
-        ck = ("working", symbol)
+        ck = ("working", self._mid(master_row), symbol)
         cached = self._master_exits_cache.get(ck)
         if cached and (time.time() - cached[1]) < self._MASTER_EXITS_TTL:
             return cached[0]
@@ -1179,12 +1200,12 @@ class CopyEngine:
         if not master_row:
             return None
         if not fresh:
-            cached = self._master_signed_cache.get(symbol)
+            cached = self._master_signed_cache.get((self._mid(master_row), symbol))
             if cached and (time.time() - cached[1]) < self._MASTER_POS_TTL:
                 return cached[0]
         try:
             signed = await self._position_size_signed(self._get_master_client(master_row), symbol)
-            self._master_signed_cache[symbol] = (signed, time.time())
+            self._master_signed_cache[(self._mid(master_row), symbol)] = (signed, time.time())
             return signed
         except Exception as e:
             logger.error(f"Master signed position fetch failed for {symbol}: {e}")
@@ -1733,15 +1754,21 @@ class CopyEngine:
         # observed decrease marks the symbol as REDUCING for a cooldown, during
         # which top-ups are suppressed. Trims are unaffected: reducing on a
         # snapshot is safe, adding is not.
+        # Scoped to THIS master, in memory and in Redis. Keyed on the symbol
+        # alone, two masters trading the same contract shared one high-water
+        # mark — and the peak is what suppresses top-ups while a master sits
+        # below its high.
         for _sym, _p in master_map.items():
-            self._master_size_peak[_sym] = await ledger.bump_peak(
-                self.redis, owner_id, _sym, _p[0]
+            self._master_size_peak[(_mkey, _sym)] = await ledger.bump_peak(
+                self.redis, _mkey, _sym, _p[0]
             )
         # A leg the master has fully exited starts from a clean peak next time.
-        for _sym in list(self._master_size_peak):
-            if _sym not in master_map:
-                self._master_size_peak.pop(_sym, None)
-                await ledger.clear_peak(self.redis, owner_id, _sym)
+        # Only this master's entries — another master's legs are not ours to
+        # forget.
+        for _k in [k for k in self._master_size_peak if k[0] == _mkey]:
+            if _k[1] not in master_map:
+                self._master_size_peak.pop(_k, None)
+                await ledger.clear_peak(self.redis, _mkey, _k[1])
 
         current_open: set = set()   # (follower_id, sym) missing THIS pass
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
@@ -1883,7 +1910,7 @@ class CopyEngine:
                             # long as the master stays below its high-water mark. The
                             # time window alone let a top-up through 45s after it
                             # expired, mid-unwind (2026-08-03, P-BTC-62600-030826).
-                            peak = self._master_size_peak.get(sym, 0.0)
+                            peak = self._master_size_peak.get((_mkey, sym), 0.0)
                             if peak and abs(msz) < peak:
                                 logger.info(
                                     f"reconcile: {fol.get('name')} under-exposed on {sym} "

@@ -335,15 +335,28 @@ async def clear_hands_off(redis, owner_id, follower_id, symbol) -> None:
 PEAK_TTL = 7 * 24 * 3600
 
 
-def _peak_key(owner_id, symbol) -> str:
-    return f"mpeak:{owner_id or '_'}:{symbol}"
+def _peak_key(scope_id, symbol) -> str:
+    """scope_id is the MASTER's account id, not the owner's.
+
+    It was the owner's, which is wrong twice over now that one login may run
+    several masters: two of that owner's masters trading the same contract
+    shared a single high-water mark. The peak suppresses top-ups while a master
+    sits below its high, so a neighbouring master's larger position could
+    suppress top-ups this one genuinely needed — or its smaller one could let a
+    top-up through mid-unwind, which is the 2026-08-03 incident the caller's
+    comment describes.
+
+    Old mpeak:<owner>:<symbol> keys simply expire; a peak is a running maximum
+    and starting fresh costs nothing.
+    """
+    return f"mpeak:{scope_id or '_'}:{symbol}"
 
 
-async def bump_peak(redis, owner_id, symbol, size) -> float:
+async def bump_peak(redis, scope_id, symbol, size) -> float:
     """Record the master's current size and return the running peak."""
     if not redis or not symbol:
         return float(size or 0)
-    key = _peak_key(owner_id, symbol)
+    key = _peak_key(scope_id, symbol)
     cur = abs(float(size or 0))
     try:
         prev = await redis.get(key)
@@ -369,19 +382,19 @@ async def get_peak(redis, owner_id, symbol) -> float:
     if not redis or not symbol:
         return 0.0
     try:
-        v = await redis.get(_peak_key(owner_id, symbol))
+        v = await redis.get(_peak_key(scope_id, symbol))
         return float(v) if v else 0.0
     except Exception as e:
         logger.debug(f"ledger: get_peak failed for {symbol}: {e}")
         return 0.0
 
 
-async def clear_peak(redis, owner_id, symbol) -> None:
+async def clear_peak(redis, scope_id, symbol) -> None:
     """Master closed the leg — the next position starts from a clean peak."""
     if not redis or not symbol:
         return
     try:
-        await redis.delete(_peak_key(owner_id, symbol))
+        await redis.delete(_peak_key(scope_id, symbol))
     except Exception:
         pass
 
