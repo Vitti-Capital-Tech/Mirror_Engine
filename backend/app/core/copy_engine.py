@@ -94,6 +94,28 @@ ORDER_CONFIRM_SETTLE_SEC = float(os.getenv("ORDER_CONFIRM_SETTLE_SEC", "3"))
 # the hours it took a person to notice on 2026-11-19.
 STUCK_AFTER_SEC = float(os.getenv("STUCK_AFTER_SEC", "60"))
 
+# When to SAY a discrepancy exists, as opposed to when to give up on it.
+#
+# Desk call 2026-11-20: if master and follower do not match, say so, and say so
+# again when it is fixed. The engine used to speak only after STUCK_AFTER_SEC,
+# so anything it corrected itself within half a minute was never mentioned —
+# which left a client watching legs sit off-ratio with no way to tell a
+# deliberate hold from a broken copier.
+#
+# NOT on the first sighting. A book read mid-flight looks wrong for one pass and
+# then is not, and a false alarm teaches people to ignore the channel. One pass
+# interval (10s) later is the same moment the engine itself becomes willing to
+# act, so it is as early as the engine can honestly be sure.
+MISMATCH_ALERT_AFTER_SEC = float(os.getenv("MISMATCH_ALERT_AFTER_SEC", "8"))
+
+# Internal reconcile kind -> the words a human reads.
+_MISMATCH_KIND = {
+    "open": "missing",    # follower has no leg at all
+    "close": "extra",     # follower holds a leg the master does not
+    "trim": "size",       # right side, too much
+    "topup": "size",      # right side, too little
+}
+
 
 # Deadband before the reconciler will resize a follower that is on the correct
 # side. The target is derived from a LIVE balance ratio (auto_ratio divides the
@@ -243,6 +265,11 @@ class CopyEngine:
         # instead of being re-detected in silence every ten seconds.
         # {(master_id, kind, follower_id, symbol): first_seen_ts}
         self._recon_stuck_since: dict = {}
+        # {(mkey, kind, follower_id, sym): account name} for the legs we have
+        # ALERTED on. Kept so that when the discrepancy settles we can clear its
+        # throttle — without it, a leg that goes wrong, is fixed, and goes wrong
+        # again an hour later stays silent for a week.
+        self._recon_alert_names: dict = {}
         self._master_size_peak: dict = {}
         # (follower_id, symbol, stop_order_type) seen as MISSING protection in the
         # previous sweep. Protection is only ADDED after two consecutive sightings,
@@ -1784,6 +1811,13 @@ class CopyEngine:
         current_close: set = set()  # (follower_id, sym) orphan/opposite THIS pass
         current_trim: set = set()   # (follower_id, sym, excess) over-exposed THIS pass
         current_topup: dict = {}    # {(follower_id, sym): short_by} under-exposed THIS pass
+        # (follower_id, sym) over-exposed but deliberately NOT trimmed, because
+        # the master is unwinding this leg himself. A desk rule, not a fault —
+        # but it was completely silent, so the client saw a follower sitting
+        # over its target with no explanation anywhere and reasonably assumed
+        # the ratio had broken. 2026-11-20: shorts "not maintaining the ratio"
+        # were four legs held under exactly this rule.
+        current_hold: set = set()
         # What to SAY about each candidate if it turns out to be stuck.
         # {(kind, follower_id, sym): (name, held, target, master_size)}
         _stuck_detail: dict = {}
@@ -2083,6 +2117,14 @@ class CopyEngine:
                                     f"(excess {excess}) — but the master is still WORKING an order "
                                     f"here; his fill or cancel settles it, not a trim"
                                 )
+                                # Deliberate, and now VISIBLE. The decision not to
+                                # trim stands; what changes is that a hold lasting
+                                # longer than a normal correction says so, through
+                                # the same threshold and throttle every other
+                                # unsettled discrepancy uses.
+                                current_hold.add((fid, sym))
+                                _stuck_detail[("hold", fid, sym)] = (
+                                    fol.get("name"), held, int(target), msz)
                                 continue
                             tkey = (fid, sym, excess)
                             current_trim.add(tkey)
@@ -2369,17 +2411,42 @@ class CopyEngine:
         _live = set()
         for _kind, _cands in (("open", current_open), ("close", current_close),
                               ("trim", {(k[0], k[1]) for k in current_trim}),
-                              ("topup", set(current_topup))):
+                              ("topup", set(current_topup)),
+                              ("hold", current_hold)):
             for _fid, _sym in _cands:
                 _sk = (_mkey, _kind, _fid, _sym)
                 _live.add(_sk)
                 _since = self._recon_stuck_since.setdefault(_sk, _now)
                 _age = _now - _since
-                if _age < STUCK_AFTER_SEC:
-                    continue
                 _name, _held, _target, _msz = _stuck_detail.get(
                     (_kind, _fid, _sym), (None, None, None, None))
                 if not _name:
+                    continue
+                if _age < MISMATCH_ALERT_AFTER_SEC:
+                    continue        # first sighting — may be a book mid-flight
+                self._recon_alert_names[_sk] = _name
+                try:
+                    # STAGE ONE, at the second sighting: it does not match, and
+                    # here is what does not match. A hold gets its own wording —
+                    # it is a deliberate decision, not a fault, and "mismatch,
+                    # correcting it now" would be a lie about a leg we are
+                    # choosing to leave alone.
+                    if _kind == "hold":
+                        asyncio.create_task(tg.notify_holding(
+                            _name, _sym, _held, _target,
+                            master=_msz, seconds=_age,
+                        ))
+                    else:
+                        asyncio.create_task(tg.notify_mismatch(
+                            _name, _sym, _MISMATCH_KIND.get(_kind, _kind),
+                            follower=_held, target=_target, master=_msz,
+                        ))
+                except Exception as _e:
+                    logger.warning(f"could not raise a mismatch alert for {_name} {_sym}: {_e}")
+                # STAGE TWO, much later: it is STILL not settled. The correction
+                # alert that normally follows stage one never arrived, so this is
+                # the one that means a human has to look.
+                if _kind == "hold" or _age < STUCK_AFTER_SEC:
                     continue
                 try:
                     asyncio.create_task(tg.notify_stuck(
@@ -2392,6 +2459,12 @@ class CopyEngine:
         # timed from scratch rather than inheriting an old clock.
         for _sk in [k for k in self._recon_stuck_since if k[0] == _mkey and k not in _live]:
             self._recon_stuck_since.pop(_sk, None)
+            # Episode over — release the throttle so the NEXT occurrence of the
+            # same discrepancy speaks instead of being swallowed for a week.
+            _nm = self._recon_alert_names.pop(_sk, None)
+            if _nm:
+                asyncio.create_task(tg.notify_mismatch_cleared(
+                    _nm, _sk[3], _MISMATCH_KIND.get(_sk[1], _sk[1])))
 
         # This master's bucket only — never the whole map.
         self._recon_open_prev[_mkey] = current_open
@@ -2480,11 +2553,32 @@ class CopyEngine:
                     if okey not in self._prot_orphans_prev.get(_pkey, set()):
                         logger.info(f"sync_protection: {stype} on {sym} for {fol.get('name')} looks orphaned — confirming next sweep before cancelling")
                         continue
+                    # CONFIRMED on a second sweep: the follower is carrying a
+                    # stop the master no longer has. Both halves were silent —
+                    # the mismatch AND the cancel that resolved it — so a stop
+                    # could appear and disappear on a client's book with nothing
+                    # said anywhere. (desk call 2026-11-20)
+                    asyncio.create_task(tg.notify_mismatch(
+                        fol.get("name"), sym, "stop",
+                        detail=f"the follower has a {stype} the master has dropped",
+                    ))
                     try:
                         await client.cancel_order(str(o.get("id")), product_id=o.get("product_id"))
                         logger.info(f"sync_protection: cancelled orphan {stype} on {sym} for {fol.get('name')} (master removed it)")
+                        asyncio.create_task(tg.notify_correction(
+                            fol.get("name"), sym, "CANCELLED", None,
+                            why=f"orphaned {stype} — the master removed his, so the "
+                                f"follower's had nothing left to mirror"))
+                        asyncio.create_task(tg.notify_mismatch_cleared(
+                            fol.get("name"), sym, "stop"))
                     except Exception as e:
                         logger.warning(f"sync_protection: failed to cancel {stype} on {sym} for {fol.get('name')}: {e}")
+                        asyncio.create_task(tg.notify_fail(
+                            fol.get("name"), sym, "cancel", 1,
+                            f"could not cancel the orphaned {stype} — {_short_reason(e, '')}",
+                            key=f"orphcancel:{fol.get('id')}:{sym}:{stype}",
+                            window=tg.ONCE_WINDOW,
+                        ))
 
                 # ---- ADD protection the follower is MISSING. ----
                 # Until now this sweep could only ever CANCEL: nothing anywhere in
@@ -2521,6 +2615,15 @@ class CopyEngine:
                             f"— confirming next sweep before placing"
                         )
                         continue
+                    # CONFIRMED: the master protects this leg and the follower
+                    # does not. Placing it already alerted; the GAP never did,
+                    # so an unprotected follower was only ever visible once it
+                    # stopped being unprotected.
+                    asyncio.create_task(tg.notify_mismatch(
+                        fol.get("name"), sym, "protection",
+                        detail=f"the master has a {stype} on this leg and the "
+                               f"follower has none",
+                    ))
                     stop_price = det.get("stop_price")
                     product_id = det.get("product_id")
                     if stop_price is None or not product_id:
@@ -2564,6 +2667,8 @@ class CopyEngine:
                         # Protection is back, so a future loss of it alerts again.
                         asyncio.create_task(tg.clear_alert(
                             f"prot:{fol.get('id')}:{sym}:{stype}"))
+                        asyncio.create_task(tg.notify_mismatch_cleared(
+                            fol.get("name"), sym, "protection"))
                     except Exception as e:
                         body = getattr(getattr(e, "response", None), "text", "")
                         logger.error(
@@ -3494,6 +3599,24 @@ class CopyEngine:
                     _hist_leg(follower, status="pending", requested=qty,
                               follower_order_id=follower_order_id)
                     logger.info(f"Mirrored order {master_order_id} -> {follower['name']} order {follower_order_id} (qty {qty})")
+                    # A place that came from the 30s sweep means this follower
+                    # was MISSING an order the master is resting — the live
+                    # mirror never landed. The gap-fill worked, but it only ever
+                    # appeared as "re-mirrored N resting limit order(s)" in a
+                    # log. Say both halves: what was missing, and that it is
+                    # now there. (desk call 2026-11-20)
+                    if (event or {}).get("source") == "reconcile":
+                        asyncio.create_task(tg.notify_mismatch(
+                            follower.get("name"), symbol, "order",
+                            follower=0, master=master_qty,
+                            detail=(f"the master is resting a {side} here and the "
+                                    f"follower had nothing — the live copy never "
+                                    f"reached the exchange"),
+                        ))
+                        asyncio.create_task(tg.notify_correction(
+                            follower.get("name"), symbol, "PLACED", int(qty),
+                            why="a resting order the follower was missing — "
+                                "recovered by the 30s order sweep"))
 
                     # Plain LIMIT order (not a stop/bracket): if it hasn't filled
                     # after the wait+retry window, escalate to market so the follower

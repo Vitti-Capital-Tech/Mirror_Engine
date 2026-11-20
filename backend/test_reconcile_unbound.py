@@ -54,23 +54,33 @@ FAILURES = []
 # Adding a name here is a deliberate act -- do it only after convincing
 # yourself the path cannot be reached, and say why in the commit.
 BASELINE = {
+    # These sit inside the one big reduce-only branch, bound at its top and
+    # read further down it. The compiler flags them because the branch is
+    # conditional across loop iterations, not because a path reaches them
+    # unbound.
     "_mirror_place": {
         "_prev_v", "filled_exit", "follower_held", "follower_order_id",
         "master_now", "resp_obj", "rungs", "signed", "target", "why_zero",
     },
-    # All of these sit inside the one big reduce-only branch, bound at its top
-    # and read further down it. The compiler flags them because the branch is
-    # conditional across loop iterations, not because a path reaches them
-    # unbound.
     "_reconcile_positions": {
-        "_age", "_e", "_fid", "_held", "_kind", "_live", "_msz", "_name",
-        "_now", "_target",
+        # All of these live in the end-of-pass escalation sweep: nested `for`
+        # loops that bind each name and read it inside the same loop. The
+        # compiler flags them only because a loop may not run at all.
+        "_age", "_e", "_held", "_kind", "_live", "_msz", "_name", "_nm",
+        "_now", "_sk", "_target",
         # `except ... as _leg_err` -- Python deletes the name at the end of the
         # handler, so the compiler cannot prove it bound. Only ever read inside
         # the handler that binds it.
         "_leg_err",
+        # `why` is assigned and then read three lines later in the same block
+        # (the close branch's log line and its correction alert). It became
+        # unprovable only when the per-leg try/except was added around it,
+        # which gives the compiler an exception edge it cannot reason past.
+        "why",
     },
 }
+
+SAFE = set(dir(__builtins__)) | {"self"}
 
 
 def check(name, got, want):

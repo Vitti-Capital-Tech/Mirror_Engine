@@ -45,6 +45,9 @@ STUCK_ALERT_WINDOW = 1800.0
 # is a week: effectively "once" for any real episode, while guaranteeing a
 # genuinely stuck problem cannot stay quiet forever.
 ONCE_WINDOW = 7 * 24 * 3600.0
+# Written as a name because this module is edited by scripts often enough that
+# an escaped newline inside a generated literal has broken it before.
+NEWLINE = chr(10)
 
 # Alert types NOT forwarded to Telegram, because a better message already covers
 # them. They still land in the database and the in-app Alert Feed.
@@ -424,7 +427,12 @@ async def notify_correction(
     lines = [
         f"🔧 <b>Reconciler corrected</b> · {account}",
         f"<code>{symbol}</code>",
-        f"<b>{action}</b> {_num(lots)} lot(s)" + (f" — {detail}" if detail else ""),
+        (f"<b>{action}</b> {_num(lots)} lot(s)" if lots is not None
+         else f"<b>{action}</b>")
+        # A cancelled stop or a restored SL/TP has no lot count. Printing
+        # "1 lot(s)" for a stop order, or a bare "— lot(s)" for a missing
+        # one, makes the alert read like a position change it is not.
+        + (f" — {detail}" if detail else ""),
     ]
     if why:
         lines.append(f"<i>{why}</i>")
@@ -483,6 +491,119 @@ async def notify_stuck(account: str, symbol: str, kind: str, held, target,
     if why:
         lines.append(f"↳ {why}")
     await send_message("\n".join(lines), account=account)
+
+
+async def notify_mismatch(account: str, symbol: str, kind: str,
+                          follower=None, master=None, target=None,
+                          detail: str | None = None, acting: bool = True) -> None:
+    """Something does not match between master and follower, said at the moment
+    the engine is sure of it.
+
+    WHY THIS EXISTS SEPARATELY FROM EVERY OTHER ALERT. The engine's rule was
+    "only speak when a human must act", so anything it fixed itself stayed
+    silent and anything it had merely SEEN waited 60s. That is defensible for
+    noise and indefensible for trust: on 2026-11-20 a client watched four legs
+    sit off-ratio with nothing said about two of them, and had no way to tell a
+    deliberate hold from a broken copier. Desk call: if it does not match, say
+    so, and say so again when it is fixed.
+
+    TIMING. Not on the first sighting. A book read mid-flight -- an order half
+    filled, a position still settling -- looks wrong for one pass and then is
+    not, and an alert on that is a false alarm that teaches people to ignore
+    the channel. Fired on the SECOND consecutive sighting, which is the same
+    moment the engine itself becomes willing to act on it: ~10-20s, not 60.
+
+    ONE PER EPISODE. The sweep re-detects every 10s. The throttle is cleared
+    when the discrepancy settles, so the next occurrence speaks again.
+    """
+    if not telegram_enabled():
+        return
+    if not await _should_send(f"mismatch:{account}:{symbol}:{kind}", ONCE_WINDOW):
+        return
+
+    _k = {
+        "size": "POSITION SIZE",
+        "missing": "LEG MISSING ON THE FOLLOWER",
+        "extra": "LEG THE MASTER DOES NOT HOLD",
+        "stop": "STOP ORDER THE MASTER NO LONGER HAS",
+        "protection": "TP/SL MISSING ON THE FOLLOWER",
+        "order": "RESTING ORDER MISSING ON THE FOLLOWER",
+    }.get(kind, kind.upper())
+
+    lines = [
+        f"⚠️ <b>Mismatch</b> · {account}",
+        f"<code>{symbol}</code>",
+        f"<b>{_k}</b>",
+    ]
+    if follower is not None or target is not None:
+        _f = f"follower has {_num(follower)}" if follower is not None else ""
+        _t = f"should have {_num(target)}" if target is not None else ""
+        _m = f"master has {_num(master)}" if master is not None else ""
+        lines.append(" · ".join(x for x in (_f, _t, _m) if x))
+    elif master is not None:
+        lines.append(f"master has {_num(master)}")
+    if detail:
+        lines.append(f"<i>{detail}</i>")
+    # NO PROMISE ABOUT WHAT HAPPENS NEXT. This used to say "correcting it now",
+    # which the engine cannot know: on 2026-11-20 the correction itself crashed
+    # on four legs and nothing was corrected at all. An alert that guarantees a
+    # fix which does not arrive is worse than one that guarantees nothing --
+    # the reader stops checking. State the fact; the correction alert, or the
+    # 60s "still not corrected", says what actually happened.
+    lines.append("<i>not corrected yet</i>" if acting
+                 else "<i>not being corrected automatically — see above</i>")
+    await send_message(NEWLINE.join(lines), account=account)
+
+
+async def notify_mismatch_cleared(account: str, symbol: str, kind: str) -> None:
+    """Let the next occurrence of the same discrepancy speak again.
+
+    Without this a leg that goes wrong, is fixed, and goes wrong again an hour
+    later would be silently swallowed by the throttle for a week.
+    """
+    await clear_alert(f"mismatch:{account}:{symbol}:{kind}")
+
+
+async def notify_holding(account: str, symbol: str, held, target,
+                         master=None, seconds: float = 0) -> None:
+    """A leg the reconciler is deliberately leaving alone.
+
+    When the master is working an order that reduces his own position, the
+    reconciler does NOT trim the follower back to target. His order is filling
+    in pieces; his size is dropping and the follower's has not moved yet, so
+    the gap is a copy mid-flight. Trimming into it would fill the follower at a
+    different price from the master's, twice over, for a gap that settles
+    itself in one step when his order terminates. Held with no size cap and no
+    time limit — desk call, Prathav 2026-09-25.
+
+    That rule was right and completely invisible. On 2026-11-20 four legs sat
+    over target under it; the client saw the two WITHOUT a resting master order
+    get trimmed to the ratio and the two WITH one not, and concluded the ratio
+    had stopped working on shorts. It had not. Nothing anywhere said the engine
+    was waiting on purpose.
+
+    So: same threshold as every other unsettled discrepancy, opposite framing.
+    This is not a failure and must not read like one — "Not corrected" on a leg
+    we chose not to correct sends someone hunting a bug that does not exist.
+    """
+    if not telegram_enabled():
+        return
+    # One per (account, symbol) per window. The hold is re-detected every 10s
+    # and can last minutes — on 2026-09-21 roughly eleven of them.
+    if not await _should_send(f"holding:{account}:{symbol}", STUCK_ALERT_WINDOW):
+        return
+
+    lines = [
+        f"⏸ <b>Holding on purpose</b> · {account}",
+        f"<code>{symbol}</code>",
+        f"Holds {_num(held)}, target is {_num(target)}"
+        + (f" (master {_num(master)})" if master is not None else ""),
+        "<i>the master is closing this leg himself. Trimming now would fill at a "
+        "different price than his — so we wait for his order to fill or cancel, "
+        "and it settles in one step.</i>",
+        f"<i>waiting {int(seconds)}s — no action needed</i>",
+    ]
+    await send_message(NEWLINE.join(lines), account=account)
 
 
 async def send_alert(alert: dict) -> None:

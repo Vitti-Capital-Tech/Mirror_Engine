@@ -257,7 +257,11 @@ class TradeListener:
                 continue
             if (o.get("state") or "").lower() != "open":
                 continue
-            await self._push_order_event(o, "place")
+            # Marked so the copy engine can tell a gap-fill from a live mirror.
+            # A place that comes from THIS sweep means the follower did not have
+            # the order the master is resting — which is a mismatch the desk
+            # wants told, and which was only ever a log line.
+            await self._push_order_event(o, "place", source="reconcile")
             pushed += 1
         if pushed:
             logger.info("Reconcile: re-mirrored %d resting limit order(s) for master %s", pushed, self.master_account.get("name"))
@@ -427,10 +431,16 @@ class TradeListener:
         except Exception as e:
             logger.warning("Could not mark master order %s as filled: %s", order_id, e)
 
-    async def _push_order_event(self, order: dict, action: str) -> None:
+    async def _push_order_event(self, order: dict, action: str,
+                                source: str = "live") -> None:
         """Push a resting-order place/cancel event to Redis for the copy engine."""
         payload = {
             "action": action,  # 'place' or 'cancel'
+            # 'live' (straight off the master's websocket) or 'reconcile' (the
+            # 30s sweep filling a gap). Only the engine's own idempotency guard
+            # knows whether a reconcile push actually PLACED anything, so the
+            # distinction has to travel with the event.
+            "source": source,
             "master_order_id": str(order.get("id")),
             "symbol": order.get("product_symbol"),
             "product_id": order.get("product_id"),
