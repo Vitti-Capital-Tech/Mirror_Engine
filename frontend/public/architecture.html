@@ -392,16 +392,6 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
       <span class="t">Escalation is a flat timer</span>
       <span class="d">A limit still filling at 5s is killed anyway, and the reconciler would market the remainder 15s later regardless. Both should gate on "our order is live and still filling", with a ceiling around 30s.</span>
     </div>
-    <div>
-      <span class="tag o">Open · unaudited</span>
-      <span class="t">26 variables that might not be bound</span>
-      <span class="d">Across the two hottest functions. Two of them took the reconciler down on 20 Nov. The rest have been read and judged safe, but not proven — and reading is exactly what missed the first two.</span>
-    </div>
-    <div>
-      <span class="tag f">Fixed · 20 Nov</span>
-      <span class="t">An alert line that crashed the reconciler</span>
-      <span class="d">Two variables read before they were assigned took down the whole correction pass; one of them had missing-leg recovery switched off in production for two days. Each leg now has its own guard, and a crashed correction alerts.</span>
-    </div>
   </div>
 
   <div class="note crit">
