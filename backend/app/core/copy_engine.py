@@ -1836,450 +1836,518 @@ class CopyEngine:
                 # 1) CLOSE / TRIM — follower holds a leg the master is flat on, is
                 #    on the OPPOSITE side, or is on the right side at the wrong SIZE.
                 for sym, fsz in list(fpos.items()):
-                    msz = master_map.get(sym, (0, None, None))[0]
-                    same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
-                    if same_side:
-                        # Right side — but is it the right SIZE? An exit the follower
-                        # didn't complete leaves it over-exposed on the CORRECT side,
-                        # which a side-only comparison cannot see. On
-                        # C-BTC-67200-300726 (2026-07-29) the master's exit limit
-                        # half-filled while the follower's mirrored copy filled
-                        # nothing, so the follower held 30 against a target of 15 for
-                        # hours and every check said "both short, fine".
-                        #
-                        # The target uses round_up=True — the same rounding the OPEN
-                        # path used to size the position — so ordinary ceil/floor
-                        # rounding can never masquerade as over-exposure and trigger
-                        # a spurious trim. Only a genuinely missed reduction shows up.
-                        # A plain resting order on this symbol USED to skip the trim
-                        # outright ("a close is in flight, don't race it"). That was
-                        # the flaw that would have missed 67200 entirely: the
-                        # follower's mirrored exit sat there unfilled for 2.5h, so the
-                        # guard suppressed the fix for the whole incident. It can't
-                        # tell "in flight" from "stuck".
-                        #
-                        # Split the two cases by what the order would DO (derived from
-                        # the side, not the reduce_only flag, which the exchange
-                        # doesn't always set):
-                        #   • anything that would ADD to the position -> genuinely
-                        #     unsettled (the follower may be building) -> skip.
-                        #   • only reducing orders -> a stuck close. Cancel them, then
-                        #     trim. Cancelling FIRST matters: leaving a reduce-only
-                        #     order resting while we market the excess would double-
-                        #     close the follower if it later filled.
-                        stuck_closes = []
-                        adding = False
-                        for o in resting_plain.get(sym, []):
-                            oside = (o.get("side") or "").lower()
-                            reduces = (oside == "buy" and fsz < 0) or (oside == "sell" and fsz > 0)
-                            if reduces:
-                                stuck_closes.append(o)
-                            else:
-                                adding = True
-                        if adding:
-                            continue  # position still being built — size not settled
-                        held = int(abs(fsz))
-                        _m = master_map.get(sym, (0, None, None))
-                        mark, mentry = _m[1], _m[2]
-                        target = self.risk_engine.calculate_follower_quantity(
-                            abs(msz), float(mark) if mark else 0.0, fol, round_up=True
-                        )
-                        # A zero target while the master still HOLDS means the ratio
-                        # could not be computed (balance read as 0) — NOT that the
-                        # follower should be flat. Trimming on it would close the
-                        # entire position. Never act on an unavailable ratio.
-                        if int(target) < 1:
-                            logger.warning(
-                                f"reconcile: sizing unavailable for {fol.get('name')} on {sym} "
-                                f"(master {msz:+.0f}, holds {held}) — leaving it alone this pass"
-                            )
-                            continue
-                        excess = held - int(target)
-                        # Deadband: the target moves with a live balance ratio, so a
-                        # 1-lot difference on a 30-lot leg is noise, not a miss.
-                        # Acting on it churns (trim 1, top-up 1, repeat) — see
-                        # RECON_SIZE_TOLERANCE_PCT.
-                        if abs(excess) < _size_deadband(target):
-                            continue
-                        # Don't act while the master is still trading this symbol —
-                        # its size is moving and any diff we see is transient.
-                        if master_fresh_ts is None:
-                            master_fresh_ts = await self._master_recent_fill_ts(master_row)
-                        last_fill = master_fresh_ts.get(sym)
-                        if last_fill is not None and (now - last_fill) < TRIM_SETTLE_SEC:
-                            continue
-
-                        # ---- UNDER-exposed: the follower holds LESS than its share.
-                        # Nothing used to handle this at all — the open path only fires
-                        # when the follower is completely FLAT, so a partially-filled or
-                        # partially-missed entry stayed short of target indefinitely
-                        # (2026-07-30 audit: 4 symbols, all under). Top up the shortfall,
-                        # subject to the same price guard as a stale recovery since this
-                        # is ADDING exposure at today's price.
-                        if excess <= -1:
-                            short_by = -excess
-                            # NEVER add while the master is unwinding this symbol.
-                            # Peak check first: it has no expiry, so it holds for as
-                            # long as the master stays below its high-water mark. The
-                            # time window alone let a top-up through 45s after it
-                            # expired, mid-unwind (2026-08-03, P-BTC-62600-030826).
-                            peak = self._master_size_peak.get((_mkey, sym), 0.0)
-                            if peak and abs(msz) < peak:
-                                logger.info(
-                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
-                                    f"({held} vs {int(target)}) but master is BELOW its peak "
-                                    f"({abs(msz):.0f} of {peak:.0f}) — net-reduced on this leg, "
-                                    f"not adding. Live copy still mirrors any real re-entry."
-                                )
-                                continue
-                            # RECENCY, not price. We copy recent entries and sit out
-                            # stale ones; a late entry at a moved price is worse than
-                            # not having the trade (the same rule FRESH_ENTRY_SEC
-                            # already states for the live copy path). This replaced a
-                            # price-drift test that decided it on abs(mark - entry),
-                            # which refused a move in our FAVOUR exactly as hard as
-                            # one against us: 2026-09-01 20:24 on P-BTC-75200-020926
-                            # the master was SHORT at 18.0162, the mark ran to 22.8,
-                            # and five passes refused at 23.6-27.8% — the follower
-                            # would have opened that short ~25% BETTER than the master
-                            # got, and instead sat 19 lots short of target 23 for
-                            # 2m21s. (desk call, Prathav 2026-09-02: drop drift, copy
-                            # recent trades only, no stale entries.)
+                    # PER-SYMBOL ISOLATION. Every correction for this
+                    # follower used to sit inside ONE try/except, so the
+                    # first symbol that raised cancelled the rest -- and
+                    # the OPEN pass below it as well. On 2026-11-19 an
+                    # UnboundLocalError on one leg abandoned four
+                    # unmatched, unprotected positions for twelve
+                    # consecutive passes. One bad leg now costs that leg.
+                    try:
+                        msz = master_map.get(sym, (0, None, None))[0]
+                        same_side = (fsz > 0 and msz > 0) or (fsz < 0 and msz < 0)
+                        if same_side:
+                            # Right side — but is it the right SIZE? An exit the follower
+                            # didn't complete leaves it over-exposed on the CORRECT side,
+                            # which a side-only comparison cannot see. On
+                            # C-BTC-67200-300726 (2026-07-29) the master's exit limit
+                            # half-filled while the follower's mirrored copy filled
+                            # nothing, so the follower held 30 against a target of 15 for
+                            # hours and every check said "both short, fine".
                             #
-                            # Still alerts when it declines, so an abandoned leg is
-                            # visible rather than silent — the failure mode of the
-                            # age-only gate this restores (2026-07-30: 5 missing legs,
-                            # the oldest 3.8h, skipped every 15s forever).
-                            fresh = (last_fill is not None
-                                     and (now - last_fill) <= FRESH_ENTRY_SEC)
-                            if not fresh:
-                                age_txt = (f"{now - last_fill:.0f}s ago" if last_fill
-                                           else "no recent fill")
-                                logger.info(
-                                    f"reconcile: {fol.get('name')} under-exposed on {sym} "
-                                    f"({held} vs target {int(target)}) but the master last "
-                                    f"filled it {age_txt} — stale, NOT topping up"
-                                )
-                                asyncio.create_task(tg.notify_fail(
-                                    fol.get("name"), sym, "topup", short_by,
-                                    f"master's entry is stale ({age_txt}) — left short",
-                                    key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
-                                ))
-                                self._recon_open_ts[(fid, sym)] = now
-                                continue
-                            # TWO independent observations before adding exposure —
-                            # kept deliberately: a just-filled mirror whose position
-                            # has not shown in get_positions yet looks exactly like a
-                            # shortfall, and acting on one pass is how this engine
-                            # produced duplicate positions.
+                            # The target uses round_up=True — the same rounding the OPEN
+                            # path used to size the position — so ordinary ceil/floor
+                            # rounding can never masquerade as over-exposure and trigger
+                            # a spurious trim. Only a genuinely missed reduction shows up.
+                            # A plain resting order on this symbol USED to skip the trim
+                            # outright ("a close is in flight, don't race it"). That was
+                            # the flaw that would have missed 67200 entirely: the
+                            # follower's mirrored exit sat there unfilled for 2.5h, so the
+                            # guard suppressed the fix for the whole incident. It can't
+                            # tell "in flight" from "stuck".
                             #
-                            # But the key used to include short_by, so the shortfall
-                            # had to be byte-identical on both passes. The target
-                            # comes from a LIVE balance ratio that wobbles a lot or
-                            # two between passes (2026-08-03: the same unchanged
-                            # positions read "expected 22" then "expected 30"), so a
-                            # real miss could restart confirmation indefinitely — and
-                            # the faster the loop, the more often that happens. Keyed
-                            # on (follower, symbol) it latches reliably, and we act on
-                            # the SMALLER of the two observed shortfalls so a wobble
-                            # can only ever under-open, never overshoot.
-                            ukey = (fid, sym)
-                            current_topup[ukey] = short_by
-                            _stuck_detail[("topup", fid, sym)] = (
-                                fol.get("name"), held, int(target), msz)
-                            prev_short = self._recon_topup_prev.get(_mkey, {}).get(ukey)
-                            if prev_short is None:
-                                logger.info(
-                                    f"reconcile: {fol.get('name')} under-exposed on {sym} — holds "
-                                    f"{held}, target {int(target)} (short {short_by}) — confirming "
-                                    f"next pass before topping up"
+                            # Split the two cases by what the order would DO (derived from
+                            # the side, not the reduce_only flag, which the exchange
+                            # doesn't always set):
+                            #   • anything that would ADD to the position -> genuinely
+                            #     unsettled (the follower may be building) -> skip.
+                            #   • only reducing orders -> a stuck close. Cancel them, then
+                            #     trim. Cancelling FIRST matters: leaving a reduce-only
+                            #     order resting while we market the excess would double-
+                            #     close the follower if it later filled.
+                            stuck_closes = []
+                            adding = False
+                            for o in resting_plain.get(sym, []):
+                                oside = (o.get("side") or "").lower()
+                                reduces = (oside == "buy" and fsz < 0) or (oside == "sell" and fsz > 0)
+                                if reduces:
+                                    stuck_closes.append(o)
+                                else:
+                                    adding = True
+                            if adding:
+                                continue  # position still being built — size not settled
+                            held = int(abs(fsz))
+                            _m = master_map.get(sym, (0, None, None))
+                            mark, mentry = _m[1], _m[2]
+                            target = self.risk_engine.calculate_follower_quantity(
+                                abs(msz), float(mark) if mark else 0.0, fol, round_up=True
+                            )
+                            # A zero target while the master still HOLDS means the ratio
+                            # could not be computed (balance read as 0) — NOT that the
+                            # follower should be flat. Trimming on it would close the
+                            # entire position. Never act on an unavailable ratio.
+                            if int(target) < 1:
+                                logger.warning(
+                                    f"reconcile: sizing unavailable for {fol.get('name')} on {sym} "
+                                    f"(master {msz:+.0f}, holds {held}) — leaving it alone this pass"
                                 )
                                 continue
-                            short_by = min(int(short_by), int(prev_short))
-                            if short_by < 1:
+                            excess = held - int(target)
+                            # Deadband: the target moves with a live balance ratio, so a
+                            # 1-lot difference on a 30-lot leg is noise, not a miss.
+                            # Acting on it churns (trim 1, top-up 1, repeat) — see
+                            # RECON_SIZE_TOLERANCE_PCT.
+                            if abs(excess) < _size_deadband(target):
                                 continue
-                            if now - self._recon_open_ts.get((fid, sym), 0) < self._RECON_OPEN_DEBOUNCE:
-                                continue
-                            self._recon_open_ts[(fid, sym)] = now
-                            side = "buy" if fsz > 0 else "sell"
-                            try:
-                                await client.place_order(
-                                    symbol=sym, side=side, size=int(short_by),
-                                    order_type="market_order", reduce_only=False,
-                                )
-                                logger.info(
-                                    f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
-                                    f"({held} -> {int(target)}, master {msz:+.0f}, master "
-                                    f"filled {now - last_fill:.0f}s ago)"
-                                )
-                                # Episode over: re-arm both keys so the NEXT
-                                # shortfall on this leg alerts instead of being
-                                # swallowed by the once-per-episode window.
-                                asyncio.create_task(tg.clear_alert(f"topup:{fid}:{sym}"))
-                                asyncio.create_task(tg.clear_alert(f"stale:{fid}:{sym}"))
-                                asyncio.create_task(tg.notify_correction(
-                                    fol.get("name"), sym, "TOPPED UP", int(short_by),
-                                    held=held, target=int(target), master=int(msz),
-                                    why="the live copy left this leg short — a mirror "
-                                        "was missed, skipped or under-filled"))
-                            except Exception as e:
-                                body = getattr(getattr(e, "response", None), "text", "")
-                                logger.warning(f"reconcile top-up failed for {fol.get('name')} {sym}: {e} {body}")
-                                asyncio.create_task(tg.notify_fail(
-                                    fol.get("name"), sym, side, int(short_by), _short_reason(e, body),
-                                    key=f"topup:{fid}:{sym}", window=tg.ONCE_WINDOW,
-                                ))
-                            continue
-
-                        # ---- OVER-exposed: an exit the follower didn't complete.
-                        #
-                        # Not while the master is still WORKING an order here. His
-                        # exit fills in pieces, so his position drops before ours
-                        # does, and trimming against each piece markets the
-                        # difference again and again: 2026-09-21, one 2400-lot cover
-                        # on P-BTC-79600 produced FIVE market trims in eleven minutes
-                        # (27 -> 21 -> 18 -> 13 -> 11 -> 4), paying the spread every
-                        # time, while our mirrored exit sat behind his in the queue
-                        # and never got the chance to fill at his price.
-                        #
-                        # Both proper resolutions already exist and both key off HIS
-                        # order reaching a terminal state:
-                        #   he fills   -> _escalate_after_master_fill gives our mirror
-                        #                 ESCALATE_WAIT_SEC at his price, then markets
-                        #                 the remainder.
-                        #   he cancels -> _settle_exit_after_cancel markets the gap at
-                        #                 once ("the master just abandoned that price").
-                        # The reconciler was cutting across both by acting while his
-                        # order was still live.
-                        #
-                        # Held with NO magnitude cap and NO time limit (desk call,
-                        # Prathav 2026-09-25): the drift while he unwinds is accepted
-                        # in exchange for matching his price. On the 21 Sep episode
-                        # that means holding at 27 against a falling target for ~11
-                        # minutes, ending ~575% over, then settling in one step when
-                        # his order terminates.
-                        #
-                        # An UNREADABLE book is not permission to trim — same rule as
-                        # everywhere else in this engine.
-                        working = await self._master_working_reducer(master_row, sym, msz)
-                        if working is None:
-                            logger.warning(
-                                f"reconcile: {fol.get('name')} over-exposed on {sym} but the "
-                                f"master's order book is unreadable — not trimming on an unknown"
-                            )
-                            continue
-                        if working:
-                            logger.info(
-                                f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
-                                f"{held}, target {int(target)} for master {msz:+.0f} "
-                                f"(excess {excess}) — but the master is still WORKING an order "
-                                f"here; his fill or cancel settles it, not a trim"
-                            )
-                            continue
-                        tkey = (fid, sym, excess)
-                        current_trim.add(tkey)
-                        _stuck_detail[("trim", fid, sym)] = (
-                            fol.get("name"), held, int(target), msz)
-                        if tkey not in self._recon_trim_prev.get(_mkey, set()):
-                            logger.info(
-                                f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
-                                f"{held}, target {int(target)} for master {msz:+.0f} "
-                                f"(excess {excess}) — confirming next pass before trimming"
-                            )
-                            continue
-                        missed = await self._missed_exit_ids(fol, sym)
-                        side = "sell" if fsz > 0 else "buy"
-                        try:
-                            # Clear any stuck reduce-only limit first, so it can't
-                            # fill on top of the market close below.
-                            for o in stuck_closes:
-                                if await self._safe_cancel(client, o.get("id"), o.get("product_id")):
-                                    logger.info(
-                                        f"reconcile: cancelled stuck close {o.get('id')} on {sym} "
-                                        f"for {fol.get('name')} before trimming (never filled)"
-                                    )
-                            await client.place_order(
-                                symbol=sym, side=side, size=int(excess),
-                                order_type="market_order", reduce_only=True,
-                            )
-                            logger.info(
-                                f"reconcile: TRIMMED {fol.get('name')} {sym} by {excess} "
-                                f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
-                                f"exit order(s): {missed or 'none recorded in ledger'}"
-                            )
-                            asyncio.create_task(tg.clear_alert(f"recon:{fol.get('id')}:{sym}"))
-                            asyncio.create_task(tg.notify_correction(
-                                fol.get("name"), sym, "TRIMMED", int(excess),
-                                held=held, target=int(target), master=int(msz),
-                                why=("the follower was over-exposed — an over-sized punch, "
-                                     "a duplicate order, or a master exit that never "
-                                     f"mirrored (missed: {missed or 'none in ledger'})")))
-                        except Exception as e:
-                            body = getattr(getattr(e, "response", None), "text", "")
-                            logger.warning(f"reconcile trim failed for {fol.get('name')} {sym}: {e} {body}")
-                        continue
-                    # Master FLAT but the follower still holds AND has its own
-                    # resting SL/TP: only close it if the master got flat by a
-                    # MANUAL close (its stop won't hit -> orphan). If the master
-                    # exited via SL/TP, leave it — the follower's own jittered stop
-                    # is at ~the same price and closes it on its own (no churn). If
-                    # we can't tell, leave it and retry next pass (never guess).
-                    # HANDS-OFF: the master's SL/TP triggered on this symbol, so it
-                    # is flat while the follower still holds. That is NOT an orphan —
-                    # the follower's own jittered stop is what should close it. Never
-                    # force it, regardless of how long it takes or how the master's
-                    # exit classifies.
-                    if msz == 0:
-                        hoff = await ledger.is_hands_off(self.redis, fol.get("owner_id"), fid, sym)
-                        if hoff:
-                            logger.info(
-                                f"reconcile: leaving {fol.get('name')} {sym} {fsz:+.0f} alone — "
-                                f"hands-off ({hoff.get('reason')}); its own stop closes this leg"
-                            )
-                            continue
-                    if msz == 0 and sym in resting:
-                        reason = await self._classify_master_exit(master_row, sym)
-                        if reason != "manual":
-                            # That deferral is UNBOUNDED, which is how an orphan can
-                            # sit forever: for a busy (grid) master the close rolls
-                            # out of the recent order-history window and classify
-                            # returns "unknown" on every pass. Escape hatch — if the
-                            # master hasn't filled anything on this symbol in a long
-                            # while, the follower's own jittered stop was never going
-                            # to fire alongside the master's either, so it IS an
-                            # orphan and we stop waiting.
+                            # Don't act while the master is still trading this symbol —
+                            # its size is moving and any diff we see is transient.
                             if master_fresh_ts is None:
                                 master_fresh_ts = await self._master_recent_fill_ts(master_row)
                             last_fill = master_fresh_ts.get(sym)
-                            if last_fill is not None and (now - last_fill) <= STALE_ORPHAN_SEC:
-                                continue  # recent master exit — let the follower's
-                                          # own stop have its chance first
-                            age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "not in recent window"
-                            logger.info(
-                                f"reconcile: {fol.get('name')} still holds {sym} {fsz:+.0f} behind a "
-                                f"resting stop; master exit reads '{reason}' but is stale (last master "
-                                f"fill {age_txt}) — treating as an orphan and closing"
-                            )
-                    key = (fid, sym)
-                    current_close.add(key)
-                    _stuck_detail[("close", fid, sym)] = (
-                        fol.get("name"), held, 0, msz)
-                    if key not in self._recon_close_prev.get(_mkey, set()):
-                        continue  # first sighting — confirm next pass before acting
-                    side = "sell" if fsz > 0 else "buy"
-                    try:
-                        await client.place_order(
-                            symbol=sym, side=side, size=int(abs(fsz)),
-                            order_type="market_order", reduce_only=True,
-                        )
-                        why = "manual master close orphan" if msz == 0 else "wrong-side desync"
-                        missed = await self._missed_exit_ids(fol, sym)
-                        logger.info(
-                            f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) "
-                            f"— {why}; missed master exit order(s): {missed or 'none recorded in ledger'}"
-                        )
-                        asyncio.create_task(tg.notify_correction(
-                            fol.get("name"), sym, "CLOSED", int(abs(fsz)),
-                            held=int(fsz), target=0, master=int(msz),
-                            why=f"{why}; missed master exit order(s): "
-                                f"{missed or 'none recorded in ledger'}"))
-                        # Master-flat close leaves the follower's own SL/TP resting
-                        # on a now-flat leg — nothing else cancels it once the
-                        # master's gone, so clear it here.
+                            if last_fill is not None and (now - last_fill) < TRIM_SETTLE_SEC:
+                                continue
+
+                            # ---- UNDER-exposed: the follower holds LESS than its share.
+                            # Nothing used to handle this at all — the open path only fires
+                            # when the follower is completely FLAT, so a partially-filled or
+                            # partially-missed entry stayed short of target indefinitely
+                            # (2026-07-30 audit: 4 symbols, all under). Top up the shortfall,
+                            # subject to the same price guard as a stale recovery since this
+                            # is ADDING exposure at today's price.
+                            if excess <= -1:
+                                short_by = -excess
+                                # NEVER add while the master is unwinding this symbol.
+                                # Peak check first: it has no expiry, so it holds for as
+                                # long as the master stays below its high-water mark. The
+                                # time window alone let a top-up through 45s after it
+                                # expired, mid-unwind (2026-08-03, P-BTC-62600-030826).
+                                peak = self._master_size_peak.get((_mkey, sym), 0.0)
+                                if peak and abs(msz) < peak:
+                                    logger.info(
+                                        f"reconcile: {fol.get('name')} under-exposed on {sym} "
+                                        f"({held} vs {int(target)}) but master is BELOW its peak "
+                                        f"({abs(msz):.0f} of {peak:.0f}) — net-reduced on this leg, "
+                                        f"not adding. Live copy still mirrors any real re-entry."
+                                    )
+                                    continue
+                                # RECENCY, not price. We copy recent entries and sit out
+                                # stale ones; a late entry at a moved price is worse than
+                                # not having the trade (the same rule FRESH_ENTRY_SEC
+                                # already states for the live copy path). This replaced a
+                                # price-drift test that decided it on abs(mark - entry),
+                                # which refused a move in our FAVOUR exactly as hard as
+                                # one against us: 2026-09-01 20:24 on P-BTC-75200-020926
+                                # the master was SHORT at 18.0162, the mark ran to 22.8,
+                                # and five passes refused at 23.6-27.8% — the follower
+                                # would have opened that short ~25% BETTER than the master
+                                # got, and instead sat 19 lots short of target 23 for
+                                # 2m21s. (desk call, Prathav 2026-09-02: drop drift, copy
+                                # recent trades only, no stale entries.)
+                                #
+                                # Still alerts when it declines, so an abandoned leg is
+                                # visible rather than silent — the failure mode of the
+                                # age-only gate this restores (2026-07-30: 5 missing legs,
+                                # the oldest 3.8h, skipped every 15s forever).
+                                fresh = (last_fill is not None
+                                         and (now - last_fill) <= FRESH_ENTRY_SEC)
+                                if not fresh:
+                                    age_txt = (f"{now - last_fill:.0f}s ago" if last_fill
+                                               else "no recent fill")
+                                    logger.info(
+                                        f"reconcile: {fol.get('name')} under-exposed on {sym} "
+                                        f"({held} vs target {int(target)}) but the master last "
+                                        f"filled it {age_txt} — stale, NOT topping up"
+                                    )
+                                    asyncio.create_task(tg.notify_fail(
+                                        fol.get("name"), sym, "topup", short_by,
+                                        f"master's entry is stale ({age_txt}) — left short",
+                                        key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                                    ))
+                                    self._recon_open_ts[(fid, sym)] = now
+                                    continue
+                                # TWO independent observations before adding exposure —
+                                # kept deliberately: a just-filled mirror whose position
+                                # has not shown in get_positions yet looks exactly like a
+                                # shortfall, and acting on one pass is how this engine
+                                # produced duplicate positions.
+                                #
+                                # But the key used to include short_by, so the shortfall
+                                # had to be byte-identical on both passes. The target
+                                # comes from a LIVE balance ratio that wobbles a lot or
+                                # two between passes (2026-08-03: the same unchanged
+                                # positions read "expected 22" then "expected 30"), so a
+                                # real miss could restart confirmation indefinitely — and
+                                # the faster the loop, the more often that happens. Keyed
+                                # on (follower, symbol) it latches reliably, and we act on
+                                # the SMALLER of the two observed shortfalls so a wobble
+                                # can only ever under-open, never overshoot.
+                                ukey = (fid, sym)
+                                current_topup[ukey] = short_by
+                                _stuck_detail[("topup", fid, sym)] = (
+                                    fol.get("name"), held, int(target), msz)
+                                prev_short = self._recon_topup_prev.get(_mkey, {}).get(ukey)
+                                if prev_short is None:
+                                    logger.info(
+                                        f"reconcile: {fol.get('name')} under-exposed on {sym} — holds "
+                                        f"{held}, target {int(target)} (short {short_by}) — confirming "
+                                        f"next pass before topping up"
+                                    )
+                                    continue
+                                short_by = min(int(short_by), int(prev_short))
+                                if short_by < 1:
+                                    continue
+                                if now - self._recon_open_ts.get((fid, sym), 0) < self._RECON_OPEN_DEBOUNCE:
+                                    continue
+                                self._recon_open_ts[(fid, sym)] = now
+                                side = "buy" if fsz > 0 else "sell"
+                                try:
+                                    await client.place_order(
+                                        symbol=sym, side=side, size=int(short_by),
+                                        order_type="market_order", reduce_only=False,
+                                    )
+                                    logger.info(
+                                        f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
+                                        f"({held} -> {int(target)}, master {msz:+.0f}, master "
+                                        f"filled {now - last_fill:.0f}s ago)"
+                                    )
+                                    # Episode over: re-arm both keys so the NEXT
+                                    # shortfall on this leg alerts instead of being
+                                    # swallowed by the once-per-episode window.
+                                    asyncio.create_task(tg.clear_alert(f"topup:{fid}:{sym}"))
+                                    asyncio.create_task(tg.clear_alert(f"stale:{fid}:{sym}"))
+                                    asyncio.create_task(tg.notify_correction(
+                                        fol.get("name"), sym, "TOPPED UP", int(short_by),
+                                        held=held, target=int(target), master=int(msz),
+                                        why="the live copy left this leg short — a mirror "
+                                            "was missed, skipped or under-filled"))
+                                except Exception as e:
+                                    body = getattr(getattr(e, "response", None), "text", "")
+                                    logger.warning(f"reconcile top-up failed for {fol.get('name')} {sym}: {e} {body}")
+                                    asyncio.create_task(tg.notify_fail(
+                                        fol.get("name"), sym, side, int(short_by), _short_reason(e, body),
+                                        key=f"topup:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                                    ))
+                                continue
+
+                            # ---- OVER-exposed: an exit the follower didn't complete.
+                            #
+                            # Not while the master is still WORKING an order here. His
+                            # exit fills in pieces, so his position drops before ours
+                            # does, and trimming against each piece markets the
+                            # difference again and again: 2026-09-21, one 2400-lot cover
+                            # on P-BTC-79600 produced FIVE market trims in eleven minutes
+                            # (27 -> 21 -> 18 -> 13 -> 11 -> 4), paying the spread every
+                            # time, while our mirrored exit sat behind his in the queue
+                            # and never got the chance to fill at his price.
+                            #
+                            # Both proper resolutions already exist and both key off HIS
+                            # order reaching a terminal state:
+                            #   he fills   -> _escalate_after_master_fill gives our mirror
+                            #                 ESCALATE_WAIT_SEC at his price, then markets
+                            #                 the remainder.
+                            #   he cancels -> _settle_exit_after_cancel markets the gap at
+                            #                 once ("the master just abandoned that price").
+                            # The reconciler was cutting across both by acting while his
+                            # order was still live.
+                            #
+                            # Held with NO magnitude cap and NO time limit (desk call,
+                            # Prathav 2026-09-25): the drift while he unwinds is accepted
+                            # in exchange for matching his price. On the 21 Sep episode
+                            # that means holding at 27 against a falling target for ~11
+                            # minutes, ending ~575% over, then settling in one step when
+                            # his order terminates.
+                            #
+                            # An UNREADABLE book is not permission to trim — same rule as
+                            # everywhere else in this engine.
+                            working = await self._master_working_reducer(master_row, sym, msz)
+                            if working is None:
+                                logger.warning(
+                                    f"reconcile: {fol.get('name')} over-exposed on {sym} but the "
+                                    f"master's order book is unreadable — not trimming on an unknown"
+                                )
+                                continue
+                            if working:
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
+                                    f"{held}, target {int(target)} for master {msz:+.0f} "
+                                    f"(excess {excess}) — but the master is still WORKING an order "
+                                    f"here; his fill or cancel settles it, not a trim"
+                                )
+                                continue
+                            tkey = (fid, sym, excess)
+                            current_trim.add(tkey)
+                            _stuck_detail[("trim", fid, sym)] = (
+                                fol.get("name"), held, int(target), msz)
+                            if tkey not in self._recon_trim_prev.get(_mkey, set()):
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} over-exposed on {sym} — holds "
+                                    f"{held}, target {int(target)} for master {msz:+.0f} "
+                                    f"(excess {excess}) — confirming next pass before trimming"
+                                )
+                                continue
+                            missed = await self._missed_exit_ids(fol, sym)
+                            side = "sell" if fsz > 0 else "buy"
+                            try:
+                                # Clear any stuck reduce-only limit first, so it can't
+                                # fill on top of the market close below.
+                                for o in stuck_closes:
+                                    if await self._safe_cancel(client, o.get("id"), o.get("product_id")):
+                                        logger.info(
+                                            f"reconcile: cancelled stuck close {o.get('id')} on {sym} "
+                                            f"for {fol.get('name')} before trimming (never filled)"
+                                        )
+                                await client.place_order(
+                                    symbol=sym, side=side, size=int(excess),
+                                    order_type="market_order", reduce_only=True,
+                                )
+                                logger.info(
+                                    f"reconcile: TRIMMED {fol.get('name')} {sym} by {excess} "
+                                    f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
+                                    f"exit order(s): {missed or 'none recorded in ledger'}"
+                                )
+                                asyncio.create_task(tg.clear_alert(f"recon:{fol.get('id')}:{sym}"))
+                                asyncio.create_task(tg.notify_correction(
+                                    fol.get("name"), sym, "TRIMMED", int(excess),
+                                    held=held, target=int(target), master=int(msz),
+                                    why=("the follower was over-exposed — an over-sized punch, "
+                                         "a duplicate order, or a master exit that never "
+                                         f"mirrored (missed: {missed or 'none in ledger'})")))
+                            except Exception as e:
+                                body = getattr(getattr(e, "response", None), "text", "")
+                                logger.warning(f"reconcile trim failed for {fol.get('name')} {sym}: {e} {body}")
+                            continue
+                        # Master FLAT but the follower still holds AND has its own
+                        # resting SL/TP: only close it if the master got flat by a
+                        # MANUAL close (its stop won't hit -> orphan). If the master
+                        # exited via SL/TP, leave it — the follower's own jittered stop
+                        # is at ~the same price and closes it on its own (no churn). If
+                        # we can't tell, leave it and retry next pass (never guess).
+                        # HANDS-OFF: the master's SL/TP triggered on this symbol, so it
+                        # is flat while the follower still holds. That is NOT an orphan —
+                        # the follower's own jittered stop is what should close it. Never
+                        # force it, regardless of how long it takes or how the master's
+                        # exit classifies.
                         if msz == 0:
-                            await self._cancel_follower_stops(client, sym, fol.get("name"))
-                    except Exception as e:
-                        body = getattr(getattr(e, "response", None), "text", "")
-                        logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
+                            hoff = await ledger.is_hands_off(self.redis, fol.get("owner_id"), fid, sym)
+                            if hoff:
+                                logger.info(
+                                    f"reconcile: leaving {fol.get('name')} {sym} {fsz:+.0f} alone — "
+                                    f"hands-off ({hoff.get('reason')}); its own stop closes this leg"
+                                )
+                                continue
+                        if msz == 0 and sym in resting:
+                            reason = await self._classify_master_exit(master_row, sym)
+                            if reason != "manual":
+                                # That deferral is UNBOUNDED, which is how an orphan can
+                                # sit forever: for a busy (grid) master the close rolls
+                                # out of the recent order-history window and classify
+                                # returns "unknown" on every pass. Escape hatch — if the
+                                # master hasn't filled anything on this symbol in a long
+                                # while, the follower's own jittered stop was never going
+                                # to fire alongside the master's either, so it IS an
+                                # orphan and we stop waiting.
+                                if master_fresh_ts is None:
+                                    master_fresh_ts = await self._master_recent_fill_ts(master_row)
+                                last_fill = master_fresh_ts.get(sym)
+                                if last_fill is not None and (now - last_fill) <= STALE_ORPHAN_SEC:
+                                    continue  # recent master exit — let the follower's
+                                              # own stop have its chance first
+                                age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "not in recent window"
+                                logger.info(
+                                    f"reconcile: {fol.get('name')} still holds {sym} {fsz:+.0f} behind a "
+                                    f"resting stop; master exit reads '{reason}' but is stale (last master "
+                                    f"fill {age_txt}) — treating as an orphan and closing"
+                                )
+                        key = (fid, sym)
+                        current_close.add(key)
+                        # `held` belongs to the TRIM loop above; this loop has its own
+                        # size in fsz. Reading it here raised UnboundLocalError and
+                        # aborted the ENTIRE reconcile pass for the master — close,
+                        # open, trim and top-up all of it — whenever a close candidate
+                        # was reached before a trim candidate had set it. Live on
+                        # 2026-11-19 22:12-22:14 UTC, 12 passes for JD algo3.
+                        _stuck_detail[("close", fid, sym)] = (
+                            fol.get("name"), int(abs(fsz)), 0, msz)
+                        if key not in self._recon_close_prev.get(_mkey, set()):
+                            continue  # first sighting — confirm next pass before acting
+                        side = "sell" if fsz > 0 else "buy"
+                        try:
+                            await client.place_order(
+                                symbol=sym, side=side, size=int(abs(fsz)),
+                                order_type="market_order", reduce_only=True,
+                            )
+                            why = "manual master close orphan" if msz == 0 else "wrong-side desync"
+                            missed = await self._missed_exit_ids(fol, sym)
+                            logger.info(
+                                f"reconcile: closed {fol.get('name')} {sym} {fsz:+.0f} (master {msz:+.0f}) "
+                                f"— {why}; missed master exit order(s): {missed or 'none recorded in ledger'}"
+                            )
+                            asyncio.create_task(tg.notify_correction(
+                                fol.get("name"), sym, "CLOSED", int(abs(fsz)),
+                                held=int(fsz), target=0, master=int(msz),
+                                why=f"{why}; missed master exit order(s): "
+                                    f"{missed or 'none recorded in ledger'}"))
+                            # Master-flat close leaves the follower's own SL/TP resting
+                            # on a now-flat leg — nothing else cancels it once the
+                            # master's gone, so clear it here.
+                            if msz == 0:
+                                await self._cancel_follower_stops(client, sym, fol.get("name"))
+                        except Exception as e:
+                            body = getattr(getattr(e, "response", None), "text", "")
+                            logger.warning(f"reconcile close failed for {fol.get('name')} {sym}: {e} {body}")
+                    except Exception as _leg_err:
+                        # SAY SO. The engine crashing where it is supposed to
+                        # CORRECT is the one failure nobody can see from the
+                        # outside: the position just stays wrong. On
+                        # 2026-11-19 03:42 IST this ran twelve times in two
+                        # minutes as a WARNING in a log, while four unmatched
+                        # and unprotected legs sat on the follower.
+                        logger.exception(
+                            f"reconcile: close/trim pass failed for "
+                            f"{fol.get('name')} on {sym}: {_leg_err}"
+                        )
+                        asyncio.create_task(tg.notify_fail(
+                            fol.get("name"), sym, "reconcile", 0,
+                            f"the close/trim check itself crashed "
+                            f"({type(_leg_err).__name__}: {_leg_err}) — this leg "
+                            f"was NOT corrected and will not be until this is fixed",
+                            key=f"legerr:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                        ))
+                        continue
 
                 # 2) OPEN — master holds a leg the follower is flat on (recover miss).
                 for sym, (msz, mark, mentry) in master_map.items():
-                    if msz == 0 or fpos.get(sym, 0) != 0:
-                        continue
-                    if sym in resting:
-                        continue  # live copy already has a resting order here
-                    key = (fid, sym)
-                    current_open.add(key)
-                    _stuck_detail[("open", fid, sym)] = (
-                        fol.get("name"), 0, int(target), msz)
-                    if key not in self._recon_open_prev.get(_mkey, set()):
-                        continue  # first sighting — a just-filled mirror may not be
-                                  # reflected yet; confirm on the next pass (avoids a
-                                  # duplicate entry racing the live copy)
-                    if now - self._recon_open_ts.get(key, 0) < self._RECON_OPEN_DEBOUNCE:
-                        continue
-                    price = float(mark) if mark else 0.0
-                    target = self.risk_engine.calculate_follower_quantity(abs(msz), price, fol, round_up=True)
-                    if target < 1:
-                        continue
-                    # A leg the master entered RECENTLY is recovered outright. An
-                    # older one used to be refused unconditionally, which meant a
-                    # missed entry was never recovered — the reconciler logged "SKIP
-                    # stale entry ... leaving follower flat" every 15s indefinitely
-                    # while the follower drifted further from the master (2026-07-30
-                    # audit: 5 missing legs, the oldest 3.8h and still being skipped).
-                    #
-                    # Age is the wrong test. What actually matters is whether the
-                    # price has moved away from what the master paid: judge on PRICE
-                    # drift instead, and when it IS too far, say so loudly rather
-                    # than silently doing nothing forever. (desk call, 2026-07-30)
-                    if master_fresh_ts is None:
-                        master_fresh_ts = await self._master_recent_fill_ts(master_row)
-                    last_fill = master_fresh_ts.get(sym)
-                    is_fresh = last_fill is not None and (now - last_fill) <= FRESH_ENTRY_SEC
-                    if not is_fresh:
-                        # A stale entry is NOT recovered. The price test that used to
-                        # let one through — recover if the mark is still within
-                        # SYNC_PRICE_TOLERANCE_PCT of the master's entry — is gone:
-                        # it judged abs(mark - entry), so it refused favourable moves
-                        # as hard as adverse ones and never priced the crossing at
-                        # all. We copy recent entries and sit out the rest.
-                        # (desk call, Prathav 2026-09-02: no stale entries.)
-                        #
-                        # This restores an age-only gate, whose known failure mode is
-                        # a leg abandoned for good (2026-07-30: 5 missing legs, oldest
-                        # 3.8h). So it still ALERTS every episode — the follower's
-                        # book now differs from the master's and that must be visible,
-                        # not silent.
-                        age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "no recent fill"
-                        logger.info(
-                            f"reconcile: NOT recovering {fol.get('name')} {sym} — master's entry "
-                            f"is stale (last fill {age_txt}, fresh window "
-                            f"{FRESH_ENTRY_SEC:.0f}s); leaving the follower flat on this leg"
-                        )
-                        # ONE message per episode, not one per pass. Cleared when the
-                        # leg is finally recovered, so a later occurrence still alerts.
-                        asyncio.create_task(tg.notify_fail(
-                            fol.get("name"), sym, "recover", int(target),
-                            f"master's entry is stale ({age_txt}) — follower left flat",
-                            key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
-                        ))
-                        self._recon_open_ts[key] = now
-                        continue
-                    self._recon_open_ts[key] = now
-                    side = "buy" if msz > 0 else "sell"
+                    # PER-SYMBOL ISOLATION. Every correction for this
+                    # follower used to sit inside ONE try/except, so the
+                    # first symbol that raised cancelled the rest -- and
+                    # the OPEN pass below it as well. On 2026-11-19 an
+                    # UnboundLocalError on one leg abandoned four
+                    # unmatched, unprotected positions for twelve
+                    # consecutive passes. One bad leg now costs that leg.
                     try:
-                        await client.place_order(
-                            symbol=sym, side=side, size=int(target),
-                            order_type="market_order", reduce_only=False,
+                        if msz == 0 or fpos.get(sym, 0) != 0:
+                            continue
+                        if sym in resting:
+                            continue  # live copy already has a resting order here
+                        key = (fid, sym)
+                        current_open.add(key)
+                        # SIZE FIRST, then the alert detail. This used to read
+                        # `target` seven lines before computing it, borrowing
+                        # whatever the TRIM pass above happened to leave behind —
+                        # and raising UnboundLocalError when the trim pass had set
+                        # nothing, which killed the whole reconcile for this
+                        # follower. Missing-leg recovery is the one correction that
+                        # fires when the follower has NO position at all, so the
+                        # cost of losing it is a leg that never comes back.
+                        price = float(mark) if mark else 0.0
+                        target = self.risk_engine.calculate_follower_quantity(abs(msz), price, fol, round_up=True)
+                        _stuck_detail[("open", fid, sym)] = (
+                            fol.get("name"), 0, int(target), msz)
+                        if key not in self._recon_open_prev.get(_mkey, set()):
+                            continue  # first sighting — a just-filled mirror may not be
+                                      # reflected yet; confirm on the next pass (avoids a
+                                      # duplicate entry racing the live copy)
+                        if now - self._recon_open_ts.get(key, 0) < self._RECON_OPEN_DEBOUNCE:
+                            continue
+                        if target < 1:
+                            continue
+                        # A leg the master entered RECENTLY is recovered outright. An
+                        # older one used to be refused unconditionally, which meant a
+                        # missed entry was never recovered — the reconciler logged "SKIP
+                        # stale entry ... leaving follower flat" every 15s indefinitely
+                        # while the follower drifted further from the master (2026-07-30
+                        # audit: 5 missing legs, the oldest 3.8h and still being skipped).
+                        #
+                        # Age is the wrong test. What actually matters is whether the
+                        # price has moved away from what the master paid: judge on PRICE
+                        # drift instead, and when it IS too far, say so loudly rather
+                        # than silently doing nothing forever. (desk call, 2026-07-30)
+                        if master_fresh_ts is None:
+                            master_fresh_ts = await self._master_recent_fill_ts(master_row)
+                        last_fill = master_fresh_ts.get(sym)
+                        is_fresh = last_fill is not None and (now - last_fill) <= FRESH_ENTRY_SEC
+                        if not is_fresh:
+                            # A stale entry is NOT recovered. The price test that used to
+                            # let one through — recover if the mark is still within
+                            # SYNC_PRICE_TOLERANCE_PCT of the master's entry — is gone:
+                            # it judged abs(mark - entry), so it refused favourable moves
+                            # as hard as adverse ones and never priced the crossing at
+                            # all. We copy recent entries and sit out the rest.
+                            # (desk call, Prathav 2026-09-02: no stale entries.)
+                            #
+                            # This restores an age-only gate, whose known failure mode is
+                            # a leg abandoned for good (2026-07-30: 5 missing legs, oldest
+                            # 3.8h). So it still ALERTS every episode — the follower's
+                            # book now differs from the master's and that must be visible,
+                            # not silent.
+                            age_txt = f"{now - last_fill:.0f}s ago" if last_fill else "no recent fill"
+                            logger.info(
+                                f"reconcile: NOT recovering {fol.get('name')} {sym} — master's entry "
+                                f"is stale (last fill {age_txt}, fresh window "
+                                f"{FRESH_ENTRY_SEC:.0f}s); leaving the follower flat on this leg"
+                            )
+                            # ONE message per episode, not one per pass. Cleared when the
+                            # leg is finally recovered, so a later occurrence still alerts.
+                            asyncio.create_task(tg.notify_fail(
+                                fol.get("name"), sym, "recover", int(target),
+                                f"master's entry is stale ({age_txt}) — follower left flat",
+                                key=f"stale:{fid}:{sym}", window=tg.ONCE_WINDOW,
+                            ))
+                            self._recon_open_ts[key] = now
+                            continue
+                        self._recon_open_ts[key] = now
+                        side = "buy" if msz > 0 else "sell"
+                        try:
+                            await client.place_order(
+                                symbol=sym, side=side, size=int(target),
+                                order_type="market_order", reduce_only=False,
+                            )
+                            logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
+                            asyncio.create_task(tg.notify_correction(
+                                fol.get("name"), sym, "OPENED", int(target),
+                                held=0, target=int(target), master=int(msz),
+                                why="the follower had no leg at all — the live copy "
+                                    "never reached the exchange"))
+                            # Episode over — let a future drift/failure on this leg
+                            # alert again instead of being silently suppressed.
+                            asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
+                            asyncio.create_task(tg.clear_alert(f"recon:{fid}:{sym}"))
+                        except Exception as e:
+                            body = getattr(getattr(e, "response", None), "text", "")
+                            logger.warning(f"reconcile open failed for {fol.get('name')} {sym}: {e} {body}")
+                            asyncio.create_task(tg.notify_fail(
+                                fol.get("name"), sym, side, int(target), _short_reason(e, body),
+                                key=f"recon:{fol.get('id')}:{sym}", window=tg.ONCE_WINDOW,
+                            ))
+                    except Exception as _leg_err:
+                        # SAY SO. The engine crashing where it is supposed to
+                        # CORRECT is the one failure nobody can see from the
+                        # outside: the position just stays wrong. On
+                        # 2026-11-19 03:42 IST this ran twelve times in two
+                        # minutes as a WARNING in a log, while four unmatched
+                        # and unprotected legs sat on the follower.
+                        logger.exception(
+                            f"reconcile: open pass failed for "
+                            f"{fol.get('name')} on {sym}: {_leg_err}"
                         )
-                        logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
-                        asyncio.create_task(tg.notify_correction(
-                            fol.get("name"), sym, "OPENED", int(target),
-                            held=0, target=int(target), master=int(msz),
-                            why="the follower had no leg at all — the live copy "
-                                "never reached the exchange"))
-                        # Episode over — let a future drift/failure on this leg
-                        # alert again instead of being silently suppressed.
-                        asyncio.create_task(tg.clear_alert(f"drift:{fid}:{sym}"))
-                        asyncio.create_task(tg.clear_alert(f"recon:{fid}:{sym}"))
-                    except Exception as e:
-                        body = getattr(getattr(e, "response", None), "text", "")
-                        logger.warning(f"reconcile open failed for {fol.get('name')} {sym}: {e} {body}")
                         asyncio.create_task(tg.notify_fail(
-                            fol.get("name"), sym, side, int(target), _short_reason(e, body),
-                            key=f"recon:{fol.get('id')}:{sym}", window=tg.ONCE_WINDOW,
+                            fol.get("name"), sym, "reconcile", 0,
+                            f"the open check itself crashed "
+                            f"({type(_leg_err).__name__}: {_leg_err}) — this leg "
+                            f"was NOT corrected and will not be until this is fixed",
+                            key=f"legerr:{fid}:{sym}", window=tg.ONCE_WINDOW,
                         ))
+                        continue
             except Exception as e:
                 logger.warning(f"reconcile_positions error for {fol.get('name')}: {e}")
 
