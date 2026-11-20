@@ -54,37 +54,22 @@ FAILURES = []
 # Adding a name here is a deliberate act -- do it only after convincing
 # yourself the path cannot be reached, and say why in the commit.
 BASELINE = {
-    # These sit inside the one big reduce-only branch, bound at its top and
-    # read further down it. The compiler flags them because the branch is
-    # conditional across loop iterations, not because a path reaches them
-    # unbound.
+    # Each is bound in one branch and read in another that only runs when
+    # the first did -- `_prev_v` under `if _resized`, `foid`/`leg`/`sl`
+    # inside the bracket self-heal, `follower_order_id` and `resp_obj`
+    # after a successful place. Correlated, so unreachable in practice,
+    # and not provable. Audited 2026-11-20.
     "_mirror_place": {
-        "_prev_v", "filled_exit", "follower_held", "follower_order_id",
-        "master_now", "resp_obj", "rungs", "signed", "target", "why_zero",
-        # `held` is bound by both arms of the try/except immediately above its
-        # reads, in the protective-order branch. It became unprovable when the
-        # vanish backstop added another `continue` earlier in the function.
-        "held",
+        "_prev_v", "foid", "follower_order_id", "held", "leg", "leg_key",
+        "resp_obj", "result", "sl", "why_zero",
     },
+    # The escalation sweep's loop variables, plus two `except ... as`
+    # names that Python deletes at the end of their handler. Same
+    # pattern: correlated conditions, audited 2026-11-20.
     "_reconcile_positions": {
-        # All of these live in the end-of-pass escalation sweep: nested `for`
-        # loops that bind each name and read it inside the same loop. The
-        # compiler flags them only because a loop may not run at all.
-        "_age", "_e", "_held", "_kind", "_live", "_msz", "_name", "_nm",
-        "_now", "_sk", "_target",
-        # `key` and `_qty` are each assigned a few lines above their reads
-        # inside the same branch. They became unprovable when the
-        # last-look re-read added another `continue` to those branches.
-        "key", "_qty",
-        # `except ... as _leg_err` -- Python deletes the name at the end of the
-        # handler, so the compiler cannot prove it bound. Only ever read inside
-        # the handler that binds it.
-        "_leg_err",
-        # `why` is assigned and then read three lines later in the same block
-        # (the close branch's log line and its correction alert). It became
-        # unprovable only when the per-leg try/except was added around it,
-        # which gives the compiler an exception edge it cannot reason past.
-        "why",
+        "_age", "_e", "_held", "_kind", "_leg_err", "_live",
+        "_msz", "_name", "_nm", "_now", "_qty", "_sk",
+        "_target", "key", "why",
     },
 }
 

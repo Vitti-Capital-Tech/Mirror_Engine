@@ -3142,6 +3142,31 @@ class CopyEngine:
 
         for follower in followers:
             follower["master_balance"] = master_balance
+            # BOUND HERE, not inside the reduce-only branch that computes them.
+            #
+            # Everything below the if/elif/else close-sizing chain reads these —
+            # the cover cap, and the "why is this zero" explanation — and that
+            # code runs whether or not the chain did. CPython emits
+            # LOAD_FAST_CHECK for exactly this, and it does NOT do so for a name
+            # a loop or branch genuinely dominates, so each one was a real path
+            # to UnboundLocalError, not a conservative warning.
+            #
+            # `reduce_only and ... and follower_held` reads the worst of them:
+            # the chain is skipped when the master EDITS a resting close
+            # (is_update), and `reduce_only` is true on that path, so the `and`
+            # reaches an unbound name.
+            #
+            # The defaults are the behaviour these blocks had before the chain
+            # existed: no known holding, so no cover cap; no settled master
+            # exit, so the other explanation. They make the code provable
+            # without hiding anything — a wrong value here changes a log line,
+            # not an order.
+            follower_held = 0
+            master_now = 0.0
+            rungs = None
+            filled_exit = False
+            signed = 0.0
+            target = 0
             # ORDER MATTERS HERE, and it used to be the wrong way round.
             #
             # The sizing below reads the master's resting book, the master's

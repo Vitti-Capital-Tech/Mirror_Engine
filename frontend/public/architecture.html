@@ -304,7 +304,7 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
   <h2><span class="num">04</span>The clock</h2>
 
   <figure>
-    <svg viewBox="0 0 880 196" role="img" aria-label="Timeline: confirm settle at 3 seconds, escalation at 5 seconds, position sweep every 10 seconds, order sweep every 30 seconds, and a stuck alert at 60 seconds.">
+    <svg viewBox="0 0 880 196" role="img" aria-label="Timeline: the fill is confirmed at 3 seconds, an unfilled limit is forced to market at 5 seconds, positions are checked every 10 seconds and corrected at about 20, resting orders are checked every 30 seconds, and anything still wrong at 60 seconds raises an alert.">
       <line x1="60" y1="162" x2="845" y2="162" stroke="currentColor" stroke-width="1" opacity=".45"/>
       <g stroke="currentColor" stroke-width="1" opacity=".45">
         <line x1="60" y1="162" x2="60" y2="168"/>
@@ -329,16 +329,16 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
       <rect x="60" y="42" width="60" height="20" rx="2" class="a-bar" stroke-width="1"/>
       <text x="128" y="56" font-size="11.5" font-family="monospace" fill="currentColor">unfilled limit &rarr; market</text>
 
-      <rect x="60" y="70" width="130" height="20" rx="2" class="a-bar" stroke-width="1"/>
-      <text x="198" y="84" font-size="11.5" font-family="monospace" fill="currentColor">position sweep &middot; two passes to act</text>
+      <rect x="60" y="70" width="195" height="20" rx="2" class="a-bar" stroke-width="1"/>
+      <text x="263" y="84" font-size="11.5" font-family="monospace" fill="currentColor">positions &middot; checked every 10s, corrected at ~20s</text>
 
       <rect x="60" y="98" width="260" height="20" rx="2" class="a-bar" stroke-width="1"/>
-      <text x="328" y="112" font-size="11.5" font-family="monospace" fill="currentColor">order sweep</text>
+      <text x="328" y="112" font-size="11.5" font-family="monospace" fill="currentColor">resting orders &middot; checked every 30s</text>
 
       <rect x="60" y="126" width="470" height="20" rx="2" class="w-bar" stroke-width="1"/>
       <text x="538" y="140" font-size="11.5" font-family="monospace" fill="currentColor">still wrong &rarr; "not corrected"</text>
     </svg>
-    <figcaption>A normal correction lands around 20s — two passes of the 10s sweep. Anything still wrong at 60s means the reconciler tried and failed.</figcaption>
+    <figcaption>Two sweeps, two speeds. A position correction needs the same discrepancy on two consecutive passes, so it lands at about 20s. The order sweep only re-places a resting order the follower is missing — it does not touch positions. Anything still wrong at 60s means the reconciler tried and failed.</figcaption>
   </figure>
 
   <div class="slab">
