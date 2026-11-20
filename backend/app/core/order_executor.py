@@ -141,7 +141,14 @@ class OrderExecutor:
             # while every leg of his book was being refused on this line. The
             # failure was a WARNING in a log nobody reads.
             try:
-                import asyncio
+                # NO `import asyncio` HERE. The module already imports it at the
+                # top, and a function-local import makes `asyncio` a LOCAL of
+                # execute() -- which turns every other use of it in this
+                # function, including the ones inside the nested _confirm()
+                # closure, into a free variable that is unbound until this
+                # branch happens to run. This branch only runs when a risk
+                # check REFUSES an order, so on the normal path _confirm()
+                # raised NameError on its first asyncio.sleep().
                 from app.services import telegram_client as tg
                 asyncio.create_task(tg.notify_fail(
                     account_name, symbol, side, quantity,
