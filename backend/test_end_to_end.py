@@ -118,7 +118,12 @@ class Exchange:
                 self.killed.append(oid)
                 return {"id": oid}
             size = min(size, room)
-        if (kw.get("order_type") or "limit_order") == "market_order":
+        # A stop/TP RESTS until its trigger, whatever its order_type says: a
+        # stop-market is `market_order` plus a stop_price and it must not fill
+        # on arrival. Getting this wrong made the first draft of this file
+        # "lose" every stop it placed.
+        is_stop = kw.get("stop_price") is not None or kw.get("stop_order_type")
+        if not is_stop and (kw.get("order_type") or "limit_order") == "market_order":
             cur = self.position(acct, sym)
             delta = size if side == "buy" else -size
             self.set_position(acct, sym, cur + delta)
@@ -157,7 +162,14 @@ class Client:
                 for s, v in self.ex.pos.get(self.acct, {}).items() if v]
 
     async def get_open_orders(self, state=None):
-        return list(self.ex.book.get(self.acct, {}).values()) if state == "open" else []
+        # Delta splits the book: plain limits sit in 'open', stops and TPs in
+        # 'pending'. The engine reads both and must not see either twice.
+        book = list(self.ex.book.get(self.acct, {}).values())
+        if state == "open":
+            return [o for o in book if not o.get("stop_order_type")]
+        if state == "pending":
+            return [o for o in book if o.get("stop_order_type")]
+        return []
 
     async def get_order(self, oid):
         o = self.ex.book.get(self.acct, {}).get(str(oid))
@@ -467,10 +479,98 @@ def test_a_covered_leg_gets_no_second_close():
     check("and nothing was thrown away by the exchange", killed, 0)
 
 
+def test_protection_is_mirrored_with_a_jitter():
+    """The follower gets its own stop, offset from the master's. Identical
+    triggers fire in the same instant against the same book, which is the
+    whole reason the offset exists."""
+    print("\n11. the master's stop reaches the follower, offset")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        ex.set_position("f-algo3", SYM, 715)
+        ex.place("m-jd", symbol=SYM, side="sell", size=800,
+                 order_type="market_order", stop_price="64000",
+                 stop_order_type="stop_loss_order")
+        moid = [o["id"] for o in ex.resting("m-jd", SYM)][0] if ex.resting("m-jd", SYM) else "9001"
+        await eng.process_order_event({
+            "action": "place", "master_order_id": moid, "symbol": SYM,
+            "side": "sell", "size": 800.0, "state": "pending",
+            "order_type": "market_order", "stop_price": "64000",
+            "stop_order_type": "stop_loss_order", "product_id": 1,
+            "owner_id": "u1", "master_account_id": "m-jd"})
+        stops = [o for o in ex.resting("f-algo3", SYM) if o.get("stop_order_type")]
+        return stops
+
+    stops = asyncio.run(run())
+    check("the follower has one stop", len(stops), 1)
+    if stops:
+        trig = float(stops[0]["stop_price"])
+        check("sized to the follower's own position", int(stops[0]["size"]), 715)
+        check("and NOT at the master's exact trigger", trig == 64000.0, False)
+        check("but близко enough to be the same stop".replace("близко", "close"),
+              abs(trig - 64000.0) <= 200, True)
+
+
+def test_a_master_stop_that_triggers_forces_nothing():
+    """Hands-off. The follower has its own jittered stop at ~the same level; a
+    forced market close on top of it is a sell-then-buy-back round trip with a
+    bad fill in exactly the move that triggered it."""
+    print("\n12. the master's stop fires — the follower is left to its own")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        ex.set_position("f-algo3", SYM, 715)
+        await eng.process_order_event({
+            "action": "master_stop_filled", "master_order_id": "9002",
+            "symbol": SYM, "side": "sell", "size": 800.0,
+            "stop_order_type": "stop_loss_order", "product_id": 1,
+            "owner_id": "u1", "master_account_id": "m-jd"})
+        ex.set_position("m-jd", SYM, 0)          # his stop took him out
+        # the follower still holds, with its own stop resting behind it
+        ex.place("f-algo3", symbol=SYM, side="sell", size=715,
+                 order_type="market_order", stop_price="63950",
+                 stop_order_type="stop_loss_order")
+        before = len(fc.placed)
+        for _ in range(3):
+            await eng._reconcile_positions(recon(eng, ex))
+        return ex.position("f-algo3", SYM), len(fc.placed) - before
+
+    held, placed = asyncio.run(run())
+    check("the follower still holds its position", held, 715.0)
+    check("nothing was forced onto it", placed, 0)
+
+
+def test_a_master_who_goes_flat_takes_the_follower_with_him():
+    """The other side of the same coin: the master is flat, the follower has
+    NO stop of its own behind the leg, so nothing else is going to close it."""
+    print("\n13. master flat, follower unprotected — close it")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        ex.set_position("f-algo3", SYM, 715)
+        await eng._reconcile_positions(recon(eng, ex))   # learn the leg
+        ex.set_position("m-jd", SYM, 0)
+        seen = []
+        for _ in range(3):
+            await eng._reconcile_positions(recon(eng, ex))
+            seen.append(ex.position("f-algo3", SYM))
+        return seen
+
+    seen = asyncio.run(run())
+    check("not on the first sighting", seen[0], 715.0)
+    check("closed once confirmed", seen[-1], 0.0)
+
+
 if __name__ == "__main__":
     for t in (test_the_session,
               test_the_master_unwinding_is_left_alone,
-              test_a_covered_leg_gets_no_second_close):
+              test_a_covered_leg_gets_no_second_close,
+              test_protection_is_mirrored_with_a_jitter,
+              test_a_master_stop_that_triggers_forces_nothing,
+              test_a_master_who_goes_flat_takes_the_follower_with_him):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)
