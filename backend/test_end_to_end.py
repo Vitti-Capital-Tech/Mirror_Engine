@@ -256,6 +256,21 @@ FOLLOWER = {"id": "f-algo3", "name": "JD algo3", "is_master": False,
             "tp_sl_offset": 50}
 
 
+# A SECOND group under the SAME owner. One owner running several masters is
+# the shape that broke the reconciler on 2026-11-18: every piece of two-pass
+# state was keyed per owner, so each master's pass wiped the other's and
+# nothing was ever confirmed twice.
+MASTER2 = {"id": "m-dh", "name": "Dhwani", "is_master": True, "status": "active",
+           "api_key": "k3", "api_secret": "s3", "environment": "demo",
+           "owner_id": "u1", "balance": 5243.16}
+FOLLOWER2 = {"id": "f-dh1", "name": "Dhwani1", "is_master": False,
+             "status": "active", "api_key": "k4", "api_secret": "s4",
+             "environment": "demo", "owner_id": "u1", "master_id": "m-dh",
+             "allocation_mode": "auto_ratio", "balance": 5235.97,
+             "tp_sl_offset": 50}
+RATIO2 = 5235.97 / 5243.16
+
+
 class Res:
     def __init__(self, d): self.data = d
 
@@ -276,8 +291,16 @@ class Q:
 
 
 class DB:
+    """One group by default; `two_groups` adds Dhwani's under the same owner."""
+    two_groups = False
+
     def table(self, n):
-        return Q([MASTER, FOLLOWER] if n == "accounts" else [])
+        if n != "accounts":
+            return Q([])
+        rows = [MASTER, FOLLOWER]
+        if DB.two_groups:
+            rows = rows + [MASTER2, FOLLOWER2]
+        return Q(rows)
 
 
 class Sock:
@@ -564,13 +587,163 @@ def test_a_master_who_goes_flat_takes_the_follower_with_him():
     check("closed once confirmed", seen[-1], 0.0)
 
 
+
+
+def test_two_masters_on_one_owner_stay_separate():
+    """Both desks live, both on the SAME strike, passes interleaved.
+
+    Three things have to hold at once, and each of them has been broken in
+    production inside the last week:
+
+      * each follower is sized by ITS OWN master's balance (8509 vs 5243 —
+        crossed, a Dhwani leg comes out ~38% wrong and says nothing);
+      * one master's pass does not erase the other's two-pass confirmation
+        (that is what left 2,750 lots standing on 2026-11-19 while the log
+        said "confirming next pass" thirteen times);
+      * neither blocks the other on a shared lock.
+    """
+    print("\n14. two masters, one owner, the same strike")
+    DB.two_groups = True
+    try:
+        from app.core.copy_engine import CopyEngine
+        from app.services import telegram_client as tg
+
+        async def quiet(*a, **k): return False
+        tg.send_message = quiet
+
+        ex = Exchange()
+        clients = {a: Client(ex, a) for a in ("m-jd", "f-algo3", "m-dh", "f-dh1")}
+        eng = CopyEngine(DB(), Redis(), Sock(), ConnMgr(clients))
+        eng._get_master_client = lambda row: clients[(row or {}).get("id", "m-jd")]
+
+        async def fresh(_row):
+            return {SYM: time.time() - 30}
+        eng._master_recent_fill_ts = fresh
+
+        async def classify(_r, _s): return "unknown"
+        eng._classify_master_exit = classify
+
+        def pass_for(master_id):
+            return {"owner_id": "u1", "master_account_id": master_id,
+                    "positions": [{"symbol": s_, "size": v, "mark": 40, "entry": 40}
+                                  for s_, v in ex.pos.get(master_id, {}).items() if v]}
+
+        async def run():
+            ex.set_position("m-jd", SYM, 800)      # JD holds 800
+            ex.set_position("m-dh", SYM, 3000)     # Dhwani holds 3000, same strike
+            # Interleaved, exactly as the two loops run in production.
+            for _ in range(3):
+                await eng._reconcile_positions(pass_for("m-jd"))
+                await eng._reconcile_positions(pass_for("m-dh"))
+            return ex.position("f-algo3", SYM), ex.position("f-dh1", SYM)
+
+        jd, dh = asyncio.run(run())
+        import math
+        check("JD's follower on JD's ratio", jd, float(math.ceil(800 * RATIO)))
+        check("Dhwani's follower on DHWANI's ratio", dh, float(math.ceil(3000 * RATIO2)))
+        check("neither was sized on the other's balance",
+              jd != float(math.ceil(800 * RATIO2)) and dh != float(math.ceil(3000 * RATIO)),
+              True)
+        check("both acted despite interleaving", jd > 0 and dh > 0, True)
+    finally:
+        DB.two_groups = False
+
+
+def test_one_master_failing_does_not_size_the_other():
+    """Dhwani's balance reads 0 mid-session. He must be refused, not handed
+    JD's 8509."""
+    print("\n15. one desk's balance fails, the other is untouched")
+    from app.core.copy_engine import CopyEngine
+    eng = CopyEngine.__new__(CopyEngine)
+    eng._last_master_balance = {}
+    jd = eng._master_balance_or_last(MASTER_BAL, MASTER)
+    dh = eng._master_balance_or_last(5243.16, MASTER2)
+    check("each remembered its own", (jd, dh), (MASTER_BAL, 5243.16))
+    check("dhwani falls back to dhwani",
+          eng._master_balance_or_last(0.0, MASTER2), 5243.16)
+    check("jd falls back to jd",
+          eng._master_balance_or_last(0.0, MASTER), MASTER_BAL)
+
+
+
+
+def test_the_mirror_and_the_sweep_cannot_both_act():
+    """THE RACE, in a session. The master's order arrives while a reconcile
+    pass is mid-flight on the same leg.
+
+    Before the leg lock these took DIFFERENT locks — the dispatcher keyed order
+    events on the symbol and reconcile events on a shared fallback, because a
+    reconcile event carries positions and no symbol. Both could place on the
+    same follower and the same leg at the same moment; only the two-pass rule
+    and the last look stood in the way, and both are guesses.
+    """
+    print("\n16. mirror and sweep fire together on one leg")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        await eng._reconcile_positions(recon(eng, ex))      # first sighting
+        # Now the master's own order lands at the same instant as the pass that
+        # would confirm the recovery.
+        ex.place("m-jd", symbol=SYM, side="buy", size=800,
+                 order_type="limit_order", limit_price=40)
+        moid = [o["id"] for o in ex.resting("m-jd", SYM)][0]
+        await asyncio.gather(
+            eng.process_order_event(place_event(moid, "buy", 800, 40)),
+            eng._reconcile_positions(recon(eng, ex)),
+        )
+        return ex.position("f-algo3", SYM), len(ex.resting("f-algo3", SYM))
+
+    held, resting = asyncio.run(run())
+    # The sweep may open the leg, the mirror may rest its order, but the
+    # follower must never end up with MORE than its share of the master.
+    check("never more than the ratio share", held <= float(share(800)), True)
+    check("and at most one resting mirror", resting <= 1, True)
+
+
+def test_a_leg_that_moves_mid_decision_is_resized():
+    """STALE DATA, in a session. The sweep reads the book, decides to trim,
+    and the leg shrinks while it is still deciding — the master's own exit
+    mirrored in between.
+
+    Without the last look it sends the size it computed before all of that and
+    cuts straight through the target."""
+    print("\n17. the leg moves while the sweep is deciding")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        ex.set_position("f-algo3", SYM, 800)        # 1:1, 85 over its target
+        await eng._reconcile_positions(recon(eng, ex))   # first sighting
+
+        # Between the pass's opening read and its order, the follower's own
+        # exit fills and the leg drops to 760 — now only 45 over.
+        real = eng._live_signed_fresh
+
+        async def moved(client, symbol):
+            ex.set_position("f-algo3", SYM, 760)
+            return await real(client, symbol)
+
+        eng._live_signed_fresh = moved
+        await eng._reconcile_positions(recon(eng, ex))
+        return ex.position("f-algo3", SYM)
+
+    held = asyncio.run(run())
+    check("trimmed to the target, not past it", held, float(share(800)))
+    check("it did not cut the full 85 off 760", held != 675.0, True)
+
+
 if __name__ == "__main__":
     for t in (test_the_session,
               test_the_master_unwinding_is_left_alone,
               test_a_covered_leg_gets_no_second_close,
               test_protection_is_mirrored_with_a_jitter,
               test_a_master_stop_that_triggers_forces_nothing,
-              test_a_master_who_goes_flat_takes_the_follower_with_him):
+              test_a_master_who_goes_flat_takes_the_follower_with_him,
+              test_two_masters_on_one_owner_stay_separate,
+              test_one_master_failing_does_not_size_the_other,
+              test_the_mirror_and_the_sweep_cannot_both_act,
+              test_a_leg_that_moves_mid_decision_is_resized):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)
