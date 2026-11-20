@@ -295,7 +295,11 @@ class CopyEngine:
         # How the master most recently CLOSED each symbol ("sl_tp" | "manual"),
         # cached so the 10s reconcile loop doesn't re-pull order history every
         # pass while it waits for a follower's own stop to (or fail to) hit.
-        self._last_master_balance = 0.0   # see _master_balance_or_last
+        # {master_id: last balance that read above zero}. PER MASTER, not one
+        # value for the engine: the fallback below sizes with it, so a shared
+        # slot hands one desk's balance to another's ratio. Same family as the
+        # five symbol-keyed caches fixed on 2026-11-19, missed in that pass.
+        self._last_master_balance: dict = {}   # see _master_balance_or_last
         self._master_exit_cache: dict = {}  # {(master_id, symbol): (reason, ts)}
         self._MASTER_EXIT_TTL = 20.0  # seconds
 
@@ -438,7 +442,10 @@ class CopyEngine:
             asyncio.create_task(tg.notify_fail(
                 "all followers", symbol, side, quantity,
                 "no active follower account was found — this trade was NOT copied",
-                key=f"nofollower:{owner_id or 'unscoped'}",
+                # Per MASTER, not per owner: one owner can run several, and an
+                # owner-wide key means the second master's "nobody is copying
+                # me" is swallowed for a week by the first one's.
+                key=f"nofollower:{owner_id or '-'}:{(master_row or {}).get('id') or '-'}",
             ))
             self.db.table("trades").update({"status": "failed"}).eq("id", trade_uuid).execute()
             
@@ -4257,12 +4264,19 @@ class CopyEngine:
         (2026-08-03: available_margin swung 30% on unchanged positions), so a
         seconds-old figure is a faithful stand-in.
         """
+        _mk = self._mid(master_row)
+        # Normalise once, so the WRITE below is as safe as the read further
+        # down. This attribute was a bare float before 2026-11-20; an engine
+        # object carrying the old shape would otherwise raise on assignment,
+        # on the order path, which is the one place that must never raise.
+        if not isinstance(getattr(self, "_last_master_balance", None), dict):
+            self._last_master_balance = {}
         try:
             b = float(balance or 0.0)
         except (TypeError, ValueError):
             b = 0.0
         if b > 0:
-            self._last_master_balance = b
+            self._last_master_balance[_mk] = b
             return b
         # Best-effort alert: this method is SYNCHRONOUS and is called from async
         # callers, so a loop is normally running — but a missing loop must never be
@@ -4276,19 +4290,23 @@ class CopyEngine:
             except RuntimeError:
                 pass
 
-        last = float(getattr(self, "_last_master_balance", 0.0) or 0.0)
+        # THIS master's last good figure. Reading another's would size a
+        # follower against a balance from a different desk entirely: JD algo4
+        # sat at 8509 and Dhwani at 5243 on 2026-11-19, so a crossed fallback
+        # would have been ~38% out, silently, on every leg of that event.
+        last = float(self._last_master_balance.get(_mk) or 0.0)
         if last > 0:
             logger.warning(
                 "master balance read as 0 — sizing on the last known good value "
                 "%.2f instead of dropping the event", last)
-            _alert(f"master balance read 0; used last known {last:.2f}", "mbal:stale")
+            _alert(f"master balance read 0; used last known {last:.2f}", f"mbal:stale:{_mk}")
             return last
         logger.error(
             "master balance read as 0 and there is no cached value — sizing will "
             "be refused for this event"
         )
         _alert("master balance read 0 and no cached value — events cannot be sized",
-               "mbal:none")
+               f"mbal:none:{_mk}")
         return 0.0
 
     async def _claim_escalation(self, order_id) -> bool:

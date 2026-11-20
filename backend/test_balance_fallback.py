@@ -58,9 +58,17 @@ def check(name, got, want):
         FAILURES.append(name)
 
 
+def _cached(eng):
+    """The one remembered balance, whichever master it belongs to."""
+    vals = list(eng._last_master_balance.values())
+    return vals[0] if len(vals) == 1 else eng._last_master_balance
+
+
 def engine():
     eng = CopyEngine.__new__(CopyEngine)
-    eng._last_master_balance = 0.0
+    # Per master since 2026-11-20 -- one slot handed one desk's balance to
+    # another's ratio. See test_balance_isolation.py.
+    eng._last_master_balance = {}
     eng.risk_engine = RiskEngine()
     return eng
 
@@ -69,7 +77,7 @@ def test_a_real_balance_is_used_and_remembered():
     print("\n1. a real balance is used, and remembered for later")
     eng = engine()
     check("returns it", eng._master_balance_or_last(7123.59368212, MASTER), 7123.59368212)
-    check("cached", eng._last_master_balance, 7123.59368212)
+    check("cached under this master", _cached(eng), 7123.59368212)
 
 
 def test_a_transient_zero_falls_back():
@@ -78,7 +86,7 @@ def test_a_transient_zero_falls_back():
     eng._master_balance_or_last(7123.59368212, MASTER)      # a good read first
     check("substitutes", eng._master_balance_or_last(0.0, MASTER), 7123.59368212)
     check("and again on a repeat", eng._master_balance_or_last(0, MASTER), 7123.59368212)
-    check("cache not clobbered by the zero", eng._last_master_balance, 7123.59368212)
+    check("cache not clobbered by the zero", _cached(eng), 7123.59368212)
 
 
 def test_the_event_is_now_sizeable():
