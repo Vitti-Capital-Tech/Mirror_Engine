@@ -97,6 +97,30 @@ def plain(text):
 # --- the message itself -----------------------------------------------------
 
 
+def test_the_three_failure_kinds_are_told_apart():
+    """An order the exchange rejected, the engine crashing on its own
+    correction, and the engine giving up are three different problems. They all
+    read "Mirror Failed" until 2026-11-20, so nobody could triage them."""
+    print("\n0. three failures, three headings")
+    install(dedupe=False)
+
+    async def run():
+        await tg.notify_fail(FOLLOWER, LEG, "sell", 2859, "insufficient_margin")
+        await tg.notify_fail(FOLLOWER, LEG, "reconcile", 0,
+                             "the close/trim check itself crashed (KeyError) - "
+                             "this leg was NOT corrected")
+        await tg.notify_fail(FOLLOWER, LEG, "sell", 3200,
+                             "placed 3 times and the order vanished each time "
+                             "without filling - not re-placing")
+
+    asyncio.run(run())
+    heads = [plain(t).splitlines()[0] for t in SENT]
+    check("rejected order", "Mirror Failed" in heads[0], True)
+    check("engine crash", "Engine error" in heads[1], True)
+    check("gave up retrying", "Stopped retrying" in heads[2], True)
+    check("three distinct headings", len(set(heads)), 3)
+
+
 def test_each_kind_reads_as_english():
     """A kind nobody can read is a kind nobody acts on. These four are exactly
     the four the desk asked for."""
@@ -303,7 +327,8 @@ def test_a_recovered_resting_order_is_announced():
 
 
 if __name__ == "__main__":
-    for t in (test_each_kind_reads_as_english,
+    for t in (test_the_three_failure_kinds_are_told_apart,
+              test_each_kind_reads_as_english,
               test_it_promises_nothing,
               test_the_numbers_are_all_three,
               test_it_goes_to_the_right_desk,

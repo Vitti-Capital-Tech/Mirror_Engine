@@ -371,7 +371,21 @@ async def notify_fail(account: str, symbol: str, side: str, lots, reason: str,
     else:
         # Only a real failure is worth remembering as the cause of a later fix.
         await _remember_failure(account, symbol, reason)
-        text = (f"⚠️ <b>Mirror Failed</b> · {account}\n"
+        # THREE DIFFERENT PROBLEMS, THREE DIFFERENT HEADINGS. These all read
+        # "Mirror Failed" until 2026-11-20, which flattened an order the
+        # exchange rejected, the engine crashing on its own correction, and
+        # the engine deliberately giving up into one indistinguishable
+        # alert. The first is routine; the second means the code is broken;
+        # the third means nothing more happens until a person looks. Nobody
+        # can triage what all looks the same.
+        _low = (reason or "").lower()
+        if "itself crashed" in _low:
+            _head = "🔥 <b>Engine error</b>"
+        elif "not re-placing" in _low or "vanished each time" in _low:
+            _head = "🛑 <b>Stopped retrying</b>"
+        else:
+            _head = "⚠️ <b>Mirror Failed</b>"
+        text = (f"{_head} · {account}\n"
                 f"<code>{symbol}</code>\n"
                 f"{str(side).title()}{lot_str} — {reason}")
     await send_message(text, account=account)
