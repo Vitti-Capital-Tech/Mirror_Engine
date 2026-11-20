@@ -795,6 +795,65 @@ class CopyEngine:
             logger.warning(f"Signed position fetch failed for {symbol}: {e}")
         return 0.0
 
+    async def _live_signed_fresh(self, client, symbol: str):
+        """The follower's signed position, read FRESH, with failure DISTINCT
+        from flat.
+
+        _position_size_signed returns 0.0 both when the follower is flat and
+        when the read threw, which is fine for sizing a new order and wrong for
+        this: "flat" tells a correction to stand down, so a failed read would
+        look like permission to skip — or, in the other direction, like
+        permission to act on nothing.
+
+        Deliberately uncached. The engine keeps a 3s position cache for the
+        ladder bursts, and reading a cached number here would defeat the entire
+        point of re-reading.
+        """
+        try:
+            for p in await client.get_positions():
+                if (p.get("product_symbol") or p.get("symbol")) == symbol:
+                    return float(p.get("size") or 0)
+            return 0.0
+        except Exception as e:
+            logger.warning(f"fresh position read failed for {symbol}: {e}")
+            return None
+
+    @staticmethod
+    def _still_worth_acting(planned: int, live_signed, want_signed, target=None,
+                            adding: bool = False):
+        """Re-size a correction against the position as it is RIGHT NOW.
+
+        A reconcile pass reads the follower's book at the top and then spends
+        several exchange round trips deciding — checking the master's working
+        orders, looking up missed exits, cancelling the follower's own stuck
+        closes — before it finally places anything. The size it places is the
+        one it computed before all of that. If the leg moved in between, the
+        correction is sized against a position that no longer exists.
+
+        reduce_only caps the damage on a trim or a close: the follower can
+        never be flipped to the other side. It does not stop an over-trim when
+        the leg has already shrunk, and it does not apply at all to a top-up,
+        which adds.
+
+        Returns the quantity to send, or 0 to stand down. Always the SMALLER of
+        what was planned and what is now true: under-correcting is picked up by
+        the next pass ten seconds later, over-correcting is a real trade in the
+        wrong direction.
+        """
+        if live_signed is None:
+            return 0                      # unreadable — never act on an unknown
+        if live_signed == 0:
+            return 0                      # leg already gone
+        if (live_signed > 0) != (want_signed > 0):
+            return 0                      # flipped side; this correction is stale
+        now_held = int(abs(live_signed))
+        if target is None:                # full close: cover what is actually held
+            return max(0, min(int(planned), now_held))
+        gap = (int(target) - now_held) if adding else (now_held - int(target))
+        if gap < 1:
+            return 0                      # settled itself while we were deciding
+        return max(0, min(int(planned), gap))
+
     async def _place_order_with_retry(self, client, attempts: int = 2, delay: float = 5.0, **kwargs):
         """Place an order, retrying TRANSIENT failures (network / 5xx / 429 /
         timeout) after `delay` seconds — the teammate's "wait 5s then retry"
@@ -2045,6 +2104,21 @@ class CopyEngine:
                                 self._recon_open_ts[(fid, sym)] = now
                                 side = "buy" if fsz > 0 else "sell"
                                 try:
+                                    # LAST LOOK, and this is the one that matters
+                                    # most: a top-up ADDS, so reduce_only is not
+                                    # there to cap it. Sized against a leg that
+                                    # has already filled, it opens exposure
+                                    # nobody asked for.
+                                    _fresh = await self._live_signed_fresh(client, sym)
+                                    short_by = self._still_worth_acting(
+                                        short_by, _fresh, fsz, target=target, adding=True)
+                                    if short_by < 1:
+                                        logger.info(
+                                            f"reconcile: not topping up {fol.get('name')} {sym} "
+                                            f"after all — the leg moved while we decided "
+                                            f"(now {_fresh})"
+                                        )
+                                        continue
                                     await client.place_order(
                                         symbol=sym, side=side, size=int(short_by),
                                         order_type="market_order", reduce_only=False,
@@ -2148,6 +2222,19 @@ class CopyEngine:
                                             f"reconcile: cancelled stuck close {o.get('id')} on {sym} "
                                             f"for {fol.get('name')} before trimming (never filled)"
                                         )
+                                # LAST LOOK. `excess` was computed at the top of
+                                # this pass; the master's book check, the missed-
+                                # exit lookup and the cancels above are all
+                                # exchange round trips since then.
+                                _fresh = await self._live_signed_fresh(client, sym)
+                                excess = self._still_worth_acting(
+                                    excess, _fresh, fsz, target=target)
+                                if excess < 1:
+                                    logger.info(
+                                        f"reconcile: not trimming {fol.get('name')} {sym} after all "
+                                        f"— the leg moved while we decided (now {_fresh})"
+                                    )
+                                    continue
                                 await client.place_order(
                                     symbol=sym, side=side, size=int(excess),
                                     order_type="market_order", reduce_only=True,
@@ -2224,8 +2311,20 @@ class CopyEngine:
                             continue  # first sighting — confirm next pass before acting
                         side = "sell" if fsz > 0 else "buy"
                         try:
+                            # LAST LOOK, same reason as the trim: fsz is this
+                            # pass's opening read and the hands-off check, the
+                            # exit classification and the stale-orphan lookup
+                            # have all gone to the exchange since.
+                            _fresh = await self._live_signed_fresh(client, sym)
+                            _qty = self._still_worth_acting(int(abs(fsz)), _fresh, fsz)
+                            if _qty < 1:
+                                logger.info(
+                                    f"reconcile: not closing {fol.get('name')} {sym} after all "
+                                    f"— the leg moved while we decided (now {_fresh})"
+                                )
+                                continue
                             await client.place_order(
-                                symbol=sym, side=side, size=int(abs(fsz)),
+                                symbol=sym, side=side, size=_qty,
                                 order_type="market_order", reduce_only=True,
                             )
                             why = "manual master close orphan" if msz == 0 else "wrong-side desync"

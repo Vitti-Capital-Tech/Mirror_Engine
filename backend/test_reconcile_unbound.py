@@ -68,6 +68,10 @@ BASELINE = {
         # compiler flags them only because a loop may not run at all.
         "_age", "_e", "_held", "_kind", "_live", "_msz", "_name", "_nm",
         "_now", "_sk", "_target",
+        # `key` and `_qty` are each assigned a few lines above their reads
+        # inside the same branch. They became unprovable when the
+        # last-look re-read added another `continue` to those branches.
+        "key", "_qty",
         # `except ... as _leg_err` -- Python deletes the name at the end of the
         # handler, so the compiler cannot prove it bound. Only ever read inside
         # the handler that binds it.
