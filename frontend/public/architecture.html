@@ -145,6 +145,7 @@ td.nil { font-family: var(--mono); color: var(--fg-faint); }
 .tag.f { background: var(--accent-bg); color: var(--accent); }
 .open .t { font-weight: 600; }
 .open .d { color: var(--fg-mute); font-size: 14px; }
+.tick { color: var(--accent); font-weight: 600; }
 
 footer {
   padding-block: 26px 44px; border-top: 1px solid var(--line);
@@ -379,7 +380,49 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
 </section>
 
 <section>
-  <h2><span class="num">06</span>Where it is weak</h2>
+  <h2><span class="num">06</span>What we tested</h2>
+
+  <p class="lead">A full session run against a fake exchange that actually keeps state — positions, an order book, reduce-only rules, edits, cancels — with the real engine driving it.</p>
+
+  <div class="slab">
+    <div class="slab-h">End to end · 19 steps · 44 checks</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>#</th><th>What was tested</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1</td><td class="w">Master opens a position</td><td class="w"><span class="tick">&#10003;</span> Opened at its ratio share, and not on the first sighting</td></tr>
+          <tr><td class="n">2</td><td class="w">Master rests a limit order</td><td class="w"><span class="tick">&#10003;</span> Mirrored once, sized to the ratio</td></tr>
+          <tr><td class="n">3</td><td class="w">The same order event arrives again</td><td class="w"><span class="tick">&#10003;</span> No duplicate</td></tr>
+          <tr><td class="n">4</td><td class="w">Master edits the order</td><td class="w"><span class="tick">&#10003;</span> The follower's order was edited, not re-placed</td></tr>
+          <tr><td class="n">5</td><td class="w">Master cancels</td><td class="w"><span class="tick">&#10003;</span> The follower's order went too</td></tr>
+          <tr><td class="n">6</td><td class="w">A stale re-mirror of the dead order</td><td class="w"><span class="tick">&#10003;</span> Refused — it did not come back</td></tr>
+          <tr><td class="n">7</td><td class="w">Follower drifts under target</td><td class="w"><span class="tick">&#10003;</span> Topped up to the ratio</td></tr>
+          <tr><td class="n">8</td><td class="w">Follower over target</td><td class="w"><span class="tick">&#10003;</span> Trimmed to the ratio</td></tr>
+          <tr><td class="n">9</td><td class="w">Master is unwinding his own leg</td><td class="w"><span class="tick">&#10003;</span> Held — nothing sent</td></tr>
+          <tr><td class="n">10</td><td class="w">Follower already fully covered</td><td class="w"><span class="tick">&#10003;</span> No second close; nothing thrown away by the exchange</td></tr>
+          <tr><td class="n">11</td><td class="w">Master places SL/TP</td><td class="w"><span class="tick">&#10003;</span> Mirrored, sized to the follower's own position, offset from the master's trigger</td></tr>
+          <tr><td class="n">12</td><td class="w">Master's stop fires</td><td class="w"><span class="tick">&#10003;</span> Nothing forced — the follower's own stop is left to run</td></tr>
+          <tr><td class="n">13</td><td class="w">Master goes flat, follower unprotected</td><td class="w"><span class="tick">&#10003;</span> Closed, on the second sighting not the first</td></tr>
+          <tr><td class="n">14</td><td class="w">Two masters, one owner, same strike, interleaved</td><td class="w"><span class="tick">&#10003;</span> Each follower sized by its own master's balance; both acted</td></tr>
+          <tr><td class="n">15</td><td class="w">One desk's balance read fails</td><td class="w"><span class="tick">&#10003;</span> Falls back to its own last value, never the other desk's</td></tr>
+          <tr><td class="n">16</td><td class="w">Mirror and reconciler fire together on one leg</td><td class="w"><span class="tick">&#10003;</span> Follower never ended above its share; at most one resting mirror</td></tr>
+          <tr><td class="n">17</td><td class="w">The leg moves while the sweep is deciding</td><td class="w"><span class="tick">&#10003;</span> Trimmed to the target, not past it</td></tr>
+          <tr><td class="n">18</td><td class="w">A position read fails</td><td class="w"><span class="tick">&#10003;</span> Raises instead of returning an empty book, so the pass is skipped rather than reading as “master is flat”</td></tr>
+          <tr><td class="n">19</td><td class="w">Both dangerous reads use the strict mode</td><td class="w"><span class="tick">&#10003;</span> Confirmed</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p><strong>46 test files, 1,381 checks across the whole suite — all passing.</strong></p>
+
+  <div class="note crit">
+    <p><strong>Not verified.</strong> None of this has run in live trading. Tests passing is not the same as working, and the accounts have been paused since 20 November.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">07</span>Where it is weak</h2>
 
   <div class="open">
     <div>
