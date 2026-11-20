@@ -24,6 +24,7 @@ from app.services import telegram_client as tg
 
 FAILURES = []
 SENT = []
+ROUTED = []
 
 
 def check(name, got, want):
@@ -39,13 +40,19 @@ def check_true(name, cond, detail=""):
         FAILURES.append(name)
 
 
-async def _fake_send(text: str) -> bool:
+async def _fake_send(text: str, account=None, account_id=None) -> bool:
+    # Mirrors the real send_message signature. It grew `account`/`account_id`
+    # when alerts started routing per desk (Pratik's go to his own group, not
+    # the main one); a stub that did not grow with it failed every notify test
+    # with a TypeError that said nothing about routing.
     SENT.append(text)
+    ROUTED.append((account, account_id))
     return True
 
 
 def reset():
     SENT.clear()
+    ROUTED.clear()
     tg._seen.clear()
     tg._redis = False          # force the in-memory paths, no Redis
     tg._last_fail.clear()

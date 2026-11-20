@@ -224,6 +224,16 @@ def _order_lookup(orders):
     return _get
 
 
+def _master_key(eng, event):
+    """The bucket _reconcile_positions will use for this event.
+
+    Derived the same way the engine derives it, so seeding a two-pass memory in
+    a test cannot drift from where the engine looks for it.
+    """
+    return str((event or {}).get("master_account_id")
+               or (event or {}).get("owner_id") or "")
+
+
 async def passes(eng, event, n=2):
     for _ in range(n):
         await eng._reconcile_positions(event)
@@ -390,8 +400,13 @@ async def main():
     #          happens. Seed a DIFFERENT previous observation and check it still acts,
     #          on the SMALLER of the two so a wobble can only under-open.
     eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
-    eng._recon_topup_prev = {("f1", SYM): 5}      # last pass saw a bigger shortfall
-    await eng._reconcile_positions(event)          # this pass sees 2
+    # Seeded through the engine's own key, not a hand-written one: these
+    # two-pass memories became per-MASTER dicts on 2026-11-19 (one master's
+    # pass used to wipe another's), and a test that still seeds the old flat
+    # shape silently stops exercising the latch it is here to protect.
+    _mk = _master_key(eng, event)
+    eng._recon_topup_prev = {_mk: {("f1", SYM): 5}}   # last pass saw a bigger shortfall
+    await eng._reconcile_positions(event)             # this pass sees 2
     ok &= check("confirmation latches despite a changed shortfall",
                 len(client.placed) == 1, f"placed={client.placed}")
     if client.placed:
