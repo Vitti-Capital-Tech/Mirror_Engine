@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Mirror Engine Internals</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: a single reading column with full-bleed section bands; data lives in
+   bordered slabs that break out of the column on wide screens. */
+:root {
+  --bg:        #f7f8f9;
+  --surface:   #ffffff;
+  --slab:      #eef1f3;
+  --line:      #d4dade;
+  --line-soft: #e4e9ec;
+  --fg:        #12181c;
+  --fg-mute:   #596670;
+  --fg-faint:  #7d8a93;
+  --accent:    #0b6b57;
+  --accent-bg: #e2f0ec;
+  --warn:      #9a6508;
+  --warn-bg:   #f7eeda;
+  --crit:      #a3301f;
+  --crit-bg:   #f8e6e2;
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:        #0b0e11;
+    --surface:   #11161a;
+    --slab:      #161c21;
+    --line:      #273138;
+    --line-soft: #1d252b;
+    --fg:        #e6ecef;
+    --fg-mute:   #94a3ad;
+    --fg-faint:  #6e7d87;
+    --accent:    #3fcaa5;
+    --accent-bg: #10302a;
+    --warn:      #e0ab52;
+    --warn-bg:   #332710;
+    --crit:      #f08a76;
+    --crit-bg:   #361a15;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:        #0b0e11;
+  --surface:   #11161a;
+  --slab:      #161c21;
+  --line:      #273138;
+  --line-soft: #1d252b;
+  --fg:        #e6ecef;
+  --fg-mute:   #94a3ad;
+  --fg-faint:  #6e7d87;
+  --accent:    #3fcaa5;
+  --accent-bg: #10302a;
+  --warn:      #e0ab52;
+  --warn-bg:   #332710;
+  --crit:      #f08a76;
+  --crit-bg:   #361a15;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 920px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0;
+}
+
+/* ---- masthead ---- */
+.mast { padding-block: 48px 36px; border-bottom: 1px solid var(--line); }
+.kicker {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 14px;
+}
+h1 {
+  font-size: clamp(30px, 6vw, 46px);
+  line-height: 1.08;
+  letter-spacing: -.022em;
+  font-weight: 600;
+  margin: 0 0 14px;
+  text-wrap: balance;
+}
+.standfirst {
+  font-size: clamp(16px, 2.4vw, 18px);
+  color: var(--fg-mute);
+  margin: 0;
+  max-width: 62ch;
+}
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  background: var(--line-soft);
+  border: 1px solid var(--line-soft);
+  margin-top: 30px;
+}
+.fact { background: var(--surface); padding: 14px 16px; }
+.fact dt {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  margin: 0 0 5px;
+}
+.fact dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- sections ---- */
+section { padding-block: 44px; border-bottom: 1px solid var(--line-soft); }
+section:last-of-type { border-bottom: 0; }
+h2 {
+  font-size: clamp(21px, 3.6vw, 27px);
+  letter-spacing: -.015em;
+  font-weight: 600;
+  margin: 0 0 6px;
+  text-wrap: balance;
+}
+h2 .num {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  margin-right: 10px;
+  vertical-align: 3px;
+}
+.lede { color: var(--fg-mute); margin: 0 0 26px; max-width: 64ch; }
+h3 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 28px 0 8px;
+  letter-spacing: -.005em;
+}
+p { margin: 0 0 14px; max-width: 68ch; }
+p:last-child { margin-bottom: 0; }
+code {
+  font-family: var(--mono);
+  font-size: .88em;
+  background: var(--slab);
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+strong { font-weight: 600; }
+
+/* ---- step rail ---- */
+.rail { display: grid; gap: 0; margin-top: 8px; }
+.step {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  gap: 16px;
+  padding-block: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+.step:last-child { border-bottom: 1px solid var(--line-soft); }
+.step-n {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-bg);
+  height: 26px;
+  width: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-variant-numeric: tabular-nums;
+}
+.step-b { min-width: 0; }
+.step-t { font-weight: 600; margin: 2px 0 4px; }
+.step-d { color: var(--fg-mute); font-size: 15px; margin: 0; }
+.step-d + .step-d { margin-top: 8px; }
+
+/* ---- data slab ---- */
+.slab {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  margin: 22px 0;
+}
+.slab-h {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--slab);
+}
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td {
+  text-align: left;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: 0; }
+th {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  font-weight: 500;
+  white-space: nowrap;
+}
+td.k { font-family: var(--mono); white-space: nowrap; font-weight: 500; }
+td.n {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-weight: 500;
+}
+td.w { color: var(--fg-mute); min-width: 240px; }
+
+/* ---- correction cards ---- */
+.corr {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+  gap: 1px;
+  background: var(--line-soft);
+  border: 1px solid var(--line-soft);
+  margin: 22px 0;
+}
+.corr > div { background: var(--surface); padding: 16px; }
+.corr dt {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  margin: 0 0 8px;
+  color: var(--accent);
+}
+.corr dd { margin: 0; font-size: 14.5px; color: var(--fg-mute); }
+.corr .when {
+  display: block;
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-faint);
+}
+
+/* ---- callouts ---- */
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-bg);
+  padding: 14px 16px;
+  margin: 22px 0;
+  font-size: 15px;
+}
+.note.warn { border-left-color: var(--warn); background: var(--warn-bg); }
+.note.crit { border-left-color: var(--crit); background: var(--crit-bg); }
+.note p { margin: 0; max-width: none; }
+.note p + p { margin-top: 10px; }
+.note-h {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  display: block;
+  margin-bottom: 7px;
+  opacity: .85;
+}
+
+/* ---- math block ---- */
+.math {
+  font-family: var(--mono);
+  font-size: 14px;
+  background: var(--slab);
+  border: 1px solid var(--line-soft);
+  padding: 16px;
+  margin: 18px 0;
+  line-height: 1.9;
+  overflow-x: auto;
+  font-variant-numeric: tabular-nums;
+}
+.math .c { color: var(--fg-faint); }
+.math .hl { color: var(--accent); font-weight: 600; }
+
+/* ---- timeline svg ---- */
+.tl { margin: 22px 0; }
+.tl svg { width: 100%; height: auto; display: block; }
+
+/* ---- open items ---- */
+.open { display: grid; gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); }
+.open > div { background: var(--surface); padding: 16px; display: grid; grid-template-columns: 1fr; gap: 6px; }
+.tag {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 2px;
+  justify-self: start;
+}
+.tag.open-t { background: var(--warn-bg); color: var(--warn); }
+.tag.fixed-t { background: var(--accent-bg); color: var(--accent); }
+.open .t { font-weight: 600; }
+.open .d { color: var(--fg-mute); font-size: 14.5px; }
+
+footer {
+  padding-block: 32px 48px;
+  border-top: 1px solid var(--line);
+  color: var(--fg-faint);
+  font-size: 13px;
+  font-family: var(--mono);
+}
+</style>
+<style>
+  html { color-scheme: light; }
+  body { margin: 0; }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="mast">
+  <p class="kicker">Mirror Engine · Delta Exchange India</p>
+  <h1>How the copier actually works</h1>
+  <p class="standfirst">A master account trades. Every follower in its group gets the same trade, scaled to its own balance, within a second. A second system then checks the result every ten seconds and fixes what the first one got wrong. This is what both of them do, and the numbers they run on.</p>
+
+  <dl class="facts">
+    <div class="fact"><dt>Order mirror</dt><dd>&lt; 1s typical</dd></div>
+    <div class="fact"><dt>Position check</dt><dd>every 10s</dd></div>
+    <div class="fact"><dt>Order check</dt><dd>every 30s</dd></div>
+    <div class="fact"><dt>Sizing</dt><dd>balance ratio</dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2><span class="num">01</span>The pieces</h2>
+  <p class="lede">Four processes, one box. Everything except the database and the Vercel copy of the UI runs on a single EC2 instance under Docker Compose.</p>
+
+  <div class="slab">
+    <div class="slab-h">Running services</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Service</th><th>What it is</th><th>Port</th><th>Job</th></tr></thead>
+        <tbody>
+          <tr><td class="k">backend</td><td>FastAPI / uvicorn</td><td class="n">8000</td><td class="w">Websocket listeners, copy engine, reconcilers, REST API</td></tr>
+          <tr><td class="k">redis</td><td>redis:7-alpine</td><td class="n">6379</td><td class="w">Order mapping, idempotency guards, two-pass state, alert throttles</td></tr>
+          <tr><td class="k">frontend</td><td>Next.js</td><td class="n">3000</td><td class="w">Dashboard — also deployed on Vercel</td></tr>
+          <tr><td class="k">supabase</td><td>Postgres (hosted)</td><td class="n">—</td><td class="w">Accounts, positions, orders, alerts, auth</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h3>The account model</h3>
+  <p>An <strong>owner</strong> holds one or more <strong>groups</strong>. A group is one master account and the followers attached to it. One owner can run several masters at once, which matters more than it sounds: most of the engine's in-memory state has to be keyed per master, not per owner, or two desks trading the same contract overwrite each other's answers.</p>
+  <p>Each account carries its own API key pair, its own status (<code>active</code> / <code>paused</code>), and its own sizing settings. A new account is created paused.</p>
+</section>
+
+<section>
+  <h2><span class="num">02</span>The live copy path</h2>
+  <p class="lede">What happens between the master's fill and the follower's order. This path is event-driven — no polling — and is the one that has to be fast.</p>
+
+  <div class="rail">
+    <div class="step">
+      <div class="step-n">1</div>
+      <div class="step-b">
+        <p class="step-t">Master's websocket delivers the event</p>
+        <p class="step-d">One authenticated Delta websocket per master, subscribed to <code>orders</code> and <code>positions</code>. On connect it replays a snapshot of everything currently resting and held, so a restart doesn't lose the book.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">2</div>
+      <div class="step-b">
+        <p class="step-t">The engine sizes it for each follower</p>
+        <p class="step-d">The master's quantity is converted to each follower's own quantity. Section 03 covers the arithmetic. If the ratio cannot be computed, the leg is skipped rather than guessed.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">3</div>
+      <div class="step-b">
+        <p class="step-t">Four risk checks run locally</p>
+        <p class="step-d">Account is <code>active</code>; circuit breaker not tripped; quantity is positive; quantity within <code>max_position_size</code>. A refusal here never reaches the exchange, so there is no rejection for anyone to see — which is why a refusal now sends its own alert.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">4</div>
+      <div class="step-b">
+        <p class="step-t">Idempotency guard</p>
+        <p class="step-d">One Redis read answers whether this master order is already mirrored to this follower. The same resting order arrives repeatedly — on every websocket update and on every 30-second order sweep — so this guard is what stops duplicates across all paths.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">5</div>
+      <div class="step-b">
+        <p class="step-t">Order goes out, mapping is written</p>
+        <p class="step-d"><code>ordermap:{master_order_id}</code> records which follower order belongs to which master order. Everything downstream — cancels, edits, exits, reconciliation — depends on that mapping existing.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">6</div>
+      <div class="step-b">
+        <p class="step-t">Confirm, then escalate if needed</p>
+        <p class="step-d">After a 3-second settle the engine re-reads the fill. A mirrored <em>limit</em> order that still hasn't filled after 5 seconds — checked twice — is escalated to a market order, so the follower doesn't sit out a move the master is already in.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">7</div>
+      <div class="step-b">
+        <p class="step-t">Protection is mirrored with a jitter</p>
+        <p class="step-d">The master's SL/TP is copied to each follower, offset by 50 price units by default (~0.07% on BTC). Identical triggers would all fire in the same instant against the same book; the offset spreads them.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">03</span>Sizing: the balance ratio</h2>
+  <p class="lede">Four allocation modes exist. The desk runs <code>auto_ratio</code> on every live group, so that is the one that matters.</p>
+
+  <div class="math">
+<span class="c"># auto_ratio — the mode in production</span>
+ratio = follower_balance / master_balance
+qty   = master_quantity &times; ratio
+
+<span class="c"># JD group, as logged on 2026-11-19 22:05 UTC</span>
+follower_bal = 7595.09
+master_bal   = 8509.61
+ratio        = <span class="hl">0.892531</span>
+master 800 lots  &rarr;  follower <span class="hl">715</span> lots
+  </div>
+
+  <h3>Two decisions worth knowing</h3>
+  <p><strong>It uses total balance, not free margin.</strong> Free margin shrinks as positions lock it up and grows as they close, so a ratio built on it swings with the book. On 2026-08-03 the same unchanged positions read "expected 22" at one moment and "expected 30" half an hour later — a 30% move that fired four false mismatch alerts. Total balance only moves when someone actually deposits or withdraws.</p>
+  <p><strong>An unreadable balance returns zero, never 1:1.</strong> On 2026-08-02 a master's balance read as <code>0.0</code> five times in one day. A 1:1 fallback would have computed a 610-lot target for a 70 USD account. Returning zero makes the caller skip; the reconciler retries once balances read again. A missed copy is recoverable, a 100&times; order is not.</p>
+
+  <div class="slab">
+    <div class="slab-h">The other three modes</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Mode</th><th>Formula</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td class="k">fixed</td><td class="w">A constant lot count, whatever the master did</td><td class="w">Available</td></tr>
+          <tr><td class="k">multiplier</td><td class="w"><code>master_qty &times; value</code></td><td class="w">Available</td></tr>
+          <tr><td class="k">capital_pct</td><td class="w">Budget &divide; notional per lot</td><td class="w">Removed from the UI — its sizing was wrong</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">04</span>The reconciler</h2>
+  <p class="lede">The live path is fast and can miss things: a dropped websocket event, a rejected order, a fill that lands while the backend is restarting. The reconciler is the safety net that compares reality against intent and fixes the difference.</p>
+
+  <p>Two independent sweeps run per master. The <strong>order sweep</strong> every 30 seconds re-mirrors any resting limit order the follower is missing. The <strong>position sweep</strong> every 10 seconds compares held positions and applies one of four corrections per leg.</p>
+
+  <dl class="corr">
+    <div>
+      <dt>CLOSE</dt>
+      <dd>Master is flat on a symbol the follower still holds.
+      <span class="when">Market close, reduce-only</span></dd>
+    </div>
+    <div>
+      <dt>OPEN</dt>
+      <dd>Master holds a leg the follower has nothing on — the live copy never landed.
+      <span class="when">Only if the master's fill is &lt; 180s old</span></dd>
+    </div>
+    <div>
+      <dt>TRIM</dt>
+      <dd>Right side, too much size. Cut back to the ratio target.
+      <span class="when">Deadband: 5% or 1 lot, whichever is larger</span></dd>
+    </div>
+    <div>
+      <dt>TOP-UP</dt>
+      <dd>Right side, too little size. Buy the shortfall.
+      <span class="when">Acts on the smaller of two observations</span></dd>
+    </div>
+  </dl>
+
+  <h3>Nothing acts on a first sighting</h3>
+  <p>A book read mid-flight — an order half filled, a position still settling — looks wrong for a moment and then isn't. So every correction must see the same discrepancy on two consecutive passes before acting. At a 10-second interval that puts a real correction about 20 seconds after the first sighting.</p>
+  <p>That two-pass memory is held <strong>per master</strong>. It used to be a single shared set, which worked for as long as there was only ever one active master. The moment a second came online, each master's pass overwrote the other's memory, nothing was ever confirmed twice, and nothing was ever corrected.</p>
+
+  <div class="note">
+    <span class="note-h">Per-leg isolation · added 2026-11-20</span>
+    <p>All four corrections used to sit inside one try/except per follower. Whichever leg raised first cancelled every other leg — and the OPEN sweep below it. Each leg now has its own guard, and a leg that crashes sends its own Telegram alert saying it was not corrected.</p>
+  </div>
+
+  <h3>When a discrepancy won't settle</h3>
+  <p>A discrepancy that is still there after <strong>60 seconds</strong> is escalated to Telegram. Below that threshold the reconciler is still working normally and stays quiet — an alert on every pass would be a stream nobody reads. Settling clears the clock, so a later recurrence is timed from scratch rather than alerting instantly off an old one.</p>
+</section>
+
+<section>
+  <h2><span class="num">05</span>The clock</h2>
+  <p class="lede">Every timing constant the engine runs on. All are environment-overridable; these are the deployed defaults.</p>
+
+  <div class="tl">
+    <svg viewBox="0 0 880 188" role="img" aria-label="Timeline of engine intervals from 3 seconds to 180 seconds">
+      <defs>
+        <style>
+          .ax   { stroke: var(--line); stroke-width: 1; }
+          .tick { stroke: var(--line); stroke-width: 1; }
+          .lbl  { fill: var(--fg-faint); font-family: var(--mono); font-size: 11px; }
+          .bar  { fill: var(--accent-bg); stroke: var(--accent); stroke-width: 1; }
+          .barw { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1; }
+          .btxt { fill: var(--fg); font-family: var(--mono); font-size: 11.5px; font-weight: 500; }
+        </style>
+      </defs>
+
+      <!-- axis -->
+      <line class="ax" x1="60" y1="156" x2="845" y2="156"/>
+      <g class="tick">
+        <line x1="60"  y1="156" x2="60"  y2="162"/>
+        <line x1="120" y1="156" x2="120" y2="162"/>
+        <line x1="190" y1="156" x2="190" y2="162"/>
+        <line x1="320" y1="156" x2="320" y2="162"/>
+        <line x1="530" y1="156" x2="530" y2="162"/>
+        <line x1="845" y1="156" x2="845" y2="162"/>
+      </g>
+      <g class="lbl" text-anchor="middle">
+        <text x="60"  y="178">3s</text>
+        <text x="120" y="178">5s</text>
+        <text x="190" y="178">10s</text>
+        <text x="320" y="178">30s</text>
+        <text x="530" y="178">60s</text>
+        <text x="828" y="178">180s</text>
+      </g>
+
+      <!-- lanes -->
+      <rect class="bar"  x="60"  y="12"  width="60"  height="22" rx="2"/>
+      <text class="btxt" x="128" y="27">confirm settle · 3s</text>
+
+      <rect class="bar"  x="60"  y="42"  width="60"  height="22" rx="2"/>
+      <text class="btxt" x="128" y="57">escalate unfilled limit · 5s &times;2</text>
+
+      <rect class="bar"  x="60"  y="72"  width="130" height="22" rx="2"/>
+      <text class="btxt" x="198" y="87">position sweep · every 10s</text>
+
+      <rect class="bar"  x="60"  y="102" width="260" height="22" rx="2"/>
+      <text class="btxt" x="328" y="117">order sweep · every 30s</text>
+
+      <rect class="barw" x="60"  y="132" width="470" height="18" rx="2"/>
+      <text class="btxt" x="538" y="146">stuck &rarr; alert · 60s</text>
+    </svg>
+  </div>
+
+  <div class="slab">
+    <div class="slab-h">Constants, as deployed</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Name</th><th>Value</th><th>What it governs</th></tr></thead>
+        <tbody>
+          <tr><td class="k">POSITION_RECONCILE_SEC</td><td class="n">10s</td><td class="w">Position sweep interval. Was 15s; 5s was tried and reverted — order-mirror latency went p90 0.03s&rarr;0.22s and max 1.34s&rarr;5.35s, and 5.35s touches Delta's signature window.</td></tr>
+          <tr><td class="k">RECONCILE_INTERVAL_SEC</td><td class="n">30s</td><td class="w">Order sweep interval — re-mirrors resting limit orders.</td></tr>
+          <tr><td class="k">ESCALATE_WAIT_SEC</td><td class="n">5s</td><td class="w">Unfilled mirrored limit, checked twice, then forced to market.</td></tr>
+          <tr><td class="k">ORDER_CONFIRM_SETTLE_SEC</td><td class="n">3s</td><td class="w">Wait before re-reading a fill, and re-reading the order map.</td></tr>
+          <tr><td class="k">STUCK_AFTER_SEC</td><td class="n">60s</td><td class="w">A discrepancy older than this is escalated to Telegram.</td></tr>
+          <tr><td class="k">FRESH_ENTRY_SEC</td><td class="n">180s</td><td class="w">A missed leg older than this is NOT recovered — the price has moved on. It alerts instead.</td></tr>
+          <tr><td class="k">TRIM_SETTLE_SEC</td><td class="n">10s</td><td class="w">Settle window after a trim before re-measuring.</td></tr>
+          <tr><td class="k">STALE_ORPHAN_SEC</td><td class="n">60s</td><td class="w">How long to let a follower's own stop close a leg before treating it as an orphan.</td></tr>
+          <tr><td class="k">STALE_EVENT_RECHECK_SEC</td><td class="n">3s</td><td class="w">An event older than this is re-checked against the exchange before acting.</td></tr>
+          <tr><td class="k">RECON_SIZE_TOLERANCE_PCT</td><td class="n">5%</td><td class="w">Size deadband. A 1-lot gap on a 30-lot leg is noise; acting on it churns.</td></tr>
+          <tr><td class="k">DEFAULT_TP_SL_OFFSET</td><td class="n">50.0</td><td class="w">Follower SL/TP distance from the master's, in price units.</td></tr>
+          <tr><td class="k">ESCALATION_CLAIM_TTL</td><td class="n">120s</td><td class="w">Redis lock so only one worker escalates a given order.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">06</span>What Redis holds</h2>
+  <p class="lede">Redis is not a cache here. It is the engine's working memory, and several guarantees depend on a key being present.</p>
+
+  <div class="slab">
+    <div class="slab-h">Keys and what breaks without them</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Holds</th><th>Protects against</th></tr></thead>
+        <tbody>
+          <tr><td class="k">ordermap:{moid}</td><td class="w">master order &rarr; follower order id</td><td class="w">Duplicate mirrors; orphaned cancels</td></tr>
+          <tr><td class="k">ordersize:{moid}</td><td class="w">master size this mirror reflects</td><td class="w">A resize check firing on every sweep</td></tr>
+          <tr><td class="k">ocancel:{moid}</td><td class="w">tombstone, 10 min</td><td class="w">A cancelled order resurrected by a stale 30s sweep</td></tr>
+          <tr><td class="k">mirrordone:{moid}:{fid}</td><td class="w">this leg is settled</td><td class="w">Needless exchange round trips on every repeat</td></tr>
+          <tr><td class="k">confirmed:{moid}</td><td class="w">confirm-copy result</td><td class="w">Re-confirming the same fill</td></tr>
+          <tr><td class="k">oledger:{moid}</td><td class="w">per-leg outcome: filled / skipped / failed</td><td class="w">"Which legs actually went out?" being unanswerable</td></tr>
+          <tr><td class="k">escalating:{oid}</td><td class="w">lock, 120s</td><td class="w">Two workers escalating one order</td></tr>
+          <tr><td class="k">legerr / recon / drift / stale</td><td class="w">alert throttles</td><td class="w">One fault becoming a Telegram stream</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="note warn">
+    <span class="note-h">Failure stance</span>
+    <p>Where Redis cannot be read, the engine fails <em>toward placing</em> the order. A spurious order can be cancelled; a missed one is a follower that silently stops tracking its master. The one exception is sizing — an unreadable balance always skips.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">07</span>Alerting</h2>
+  <p class="lede">Every alert is routed by owner, so one desk's alerts never land in another desk's group. The rule we work to: an alert fires only when a human has to do something.</p>
+  <p>Alerts name what the engine <strong>failed</strong> to do, not only what it did. That was added after four separate faults in one day were found by people staring at the exchange rather than by us — including a follower that doubled to 5,539 against a target of 2,771, detected eight seconds later, logged thirteen times across two minutes, and never mentioned anywhere.</p>
+
+  <div class="slab">
+    <div class="slab-h">What fires</div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Alert</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Mirror Failed</td><td class="w">A leg did not reach the exchange, or a position is unmatched and unprotected</td></tr>
+          <tr><td class="k">Reconciler corrected</td><td class="w">The engine changed a position by itself — what, by how much, and why</td></tr>
+          <tr><td class="k">Over-punched</td><td class="w">Follower filled above its target</td></tr>
+          <tr><td class="k">Stuck</td><td class="w">A discrepancy the reconciler has not settled in 60s</td></tr>
+          <tr><td class="k">Correction crashed</td><td class="w">The correction itself raised — this leg was not fixed and will not be until someone looks</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">08</span>Where it is weak</h2>
+  <p class="lede">The honest list, as of 20 November 2026.</p>
+
+  <div class="open">
+    <div>
+      <span class="tag open-t">Open · needs a decision</span>
+      <span class="t">Pause and resume has no baseline</span>
+      <span class="d">On resume the engine compares the follower against the master and treats whatever is already on the books as its own, then adjusts it. On 20 Nov 03:49 IST this trimmed 85 lots across two legs that nobody had asked it to touch. The desk needs to choose: leave pre-existing positions alone, or keep correcting the whole book.</span>
+    </div>
+    <div>
+      <span class="tag open-t">Open · being traced</span>
+      <span class="t">A master exit that never mirrored</span>
+      <span class="d">The same incident started with four legs the master had exited and the follower still held. Why that exit never reached the follower is not yet established. Everything downstream — the unprotected positions, the trims — followed from it.</span>
+    </div>
+    <div>
+      <span class="tag open-t">Open · on hold</span>
+      <span class="t">Escalation is a flat timer</span>
+      <span class="d">A limit that is still filling at 5s is killed anyway, and the reconciler would market the remainder 15s later regardless. Both should gate on "our order is live and still filling", with a ceiling around 30s. Held at the desk's request.</span>
+    </div>
+    <div>
+      <span class="tag fixed-t">Fixed · 20 Nov</span>
+      <span class="t">An alert line that crashed the reconciler</span>
+      <span class="d">Two variables read before they were assigned took down the whole correction pass. One of them had missing-leg recovery switched off in production for two days. Both fixed, both pinned by a test that uses CPython's own flow analysis to catch the next one.</span>
+    </div>
+  </div>
+
+  <div class="note crit">
+    <span class="note-h">The pattern behind most of these</span>
+    <p>The engine is good at <em>detecting</em> that something is wrong and historically bad at <em>telling anyone</em> when its own correction fails. Detection and correction live in the same process, so when correction breaks, detection usually goes quiet with it. That is the thing worth designing against, more than any individual bug.</p>
+  </div>
+</section>
+
+<footer>
+  <a href="/positions" style="color:var(--accent);text-decoration:none;border-bottom:1px solid var(--line)">&larr; Back to the dashboard</a><br><br>
+  Reflects deployed code at commit 146cd3d · 20 Nov 2026 · constants read from source, incident times from container logs
+</footer>
+
+</div>
+</body>
+</html>
