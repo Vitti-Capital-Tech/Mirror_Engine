@@ -9,6 +9,7 @@ from app.database import db
 from app.websocket.socket_manager import socket_manager
 from app.core.risk_engine import RiskEngine
 from app.core.order_executor import order_executor
+from app.core import leg_locks
 from app.core import order_ledger as ledger
 from app.core import ladder
 from app.core import order_history as oh
@@ -2206,25 +2207,33 @@ class CopyEngine:
                                 self._recon_open_ts[(fid, sym)] = now
                                 side = "buy" if fsz > 0 else "sell"
                                 try:
-                                    # LAST LOOK, and this is the one that matters
-                                    # most: a top-up ADDS, so reduce_only is not
-                                    # there to cap it. Sized against a leg that
-                                    # has already filled, it opens exposure
-                                    # nobody asked for.
-                                    _fresh = await self._live_signed_fresh(client, sym)
-                                    short_by = self._still_worth_acting(
-                                        short_by, _fresh, fsz, target=target, adding=True)
-                                    if short_by < 1:
-                                        logger.info(
-                                            f"reconcile: not topping up {fol.get('name')} {sym} "
-                                            f"after all — the leg moved while we decided "
-                                            f"(now {_fresh})"
+                                    # One leg, one writer. The live mirror holds this same lock while
+                                    # it places; without it both paths can act on this leg at once,
+                                    # which is what the two-pass rule and the last look were left to
+                                    # guess around. Narrow on purpose: the pass holds nothing between
+                                    # legs, so a sweep never blocks the mirror on other symbols.
+                                    async with leg_locks.hold(_mkey, sym, "topup") as _got:
+                                        if not _got:
+                                            continue
+                                        # LAST LOOK, and this is the one that matters
+                                        # most: a top-up ADDS, so reduce_only is not
+                                        # there to cap it. Sized against a leg that
+                                        # has already filled, it opens exposure
+                                        # nobody asked for.
+                                        _fresh = await self._live_signed_fresh(client, sym)
+                                        short_by = self._still_worth_acting(
+                                            short_by, _fresh, fsz, target=target, adding=True)
+                                        if short_by < 1:
+                                            logger.info(
+                                                f"reconcile: not topping up {fol.get('name')} {sym} "
+                                                f"after all — the leg moved while we decided "
+                                                f"(now {_fresh})"
+                                            )
+                                            continue
+                                        await client.place_order(
+                                            symbol=sym, side=side, size=int(short_by),
+                                            order_type="market_order", reduce_only=False,
                                         )
-                                        continue
-                                    await client.place_order(
-                                        symbol=sym, side=side, size=int(short_by),
-                                        order_type="market_order", reduce_only=False,
-                                    )
                                     logger.info(
                                         f"reconcile: TOPPED UP {fol.get('name')} {sym} by {short_by} "
                                         f"({held} -> {int(target)}, master {msz:+.0f}, master "
@@ -2324,23 +2333,31 @@ class CopyEngine:
                                             f"reconcile: cancelled stuck close {o.get('id')} on {sym} "
                                             f"for {fol.get('name')} before trimming (never filled)"
                                         )
-                                # LAST LOOK. `excess` was computed at the top of
-                                # this pass; the master's book check, the missed-
-                                # exit lookup and the cancels above are all
-                                # exchange round trips since then.
-                                _fresh = await self._live_signed_fresh(client, sym)
-                                excess = self._still_worth_acting(
-                                    excess, _fresh, fsz, target=target)
-                                if excess < 1:
-                                    logger.info(
-                                        f"reconcile: not trimming {fol.get('name')} {sym} after all "
-                                        f"— the leg moved while we decided (now {_fresh})"
+                                # One leg, one writer. The live mirror holds this same lock while
+                                # it places; without it both paths can act on this leg at once,
+                                # which is what the two-pass rule and the last look were left to
+                                # guess around. Narrow on purpose: the pass holds nothing between
+                                # legs, so a sweep never blocks the mirror on other symbols.
+                                async with leg_locks.hold(_mkey, sym, "trim") as _got:
+                                    if not _got:
+                                        continue
+                                    # LAST LOOK. `excess` was computed at the top of
+                                    # this pass; the master's book check, the missed-
+                                    # exit lookup and the cancels above are all
+                                    # exchange round trips since then.
+                                    _fresh = await self._live_signed_fresh(client, sym)
+                                    excess = self._still_worth_acting(
+                                        excess, _fresh, fsz, target=target)
+                                    if excess < 1:
+                                        logger.info(
+                                            f"reconcile: not trimming {fol.get('name')} {sym} after all "
+                                            f"— the leg moved while we decided (now {_fresh})"
+                                        )
+                                        continue
+                                    await client.place_order(
+                                        symbol=sym, side=side, size=int(excess),
+                                        order_type="market_order", reduce_only=True,
                                     )
-                                    continue
-                                await client.place_order(
-                                    symbol=sym, side=side, size=int(excess),
-                                    order_type="market_order", reduce_only=True,
-                                )
                                 logger.info(
                                     f"reconcile: TRIMMED {fol.get('name')} {sym} by {excess} "
                                     f"({held} -> {int(target)}, master {msz:+.0f}) — missed master "
@@ -2413,22 +2430,30 @@ class CopyEngine:
                             continue  # first sighting — confirm next pass before acting
                         side = "sell" if fsz > 0 else "buy"
                         try:
-                            # LAST LOOK, same reason as the trim: fsz is this
-                            # pass's opening read and the hands-off check, the
-                            # exit classification and the stale-orphan lookup
-                            # have all gone to the exchange since.
-                            _fresh = await self._live_signed_fresh(client, sym)
-                            _qty = self._still_worth_acting(int(abs(fsz)), _fresh, fsz)
-                            if _qty < 1:
-                                logger.info(
-                                    f"reconcile: not closing {fol.get('name')} {sym} after all "
-                                    f"— the leg moved while we decided (now {_fresh})"
+                            # One leg, one writer. The live mirror holds this same lock while
+                            # it places; without it both paths can act on this leg at once,
+                            # which is what the two-pass rule and the last look were left to
+                            # guess around. Narrow on purpose: the pass holds nothing between
+                            # legs, so a sweep never blocks the mirror on other symbols.
+                            async with leg_locks.hold(_mkey, sym, "close") as _got:
+                                if not _got:
+                                    continue
+                                # LAST LOOK, same reason as the trim: fsz is this
+                                # pass's opening read and the hands-off check, the
+                                # exit classification and the stale-orphan lookup
+                                # have all gone to the exchange since.
+                                _fresh = await self._live_signed_fresh(client, sym)
+                                _qty = self._still_worth_acting(int(abs(fsz)), _fresh, fsz)
+                                if _qty < 1:
+                                    logger.info(
+                                        f"reconcile: not closing {fol.get('name')} {sym} after all "
+                                        f"— the leg moved while we decided (now {_fresh})"
+                                    )
+                                    continue
+                                await client.place_order(
+                                    symbol=sym, side=side, size=_qty,
+                                    order_type="market_order", reduce_only=True,
                                 )
-                                continue
-                            await client.place_order(
-                                symbol=sym, side=side, size=_qty,
-                                order_type="market_order", reduce_only=True,
-                            )
                             why = "manual master close orphan" if msz == 0 else "wrong-side desync"
                             missed = await self._missed_exit_ids(fol, sym)
                             logger.info(
@@ -2551,10 +2576,17 @@ class CopyEngine:
                         self._recon_open_ts[key] = now
                         side = "buy" if msz > 0 else "sell"
                         try:
-                            await client.place_order(
-                                symbol=sym, side=side, size=int(target),
-                                order_type="market_order", reduce_only=False,
-                            )
+                            # One leg, one writer — see the trim above. This is the
+                            # correction most likely to collide: it fires when the
+                            # follower is FLAT, which is exactly what a live mirror
+                            # mid-place looks like.
+                            async with leg_locks.hold(_mkey, sym, "open") as _got:
+                                if not _got:
+                                    continue
+                                await client.place_order(
+                                    symbol=sym, side=side, size=int(target),
+                                    order_type="market_order", reduce_only=False,
+                                )
                             logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
                             asyncio.create_task(tg.notify_correction(
                                 fol.get("name"), sym, "OPENED", int(target),

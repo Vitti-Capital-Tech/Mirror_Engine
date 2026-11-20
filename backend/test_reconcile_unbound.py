@@ -67,6 +67,7 @@ BASELINE = {
     # names that Python deletes at the end of their handler. Same
     # pattern: correlated conditions, audited 2026-11-20.
     "_reconcile_positions": {
+        "reason",
         "_age", "_e", "_held", "_kind", "_leg_err", "_live",
         "_msz", "_name", "_nm", "_now", "_qty", "_sk",
         "_target", "key", "why",

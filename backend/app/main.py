@@ -1,4 +1,5 @@
 import asyncio
+from app.core import leg_locks
 import json
 import logging
 import redis.asyncio as aioredis
@@ -171,31 +172,56 @@ async def lifespan(app: FastAPI):
     await redis_client.close()
     logger.info("Shutdown completed.")
 
-# Per-symbol locks so events for the SAME symbol stay ordered (place→cancel→fill),
-# while different symbols process concurrently. This lets a burst of master
-# orders drain immediately instead of queuing one-at-a-time behind REST calls.
-_symbol_locks: dict = {}
+# Leg locks: one per (master, symbol), shared with the reconciler so the two
+# things that write to a follower's book cannot act on the same leg at once.
+# See app/core/leg_locks.py for why the key carries the master and why the
+# reconciler takes its own locks rather than being wrapped here.
+#
+# A reconcile event carries a list of positions and no `symbol`, so it used to
+# fall back to one shared key -- a DIFFERENT lock from the live mirror's, which
+# excluded nothing. It is no longer locked here at all; the sweep locks each
+# correction itself, narrowly, so one slow master's pass cannot hold up another's.
+def _event_master(event: dict):
+    return (event or {}).get("master_account_id") or (event or {}).get("owner_id")
 
-def _symbol_lock(key: str) -> asyncio.Lock:
-    lk = _symbol_locks.get(key)
-    if lk is None:
-        lk = asyncio.Lock()
-        _symbol_locks[key] = lk
-    return lk
 
 async def _run_fill(event_dict: dict):
-    async with _symbol_lock(event_dict.get("symbol") or "_"):
-        try:
-            await copy_engine.process_fill(event_dict)
-        except Exception as e:
-            logger.error(f"process_fill error: {e}", exc_info=True)
+    sym = event_dict.get("symbol")
+    if not sym:
+        await _fill(event_dict)
+        return
+    async with leg_locks.hold(_event_master(event_dict), sym, "fill") as got:
+        if not got:
+            logger.warning("fill for %s waited too long for its leg — processing anyway", sym)
+        await _fill(event_dict)
+
+
+async def _fill(event_dict: dict):
+    try:
+        await copy_engine.process_fill(event_dict)
+    except Exception as e:
+        logger.error(f"process_fill error: {e}", exc_info=True)
+
 
 async def _run_order(event: dict):
-    async with _symbol_lock(event.get("symbol") or "_"):
-        try:
-            await copy_engine.process_order_event(event)
-        except Exception as e:
-            logger.error(f"process_order_event error: {e}", exc_info=True)
+    sym = event.get("symbol")
+    if not sym:
+        # reconcile_positions and friends: no single leg to lock, and the sweep
+        # locks each correction itself.
+        await _order(event)
+        return
+    async with leg_locks.hold(_event_master(event), sym, "mirror") as got:
+        if not got:
+            logger.warning("mirror for %s waited too long for its leg — processing anyway", sym)
+        await _order(event)
+
+
+async def _order(event: dict):
+    try:
+        await copy_engine.process_order_event(event)
+    except Exception as e:
+        logger.error(f"process_order_event error: {e}", exc_info=True)
+
 
 async def redis_consumer():
     """Consume master fill events and dispatch them concurrently (ordered per symbol)."""
