@@ -114,7 +114,7 @@ class SharedBook:
         self.market_orders.append(kw)
         return {"result": {"id": f"mkt{len(self.market_orders)}"}}
 
-    async def get_positions(self):
+    async def get_positions(self, strict=False):
         return []
 
 

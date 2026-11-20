@@ -157,7 +157,7 @@ class Client:
         self.ex, self.acct = ex, acct
         self.placed, self.cancelled, self.edited = [], [], []
 
-    async def get_positions(self):
+    async def get_positions(self, strict=False):
         return [{"product_symbol": s, "size": v, "mark_price": 40, "entry_price": 40}
                 for s, v in self.ex.pos.get(self.acct, {}).items() if v]
 
@@ -733,6 +733,70 @@ def test_a_leg_that_moves_mid_decision_is_resized():
     check("it did not cut the full 85 off 760", held != 675.0, True)
 
 
+
+
+def test_a_failed_position_read_is_not_an_empty_book():
+    """THE WORST ONE. get_positions() returned [] both when an account held
+    nothing and when the read FAILED.
+
+    An empty master book reads as "he is flat on everything", and every leg the
+    follower holds then looks like a position its master has exited. Two of
+    those in a row -- a Delta blip, a rate limit, a 502 -- and the sweep closes
+    the client's entire book. The engine's own rule everywhere else is that an
+    unreadable book is never permission to act; this erased the distinction at
+    the source, so nothing downstream could honour it.
+    """
+    print("\n18. a failed read must not look like a flat master")
+    eng, ex, mc, fc = build()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)
+        ex.set_position("f-algo3", SYM, 715)
+
+        # The exchange goes dark. A strict read must raise, not report flat.
+        raised = {"n": 0}
+        real = mc.get_positions
+
+        async def dark(strict=False):
+            if strict:
+                raised["n"] += 1
+                raise RuntimeError("502 from Delta")
+            return []
+
+        mc.get_positions = dark
+        # What the listener does with it: skip the pass, push nothing.
+        pushed = True
+        try:
+            await mc.get_positions(strict=True)
+        except Exception:
+            pushed = False
+        mc.get_positions = real
+
+        # And the sweep, handed a genuinely empty book, would have closed it.
+        for _ in range(3):
+            await eng._reconcile_positions(
+                {"owner_id": "u1", "master_account_id": "m-jd", "positions": []})
+        return pushed, raised["n"], ex.position("f-algo3", SYM)
+
+    pushed, raised, held = asyncio.run(run())
+    check("a failed read raises instead of returning []", raised >= 1, True)
+    check("so the pass is skipped, not pushed as 'flat'", pushed, False)
+    check("an actually-empty book WOULD have closed the leg", held, 0.0)
+
+
+def test_the_strict_flag_is_used_where_it_matters():
+    print("\n19. and the two dangerous reads ask for it")
+    import inspect
+    from app.core.trade_listener import TradeListener
+    from app.core.copy_engine import CopyEngine
+    tl = inspect.getsource(TradeListener)
+    check("the master snapshot is strict",
+          tl.count("get_positions(strict=True)"), 2)
+    rec = inspect.getsource(CopyEngine._reconcile_positions)
+    check("the follower's book is strict",
+          "get_positions(strict=True)" in rec, True)
+
+
 if __name__ == "__main__":
     for t in (test_the_session,
               test_the_master_unwinding_is_left_alone,
@@ -743,7 +807,9 @@ if __name__ == "__main__":
               test_two_masters_on_one_owner_stay_separate,
               test_one_master_failing_does_not_size_the_other,
               test_the_mirror_and_the_sweep_cannot_both_act,
-              test_a_leg_that_moves_mid_decision_is_resized):
+              test_a_leg_that_moves_mid_decision_is_resized,
+              test_a_failed_position_read_is_not_an_empty_book,
+              test_the_strict_flag_is_used_where_it_matters):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)

@@ -134,7 +134,13 @@ class TradeListener:
             return
         try:
             positions = []
-            for p in await self.client.get_positions():
+            # STRICT. A failed read used to come back as an empty list, which
+            # reads as "the master is flat on everything" -- and every follower
+            # leg then looks like a position its master has exited. Two of
+            # those in a row (a Delta blip, a rate limit) and the sweep closes
+            # the client's whole book. Raise instead; the handler below skips
+            # the pass, and the next one is ten seconds away.
+            for p in await self.client.get_positions(strict=True):
                 sz = float(p.get("size") or 0)
                 if sz == 0:
                     continue
@@ -272,7 +278,7 @@ class TradeListener:
         try:
             master_symbols = [
                 (p.get("product_symbol") or p.get("symbol"))
-                for p in await self.client.get_positions()
+                for p in await self.client.get_positions(strict=True)
                 if float(p.get("size") or 0) != 0
             ]
             master_symbols = [s for s in master_symbols if s]

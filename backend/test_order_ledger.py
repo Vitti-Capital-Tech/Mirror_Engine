@@ -165,7 +165,7 @@ class FakeClient:
         self.order_reads = 0
         self.orders_fail = False
 
-    async def get_positions(self): return self._pos
+    async def get_positions(self, strict=False): return self._pos
     async def get_open_orders(self, state=None):
         self.order_reads += 1
         if self.orders_fail:

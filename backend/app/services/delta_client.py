@@ -100,7 +100,7 @@ class DeltaClient:
             return None
         return resp.json()
 
-    async def get_positions(self) -> list:
+    async def get_positions(self, strict: bool = False) -> list:
         """Fetch all open positions. /v2/positions/margined returns them all —
         BTC options included, which is what this desk trades.
 
@@ -121,8 +121,16 @@ class DeltaClient:
             res = await self._get_json("/v2/positions/margined")
         except Exception as e:
             logger.warning(f"Could not fetch positions: {e}")
+            if strict:
+                raise
             return []
         if res is None:
+            # A non-200 is NOT "this account holds nothing". Callers that act on
+            # the answer must be able to tell the difference: an empty book says
+            # the master is flat, which is the one reading that makes the engine
+            # close a follower's entire position. strict=True raises instead.
+            if strict:
+                raise RuntimeError("positions read failed (non-200 from Delta)")
             return []
         rows = res.get("result", []) if isinstance(res, dict) else res
         return list(rows or [])

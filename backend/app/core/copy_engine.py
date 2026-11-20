@@ -2002,7 +2002,11 @@ class CopyEngine:
                 continue
             try:
                 fpos = {}
-                for p in await client.get_positions():
+                # STRICT, same reason as the master snapshot: an empty book
+                # reads as "this follower holds nothing", which turns every leg
+                # it really holds into a missing one and invites a duplicate
+                # entry. The except below keeps the previous candidates alive.
+                for p in await client.get_positions(strict=True):
                     s = p.get("product_symbol") or p.get("symbol")
                     sz = float(p.get("size") or 0)
                     if s and sz != 0:

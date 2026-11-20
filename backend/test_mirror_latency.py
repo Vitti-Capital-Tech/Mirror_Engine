@@ -105,7 +105,7 @@ class CountingClient:
         self.calls = []
         self.placed = []
 
-    async def get_positions(self):
+    async def get_positions(self, strict=False):
         self.calls.append("get_positions")
         return list(self._positions)
 
@@ -490,7 +490,7 @@ async def test_escalation_setup_reads_accounts_once_for_many_followers():
             # 'open' with lots left, so the loop proceeds past _order_done
             return {"result": {"id": oid, "state": "open", "size": 5,
                                "unfilled_size": 5, "product_id": 1}}
-        async def get_positions(self):
+        async def get_positions(self, strict=False):
             return []
 
     f2 = dict(FOLLOWER_ROW, id="fB", name="Second follower")
@@ -514,7 +514,7 @@ async def test_escalation_setup_survives_a_follower_not_in_the_table():
     class Cl:
         async def get_order(self, oid):
             return {"result": {"id": oid, "state": "closed", "unfilled_size": 0}}
-        async def get_positions(self):
+        async def get_positions(self, strict=False):
             return []
 
     eng = build_engine(CountingClient(name="master"), Cl())
