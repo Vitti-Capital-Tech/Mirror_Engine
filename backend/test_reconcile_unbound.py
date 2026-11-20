@@ -61,6 +61,10 @@ BASELINE = {
     "_mirror_place": {
         "_prev_v", "filled_exit", "follower_held", "follower_order_id",
         "master_now", "resp_obj", "rungs", "signed", "target", "why_zero",
+        # `held` is bound by both arms of the try/except immediately above its
+        # reads, in the protective-order branch. It became unprovable when the
+        # vanish backstop added another `continue` earlier in the function.
+        "held",
     },
     "_reconcile_positions": {
         # All of these live in the end-of-pass escalation sweep: nested `for`

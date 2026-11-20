@@ -122,6 +122,10 @@ def engine(follower_held, master_pos, legs=None, live_ids=(), ordermap=None):
     eng.redis = FakeRedis(ordermap)
     eng.risk_engine = RiskEngine()
     eng._open_orders_cache = {}
+    # Same listing kept whole, for the close-cover check. A partial
+    # engine built with __new__ has to grow with __init__ or it fails
+    # on an attribute the real engine always has.
+    eng._open_orders_raw = {}
     eng._OPEN_ORDERS_TTL = 0.0
     client = FakeClient(live_ids)
 

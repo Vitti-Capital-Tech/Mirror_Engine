@@ -108,6 +108,12 @@ STUCK_AFTER_SEC = float(os.getenv("STUCK_AFTER_SEC", "60"))
 # act, so it is as early as the engine can honestly be sure.
 MISMATCH_ALERT_AFTER_SEC = float(os.getenv("MISMATCH_ALERT_AFTER_SEC", "8"))
 
+# How many times we will place the same mirror, and watch it disappear without
+# filling, before stopping and saying so. Two retries is enough to ride out a
+# genuine transient; a third identical disappearance is a condition at the
+# exchange that re-placing will not fix.
+VANISH_GIVE_UP = int(os.getenv("VANISH_GIVE_UP", "3"))
+
 # Internal reconcile kind -> the words a human reads.
 _MISMATCH_KIND = {
     "open": "missing",    # follower has no leg at all
@@ -278,6 +284,9 @@ class CopyEngine:
         # {account_id: (set_of_resting_order_ids, ts)} — see _order_is_live. Short
         # TTL: this only shortcuts the "yes, still live" answer, never "gone".
         self._open_orders_cache: dict = {}
+        # {account_id: ([order dicts], ts)} — the same listing the id cache is
+        # built from, kept whole so a cover check costs no extra REST call.
+        self._open_orders_raw: dict = {}
         self._OPEN_ORDERS_TTL = 3.0  # seconds
         # {(master_id, api_key): DeltaClient} — reused so the hot master helpers
         # don't pay a TLS handshake per call. See _get_master_client.
@@ -916,11 +925,12 @@ class CopyEngine:
             hit = self._open_orders_cache.get(account_id)
             if hit and (time.time() - hit[1]) < self._OPEN_ORDERS_TTL:
                 return hit[0]
-        ids, ok = set(), False
+        ids, ok, raw = set(), False, []
         for st in ("open", "pending"):
             try:
                 for o in await client.get_open_orders(state=st):
                     ids.add(str(o.get("id")))
+                    raw.append(o)
                 ok = True
             except Exception:
                 pass
@@ -928,7 +938,99 @@ class CopyEngine:
             return None
         if account_id:
             self._open_orders_cache[account_id] = (ids, time.time())
+            # The same listing, kept whole. _follower_resting_cover needs sizes
+            # and sides, not just ids, and paying for a second identical REST
+            # call on the close path is exactly the volume that delayed orders
+            # past Delta's signature window in July.
+            self._open_orders_raw[account_id] = (raw, time.time())
         return ids
+
+    async def _follower_resting_cover(self, client, account_id, symbol: str,
+                                      signed_pos: float) -> float:
+        """How much of this follower's position is ALREADY covered by resting
+        orders that would reduce it.
+
+        A close is sized from the position alone: "follower holds 3200, so
+        cover 3200". It never asked how much cover was already sitting there,
+        so a position that was fully covered got covered again.
+
+        2026-11-19 22:19-22:21, JD algo3 on C-BTC-65000/65200: the same master
+        rung was mirrored five times, roughly every 30 seconds, a fresh 3200-lot
+        reduce-only each time. Each one vanished at the exchange -- there was
+        nothing left to reduce -- so the next sweep saw no live mirror and
+        placed again. That account was also being traded directly by its owner,
+        whose own close orders already covered the whole position.
+
+        Stops, take-profits and brackets are excluded: they are protection, not
+        an exit in flight, and counting them would stop us ever closing a
+        protected leg.
+
+        Returns 0.0 when the book cannot be read -- the caller then behaves as
+        it always did rather than refusing to close on an unknown.
+        """
+        if not signed_pos:
+            return 0.0
+        cached = self._open_orders_raw.get(account_id) if account_id else None
+        if not cached or (time.time() - cached[1]) >= self._OPEN_ORDERS_TTL:
+            if await self._live_order_ids(client, account_id, fresh=True) is None:
+                return 0.0
+            cached = self._open_orders_raw.get(account_id)
+            if not cached:
+                return 0.0
+        total = 0.0
+        for o in cached[0]:
+            if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                continue
+            if o.get("stop_order_type") or o.get("stop_price") or o.get("bracket_order"):
+                continue
+            oside = (o.get("side") or "").lower()
+            # buy reduces a short, sell reduces a long
+            if (oside == "buy" and signed_pos < 0) or (oside == "sell" and signed_pos > 0):
+                try:
+                    total += abs(float(o.get("unfilled_size")
+                                       if o.get("unfilled_size") is not None
+                                       else o.get("size") or 0))
+                except (TypeError, ValueError):
+                    continue
+        return total
+
+    async def _count_vanished(self, master_order_id, follower_id) -> int:
+        """How many times this mirror has been placed and then found gone
+        without filling, including this time.
+
+        Returns 0 when Redis cannot be counted. An unreadable counter must
+        never block a legitimate mirror — the same direction every other
+        fallback in this engine fails in.
+        """
+        try:
+            n = await self.redis.incr(f"vanish:{master_order_id}:{follower_id}")
+            await self.redis.expire(f"vanish:{master_order_id}:{follower_id}", 3600)
+            return int(n)
+        except Exception as e:
+            logger.debug("vanish counter unavailable for %s: %s", master_order_id, e)
+            return 0
+
+    async def _cap_close_to_room(self, client, follower, symbol: str, side: str,
+                                 qty: int, follower_held: int, signed) -> int:
+        """Trim a close down to the cover the follower has ROOM for.
+
+        Kept out of _mirror_place deliberately: that function is long enough
+        that two more conditionally-bound locals in it are two more chances for
+        the UnboundLocalError class of bug that took the reconciler down on
+        2026-11-20. In here they are bound on every path.
+        """
+        _signed = signed if signed else (follower_held if side == "sell" else -follower_held)
+        covered = await self._follower_resting_cover(
+            client, follower["id"], symbol, _signed)
+        room = int(max(0.0, float(follower_held) - covered))
+        if qty <= room:
+            return qty
+        logger.info(
+            f"Close for {follower['name']} on {symbol}: wanted {qty} but "
+            f"{covered:.0f} of {follower_held} is already covered by resting "
+            f"orders — placing {room}"
+        )
+        return room
 
     async def _order_is_live(self, client, order_id: str, account_id=None) -> bool:
         """True if the given order id is still resting (open/pending).
@@ -3108,6 +3210,13 @@ class CopyEngine:
                     continue
 
                 if await self._order_is_live(client, mapped, follower["id"]):
+                    # The mirror survived, so whatever made earlier ones vanish
+                    # is over. Forget the count, or an unrelated episode hours
+                    # later inherits it and gives up on its first try.
+                    try:
+                        await self.redis.delete(f"vanish:{master_order_id}:{follower['id']}")
+                    except Exception:
+                        pass
                     # Still resting. A plain re-send has nothing to do; an EDIT
                     # falls through to the edit path below, which is the one case
                     # that may legitimately act on an already-mirrored order.
@@ -3187,7 +3296,40 @@ class CopyEngine:
                         )
                         await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
                         continue
-                    # cancelled without filling — clear and re-place
+                    # Cancelled without filling. That normally means the mirror
+                    # really is outstanding and should be re-placed — but not
+                    # forever. An order that we place and that then disappears
+                    # every single time is telling us something, and re-placing
+                    # it on a 30s loop just hides the message:
+                    #
+                    #   2026-11-19 22:19-22:21, JD algo3 on C-BTC-65000/65200 —
+                    #   the same rung placed five times, a fresh 3200-lot
+                    #   reduce-only each time, each one gone before the next
+                    #   sweep. Nothing filled, nothing was said, and it would
+                    #   have continued all session.
+                    #
+                    # The cover cap above should stop that particular case from
+                    # recurring. This is the backstop for every other reason an
+                    # order might not survive, none of which we can enumerate.
+                    _gone_at = await self._count_vanished(master_order_id, follower["id"])
+                    if _gone_at >= VANISH_GIVE_UP:
+                        logger.warning(
+                            f"Not re-placing {master_order_id} for {follower['name']} on "
+                            f"{symbol}: placed {_gone_at} times and it vanished each time "
+                            f"without filling"
+                        )
+                        asyncio.create_task(tg.notify_fail(
+                            # The MASTER's size, not the follower's: `qty` is
+                            # computed further down and is not bound yet here.
+                            # Reading it was exactly the mistake that took the
+                            # reconciler down on 2026-11-20.
+                            follower.get("name"), symbol, side, int(master_qty or 0),
+                            f"placed {_gone_at} times and the order vanished each time "
+                            f"without filling — not re-placing, this needs a look",
+                            key=f"vanish:{follower['id']}:{symbol}",
+                            window=tg.ONCE_WINDOW,
+                        ))
+                        continue
                     await self.redis.hdel(f"ordermap:{master_order_id}", follower["id"])
 
             # Floor so the mirrored order quantity matches the follower's position
@@ -3584,6 +3726,20 @@ class CopyEngine:
                         f"{follower_held} -> cover {cover}, this rung {qty} "
                         f"[ladder {len(rungs)} rungs: {alloc}]"
                     )
+                # ROOM LEFT, not just size wanted. Everything above sizes the
+                # close from the POSITION; none of it asks how much of that
+                # position is already covered by resting orders. A fully covered
+                # leg therefore got covered again, and the exchange threw the
+                # surplus away — which looks exactly like a mirror that never
+                # landed, so the next sweep placed it again. Five times on
+                # C-BTC-65000/65200, 2026-11-19 22:19-22:21.
+                #
+                # The cap is the invariant the ladder should always have had:
+                # the follower's resting cover never exceeds what it holds.
+                if reduce_only and int(qty) >= 1 and follower_held:
+                    qty = await self._cap_close_to_room(
+                        client, follower, symbol, side, int(qty),
+                        int(follower_held), signed)
                 # No deadband here. A deadband is right for a position REBALANCE (don't
                 # churn over ratio noise), but on a ladder it re-creates the starvation
                 # this replaced: every rung's fair share on a small follower is ~1 lot,

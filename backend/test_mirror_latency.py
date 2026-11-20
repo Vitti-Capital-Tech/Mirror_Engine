@@ -198,6 +198,10 @@ def build_engine(master_client, follower_client):
     eng.db = FakeDB([MASTER_ROW, FOLLOWER_ROW])
     eng.risk_engine = RiskEngine()
     eng._open_orders_cache = {}
+    # Same listing kept whole, for the close-cover check. A partial
+    # engine built with __new__ has to grow with __init__ or it fails
+    # on an attribute the real engine always has.
+    eng._open_orders_raw = {}
     eng._OPEN_ORDERS_TTL = 3.0
     eng._master_pos_cache = {}
     eng._MASTER_POS_TTL = 3.0

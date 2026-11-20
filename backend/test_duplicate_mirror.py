@@ -132,6 +132,10 @@ def build_engine(client):
     eng = CopyEngine.__new__(CopyEngine)      # no __init__: avoid real clients
     eng.redis = FakeRedis()
     eng._open_orders_cache = {}
+    # Same listing kept whole, for the close-cover check. A partial
+    # engine built with __new__ has to grow with __init__ or it fails
+    # on an attribute the real engine always has.
+    eng._open_orders_raw = {}
     eng._OPEN_ORDERS_TTL = 3.0
     eng._client_for = lambda *a, **k: client
     return eng
