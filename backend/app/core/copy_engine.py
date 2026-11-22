@@ -333,6 +333,72 @@ class CopyEngine:
             except Exception:
                 logger.warning(f"Could not record skipped copy for {follower.get('name')}: {e}")
 
+    def _claim_master_fill(self, master_trade_id, filled_so_far: float, trade_data: dict):
+        """Record a master market fill, or claim the part of it not yet copied.
+
+        `filled_so_far` is how much of the master's order has filled in total
+        (TradeListener._filled_so_far); trades.quantity is how much of it has
+        been copied. A market order can fill in PIECES, one event per piece under
+        the same order id, so an existing row is not by itself a duplicate — only
+        the part already copied is.
+
+        2026-11-22, C-BTC-62800 order 1704167399 (3000 lots) filled 1 then 2999.
+        The guard here used to return on any existing row, so the 2999 were
+        dropped: the follower sat on 1 lot until the reconciler topped it up ~30s
+        later, and the desk got five Telegram messages for one trade.
+
+        Returns (trade_row, copied_before), or None when there is nothing new to
+        copy or the row could not be read or written.
+        """
+        for _attempt in range(2):
+            try:
+                existing = (self.db.table("trades").select("*")
+                            .eq("master_trade_id", master_trade_id).execute())
+            except Exception as e:
+                logger.error(f"Failed to read master trade {master_trade_id}: {e}")
+                return None
+
+            if not existing.data:
+                try:
+                    res = self.db.table("trades").insert(trade_data).execute()
+                except Exception as e:
+                    # Usually the UNIQUE(master_trade_id) constraint: another
+                    # piece of this order recorded it a moment ago. Read it back
+                    # and claim against that row instead of dropping this piece.
+                    logger.info(f"Insert of master trade {master_trade_id} lost a race ({e}) — re-reading")
+                    continue
+                if not res.data:
+                    logger.error(f"Failed to insert master trade {master_trade_id} into DB.")
+                    return None
+                return res.data[0], 0.0
+
+            row = existing.data[0]
+            copied_before = float(row.get("quantity") or 0)
+            if filled_so_far <= copied_before:
+                logger.warning(
+                    f"Master trade {master_trade_id} already exists in DB "
+                    f"({copied_before:g} copied, event says {filled_so_far:g} filled) — skipping."
+                )
+                return None
+            # Conditional on quantity still being what was read, so when two
+            # pieces race only one of them copies the difference.
+            try:
+                claim = (self.db.table("trades").update({"quantity": filled_so_far})
+                         .eq("id", row["id"]).eq("quantity", copied_before).execute())
+            except Exception as e:
+                logger.error(f"Failed to claim further fill of {master_trade_id}: {e}")
+                return None
+            if not claim.data:
+                continue  # another piece moved it first; re-read and compare again
+            logger.info(
+                f"Master order {master_trade_id} filled further: {copied_before:g} -> "
+                f"{filled_so_far:g} — copying the remaining {filled_so_far - copied_before:g}"
+            )
+            return row, copied_before
+
+        logger.error(f"Could not record or claim master trade {master_trade_id} — skipping.")
+        return None
+
     async def process_fill(self, event_dict: dict) -> None:
         """
         Process a master fill event:
@@ -370,35 +436,25 @@ class CopyEngine:
                 )
                 return
 
-        # 1. Save master trade to Supabase
-        try:
-            # Check for existing
-            existing = self.db.table("trades").select("id").eq("master_trade_id", master_trade_id).execute()
-            if existing.data:
-                logger.warning(f"Master trade {master_trade_id} already exists in DB, skipping.")
-                return
-
-            trade_data = {
-                "master_trade_id": master_trade_id,
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "trade_type": trade_type,
-                "status": "processing",
-                "raw_payload": raw_payload,
-                "owner_id": owner_id,
-            }
-            insert_res = self.db.table("trades").insert(trade_data).execute()
-            if not insert_res.data:
-                logger.error(f"Failed to insert master trade {master_trade_id} into DB.")
-                return
-            
-            trade_record = insert_res.data[0]
-            trade_uuid = trade_record["id"]
-        except Exception as e:
-            logger.error(f"Failed to save master trade to DB: {e}")
+        # 1. Save master trade to Supabase — or, for a further piece of an order
+        # already recorded, claim just the part not yet copied.
+        claimed = self._claim_master_fill(master_trade_id, quantity, {
+            "master_trade_id": master_trade_id,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "trade_type": trade_type,
+            "status": "processing",
+            "raw_payload": raw_payload,
+            "owner_id": owner_id,
+        })
+        if claimed is None:
             return
+        trade_record, copied_before = claimed
+        trade_uuid = trade_record["id"]
+        # Lots this event adds to what has already been copied for the order.
+        fill_qty = quantity - copied_before
 
         # 2. Get active follower accounts (scoped to the master's owner)
         # One read for the followers AND the master (whose balance the ratio needs
@@ -437,10 +493,10 @@ class CopyEngine:
             # once, not once per fill.
             logger.error(
                 "No active follower accounts found — %s %s %s was NOT copied to anyone.",
-                side, quantity, symbol,
+                side, fill_qty, symbol,
             )
             asyncio.create_task(tg.notify_fail(
-                "all followers", symbol, side, quantity,
+                "all followers", symbol, side, fill_qty,
                 "no active follower account was found — this trade was NOT copied",
                 # Per MASTER, not per owner: one owner can run several, and an
                 # owner-wide key means the second master's "nobody is copying
@@ -502,7 +558,12 @@ class CopyEngine:
                     f"unflagged close, mirroring follower close immediately"
                 )
         if is_exit:
-            master_remaining = await self._master_position_size(master_row, symbol)
+            # A further piece of a split order arrives within milliseconds of
+            # the last one, so the ~3s cached size is the size BEFORE this piece
+            # — the follower would be "already at target" and keep the lots the
+            # master just closed. Read it fresh for those.
+            master_remaining = await self._master_position_size(
+                master_row, symbol, fresh=bool(copied_before))
 
         # Order-ID ledger: record the MASTER order before dispatching anything, so
         # a crash mid-dispatch still leaves an entry with no follower legs (i.e.
@@ -544,7 +605,7 @@ class CopyEngine:
                 if master_remaining is None:
                     # Couldn't read the master's remaining size — fall back to a
                     # proportional close rather than skipping the exit entirely.
-                    follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                    follower_qty = self.risk_engine.calculate_follower_quantity(fill_qty, entry_price, follower, round_up=True)
                 else:
                     # round_up=True (min_one=False): one definition of the follower's
                     # target across every path — live close, mirrored close,
@@ -586,7 +647,37 @@ class CopyEngine:
                     )
                     self._record_skipped_copy(trade_uuid, follower, skip_reason)
                     continue
-                follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                if not copied_before:
+                    follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                else:
+                    # A further piece of an order already partly copied. Copy
+                    # the growth in the follower's share of the ORDER (so 1 +
+                    # 2999 lands on exactly the share of 3000, not one lot over
+                    # from rounding each piece up), and never past its share of
+                    # the master's live POSITION — if the reconciler topped the
+                    # follower up before this piece was processed, sending the
+                    # piece as well would double it.
+                    follower_qty = (
+                        self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                        - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=True)
+                    )
+                    if master_signed_now is not None:
+                        target = self.risk_engine.calculate_follower_quantity(
+                            abs(master_signed_now), entry_price, follower, round_up=True, min_one=False)
+                        held = await self._position_size(client, symbol)
+                        follower_qty = min(follower_qty, int(target) - int(held))
+                    if follower_qty <= 0:
+                        logger.info(
+                            f"Further fill of {master_trade_id} on {symbol}: {follower['name']} "
+                            f"already holds its share — nothing to add"
+                        )
+                        skip_reason = "already at its share of the master's position"
+                        await ledger.record_follower_leg(
+                            self.redis, master_trade_id, follower["id"], status="skipped",
+                            reason=skip_reason,
+                        )
+                        self._record_skipped_copy(trade_uuid, follower, skip_reason)
+                        continue
 
             tasks.append(order_executor.execute(
                 client=client,

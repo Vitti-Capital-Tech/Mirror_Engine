@@ -391,7 +391,16 @@ class TradeListener:
         order_id = str(order.get("id"))
         symbol = order.get("product_symbol")
         side_str = order.get("side", "").lower()
-        size = float(order.get("filled_size") or order.get("size") or 0)
+        # How much of the order has filled SO FAR, not how big this piece was.
+        # A market order can fill in pieces, and Delta sends one update per piece
+        # under the same order id; the copy engine copies the difference between
+        # this figure and what it has already copied for the id.
+        #
+        # size - unfilled_size, read before filled_size: on 2026-11-22 order
+        # 1704167399 (3000 lots) filled 1 then 2999, and the closing update
+        # carried filled_size "2999" with unfilled_size 0. Only size - unfilled
+        # reads 3000 there.
+        size = self._filled_so_far(order)
         avg_price = float(
             order.get("average_fill_price")
             or order.get("avg_fill_price")
@@ -422,6 +431,19 @@ class TradeListener:
         payload["master_account_id"] = self._master_id()
         payload["ts"] = time.time()  # detection time, for latency measurement
         await self.redis.lpush("trade_events", json.dumps(payload))
+
+    @staticmethod
+    def _filled_so_far(order: dict) -> float:
+        """Lots of this order filled in total: size - unfilled_size when the
+        payload has both, else filled_size, else size."""
+        try:
+            if order.get("size") is not None and order.get("unfilled_size") is not None:
+                done = float(order["size"]) - float(order["unfilled_size"])
+                if done > 0:
+                    return done
+        except (TypeError, ValueError):
+            pass
+        return float(order.get("filled_size") or order.get("size") or 0)
 
     async def _mark_master_order_filled(self, order_id) -> None:
         """Record that a master order id has filled.
