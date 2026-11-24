@@ -278,7 +278,8 @@ class PositionMonitor:
                 # empty. Instead it is TIMED: a snapshot gap clears in seconds, a
                 # real orphan does not. Only a position that outlives
                 # _ORPHAN_ALERT_SEC with no master row behind it is called out.
-                await self._maybe_alert_orphan(account_id, account_name, symbol, follower_qty)
+                await self._maybe_alert_orphan(account_id, account_name, symbol, follower_qty,
+                                               owner_id=owner_id)
                 return "unknown"
             self._orphan_since.pop((account_id, symbol), None)
             master_qty = float(master_pos_res.data[0]["quantity"])
@@ -429,7 +430,8 @@ class PositionMonitor:
     # beyond this means the symbol stopped being held and came back.
     _ORPHAN_GAP_SEC = 30.0
 
-    async def _maybe_alert_orphan(self, account_id, account_name, symbol, follower_qty):
+    async def _maybe_alert_orphan(self, account_id, account_name, symbol, follower_qty,
+                                  owner_id=None):
         """Warn when a follower is holding a position the master no longer has.
 
         This is the one the 2026-11-11 incident needed. The follower held
@@ -478,6 +480,30 @@ class PositionMonitor:
         first, _ = entry
         self._orphan_since[key] = (first, now)
         if now - first < self._ORPHAN_ALERT_SEC:
+            return
+        # A HANDS-OFF LEG IS NOT AN ORPHAN, and the wording below is what makes
+        # saying so important. "its TP/SL are gone too, so this position is
+        # unmatched AND unprotected" is the most alarming thing this engine can
+        # say, and in the hands-off case the second half is simply untrue: the
+        # follower's own stop is still sitting there, and it is exactly what
+        # will close the leg.
+        #
+        # This is the sibling of the mismatch carve-out in check_sync_and_alert.
+        # That one covers a master whose position row reads zero; this one
+        # covers a master whose row is gone entirely, which is the other way the
+        # same stop-out lands. Jigar was sent this exact wording on 2026-11-20
+        # at 03:42 IST for four legs that were behaving correctly.
+        # getattr, not self.redis: this function exists to be the thing that
+        # speaks when nothing else does, so it must not be the thing that
+        # raises. is_hands_off treats a missing client as 'no mark'.
+        hoff = await ledger.is_hands_off(
+            getattr(self, "redis", None), owner_id, account_id, symbol)
+        if hoff:
+            logger.info(
+                "%s holds %s on %s with the master gone, but the leg is hands-off "
+                "(%s) — its own stop closes it; not alerting",
+                account_name, abs(follower_qty), symbol, hoff.get("reason"),
+            )
             return
         try:
             await tg.notify_fail(

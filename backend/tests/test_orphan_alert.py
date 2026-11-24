@@ -61,6 +61,11 @@ def monitor():
     pm.tg.notify_fail = fake_notify
     m = PositionMonitor.__new__(PositionMonitor)
     m._orphan_since = {}
+    # No hands-off mark for any leg in these scenarios: a genuine orphan
+    # must still alert. The hands-off carve-out has its own file.
+    class _NoMarks:
+        async def get(self, _key): return None
+    m.redis = _NoMarks()
     SENT.clear()
     return m
 

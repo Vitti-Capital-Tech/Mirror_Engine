@@ -192,11 +192,64 @@ def test_the_check_is_in_the_code():
           "_resolve_mismatch_alert" in src, True)
 
 
+
+
+# --- the sibling path: the master's position row is GONE, not zero ----------
+
+
+def _orphan(hands_off, seen_for):
+    """Drive _maybe_alert_orphan directly, with the episode already aged past
+    its alert window."""
+    import time
+    import app.core.position_monitor as pm
+    m = PositionMonitor.__new__(PositionMonitor)
+    m._orphan_since = {}
+    m.redis = Redis(hands_off)
+    SENT.clear()
+
+    async def go():
+        key = ("f-dh1", SYM)
+        await m._maybe_alert_orphan("f-dh1", "Dhwani1", SYM, 3006.0, owner_id="u1")
+        m._orphan_since[key] = (time.time() - seen_for, time.time())
+        await m._maybe_alert_orphan("f-dh1", "Dhwani1", SYM, 3006.0, owner_id="u1")
+
+    asyncio.run(go())
+    return len(SENT)
+
+
+def test_the_orphan_alert_respects_hands_off_too():
+    """THE SIBLING. check_sync_and_alert covers a master whose position row
+    reads zero; this covers one whose row is gone entirely, which is the other
+    way the same stop-out lands.
+
+    The wording is what makes it matter: "its TP/SL are gone too, so this
+    position is unmatched AND unprotected" is the most alarming line this
+    engine has, and on a hands-off leg the second half is untrue — the
+    follower's own stop is still there and is what closes it. Jigar was sent
+    exactly this for four correct legs on 2026-11-20 at 03:42 IST.
+    """
+    print("\n5. the orphan alert, with the master's row gone")
+    m = PositionMonitor.__new__(PositionMonitor)
+    sent_handsoff = _orphan(hands_off=True, seen_for=m._ORPHAN_ALERT_SEC + 5)
+    check("hands-off: stays quiet", sent_handsoff, 0)
+
+
+def test_a_real_orphan_still_alerts():
+    print("\n6. and a genuine orphan is still reported")
+    m = PositionMonitor.__new__(PositionMonitor)
+    sent_real = _orphan(hands_off=False, seen_for=m._ORPHAN_ALERT_SEC + 5)
+    check("no mark: alerts", sent_real, 1)
+    check("and it says what is wrong",
+          "unmatched AND unprotected" in SENT[0][0][4], True)
+
+
 if __name__ == "__main__":
     for t in (test_the_live_case_is_not_a_mismatch,
               test_without_the_mark_it_is_still_a_mismatch,
               test_a_matching_leg_is_synced_either_way,
-              test_the_check_is_in_the_code):
+              test_the_check_is_in_the_code,
+              test_the_orphan_alert_respects_hands_off_too,
+              test_a_real_orphan_still_alerts):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)
