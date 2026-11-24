@@ -1,249 +1,202 @@
-# Mirror Engine - Low-Level Design (LLD)
+# Mirror Engine — Low-Level Design
 
-This document describes the low-level design, database structures, class definitions, and internal mechanisms of the **Mirror Engine** copy trading system.
-
----
-
-## 1. Database Schema (Supabase PostgreSQL)
-
-The backend system manages five main tables inside Supabase. Foreign keys link followers back to original trade event logs.
-
-### 1.1 `accounts` Table
-Stores Delta Exchange credentials and parameters for the Master and Follower accounts.
-| Column | Type | Constraints | Description |
-| :--- | :--- | :--- | :--- |
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique identifier |
-| `name` | VARCHAR | NOT NULL | Readable name |
-| `account_type` | VARCHAR | NOT NULL (CHECK: master, follower) | Account classification |
-| `api_key` | VARCHAR | NOT NULL | Delta Exchange API Key |
-| `api_secret` | VARCHAR | NOT NULL | Delta Exchange API Secret |
-| `allocation_pct` | NUMERIC | DEFAULT 100.0 | Follower allocation percentage |
-| `is_active` | BOOLEAN | DEFAULT TRUE | Active copying flag |
-| `status` | VARCHAR | DEFAULT 'active' (active, paused, blocked) | Health status |
-| `created_at` | TIMESTAMPTZ | DEFAULT NOW() | Timestamp |
-
-### 1.2 `trades` Table
-Logs master order filled events captured from the Delta Exchange WebSocket feed.
-| Column | Type | Constraints | Description |
-| :--- | :--- | :--- | :--- |
-| `id` | UUID | PRIMARY KEY | Unique identifier |
-| `symbol` | VARCHAR | NOT NULL | Delta contract code (e.g. `BTCUSD`) |
-| `side` | VARCHAR | NOT NULL (buy, sell) | Order side |
-| `qty` | NUMERIC | NOT NULL | Filled quantity |
-| `entry_price` | NUMERIC | NOT NULL | Weighted average execution price |
-| `status` | VARCHAR | DEFAULT 'pending' (copied, partial, failed) | Overall execution status |
-| `created_at` | TIMESTAMPTZ | DEFAULT NOW() | Ingestion timestamp |
-
-### 1.3 `trade_copies` Table
-Stores copying execution parameters and outputs for every follower account.
-| Column | Type | Constraints | Description |
-| :--- | :--- | :--- | :--- |
-| `id` | UUID | PRIMARY KEY | Copy execution identifier |
-| `trade_id` | UUID | FOREIGN KEY REFERENCES `trades(id)` | Associated master trade |
-| `account_id` | UUID | FOREIGN KEY REFERENCES `accounts(id)` | Target follower account |
-| `qty` | NUMERIC | NOT NULL | Follower copy size |
-| `execution_price`| NUMERIC | - | Follower average entry price |
-| `slippage_pct` | NUMERIC | - | Slippage percentage relative to master |
-| `status` | VARCHAR | NOT NULL (filled, failed) | Individual copy task state |
-| `error_message` | VARCHAR | - | Reason for failure (if any) |
-| `latency_ms` | INTEGER | - | End-to-end copy time in milliseconds |
-| `created_at` | TIMESTAMPTZ | DEFAULT NOW() | Log creation time |
-
-### 1.4 `positions` Table
-Tracks real-time open positions for master/follower accounts to check size drift.
-| Column | Type | Constraints | Description |
-| :--- | :--- | :--- | :--- |
-| `id` | UUID | PRIMARY KEY | Unique identifier |
-| `account_id` | UUID | FOREIGN KEY REFERENCES `accounts(id)` | Account owner |
-| `symbol` | VARCHAR | NOT NULL | Symbol name |
-| `size` | NUMERIC | NOT NULL (Signed: + for Long, - for Short) | Net position size |
-| `entry_price` | NUMERIC | NOT NULL | Entry average price |
-| `sync_status` | VARCHAR | DEFAULT 'synced' (synced, desynced) | Drift status relative to master |
-| `updated_at` | TIMESTAMPTZ | DEFAULT NOW() | Last update timestamp |
-
-### 1.5 `alerts` Table
-Records critical system indicators, excessive slippages, and socket failures.
-| Column | Type | Constraints | Description |
-| :--- | :--- | :--- | :--- |
-| `id` | UUID | PRIMARY KEY | Alert identifier |
-| `account_id` | UUID | FOREIGN KEY REFERENCES `accounts(id)` | Affected account |
-| `severity` | VARCHAR | CHECK (info, warning, critical) | Alert level |
-| `message` | TEXT | NOT NULL | Description |
-| `is_resolved` | BOOLEAN | DEFAULT FALSE | Status flag |
-| `created_at` | TIMESTAMPTZ | DEFAULT NOW() | Incident timestamp |
+Schema, events, state, and the exact rules each path follows. Reflects the code at commit `5982fe8` (24 Nov 2026). For the overall picture see the [HLD](hld.md).
 
 ---
 
-## 2. Sequence Diagram (Order Copy Flow)
+## 1. Database (Supabase Postgres)
 
-The interaction pattern below demonstrates step-by-step latency-bound actions when a trade event fires.
+Base tables in `backend/database/supabase_schema.sql`; changes in `backend/database/migrations/001`–`007`. Every domain row carries `owner_id` (migration 001); Row-Level Security (002) restricts reads to the owner or an admin — the backend uses the service key and bypasses it.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Exchange as Delta Exchange (Master WS)
-    participant Listener as Trade Listener Service
-    participant Redis as Redis Event Queue
-    participant Engine as Copy Engine
-    participant Risk as Risk Engine
-    participant Exec as Order Executor
-    participant Follower as Delta API (Follower API)
-    participant DB as Supabase DB
-    participant Socket as Socket.IO Hub
-    participant Client as Frontend Dashboard
+### `accounts`
+| Column | Notes |
+|---|---|
+| `id`, `name`, `owner_id` | |
+| `api_key`, `api_secret` | Fernet-encrypted at rest (`enc:v1:` prefix), decrypted inside `DeltaClient` |
+| `is_master` | |
+| `master_id` | follower → its master (006). `ON DELETE SET NULL`: a follower of a deleted master follows nobody |
+| `environment` | `demo` / `live` |
+| `status` | `active` / `paused` / `error` / `circuit_break` |
+| `allocation_mode`, `allocation_value` | `auto_ratio` / `multiplier` / `fixed` / `capital_pct` |
+| `allocated_balance` | replaces the real balance in the auto ratio (001) |
+| `max_position_size` | hard cap on any follower order |
+| `tp_sl_offset` | on a master: how far its followers' SL/TP sit beyond its own (005); default 50 when unset |
+| `balance`, `available_margin`, `used_margin`, `today_pnl`, `realized_pnl_today` (007) | refreshed by the live position poller |
+| `consecutive_failures` | executor's circuit-breaker counter |
 
-    Exchange->>Listener: Broadcast Order Fill Event (WebSocket)
-    Note over Listener: Ingest JSON, check if Master trade
-    Listener->>Redis: LPUSH trade_events {payload}
-    
-    activate Engine
-    Engine->>Redis: BRPOP trade_events (Worker thread)
-    Redis-->>Engine: Return trade event details
-    
-    Engine->>DB: Fetch active Follower accounts
-    DB-->>Engine: Accounts list (API Keys, secrets, multipliers)
-    
-    loop For each active follower (Parallel Execution)
-        Engine->>Risk: Assess margin and allocation multiplier
-        Risk-->>Engine: Approved trade size (quantity)
-        Engine->>Exec: Request order execution
-        activate Exec
-        Exec->>Follower: HTTP POST /orders (Market Order)
-        Follower-->>Exec: Return execution status (Price, size, latency)
-        Note over Exec: Calculate execution slippage & latency
-        Exec->>DB: Log copy result to `trade_copies`
-        Exec->>Socket: Emit update (trade_copied)
-        deactivate Exec
-    end
-    deactivate Engine
-    
-    Socket-->>Client: Update UI components via Socket.IO
-```
+### `trades` — one row per master order that reached the fill path
+`master_trade_id` (unique; the master order id, or `ord:<id>` for an order-stage row, 004), `symbol`, `side`, **`quantity` = how much of that order has been copied so far** (the per-order claim, §4.1), `entry_price`, `trade_type`, `status` (`processing` / `copied` / `partial` / `failed`), `raw_payload`.
+
+### `trade_copies` — one row per (master order, follower) leg
+`trade_id`, `account_id`, `follower_order_id`, `quantity` (filled), `requested_quantity` (the proportional target, 003), `master_order_id` (004), `execution_price`, `slippage_*`, `execution_time_ms`, `status` (`pending` / `filled` / `partial` / `failed` / `skipped` / `retrying`), `failure_reason`.
+
+### `positions`, `alerts`, `profiles`, `auth_otps`
+`positions` caches live positions for the dashboard (a closed symbol's row is **deleted**, not zeroed). `alerts` holds the in-app feed (`level`, `type`, `message`, `metadata`, `is_resolved`). `profiles(id, email, role)` and `auth_otps` back auth (001).
 
 ---
 
-## 3. Mathematical Specifications
+## 2. Events
 
-### 3.1 Allocation Sizing Formula
-Follower copy quantity ($Q_{f}$) is calculated using the master's filled quantity ($Q_{m}$), follower allocation percentage ($A_{f}$), and risk multiplier parameters:
+All pushed by `TradeListener` to Redis and carrying `owner_id` **and `master_account_id`**.
 
-$$Q_{f} = Q_{m} \times \left( \frac{A_{f}}{100} \right)$$
+| Queue | Action | Produced when | Consumer |
+|---|---|---|---|
+| `trade_events` | fill | a master **market** order fills (each piece) — `quantity` is **filled so far** (`size − unfilled_size`) | `process_fill` |
+| `order_events` | `place` | a master limit/stop is open/pending (incl. the 30s re-push, `source="reconcile"`) | `_mirror_place` |
+| | `cancel` | a master order is cancelled | `_mirror_cancel` |
+| | `master_filled` | a master **limit** fills (partial or full) | `_escalate_after_master_fill`, `_confirm_order_copied` |
+| | `master_stop_filled` | a master SL/TP fills | `_mark_hands_off` |
+| | `reconcile_positions` | every 10s, with the master's positions | `_reconcile_positions` |
+| | protection sync | every 30s, the master's resting stops | `_sync_protection` |
 
-*Example*: If a master enters $10.0$ contracts of `BTCUSD` and the follower has an allocation of $50\%$, the follower copy size is $5.0$ contracts.
-
-### 3.2 Slippage Percentage Formula
-Slippage ($S_{pct}$) measures the premium or discount paid by the follower compared to the master's entry price. For BUY trades:
-
-$$S_{pct} = \left( \frac{P_{follower} - P_{master}}{P_{master}} \right) \times 100$$
-
-For SELL trades:
-
-$$S_{pct} = \left( \frac{P_{master} - P_{follower}}{P_{master}} \right) \times 100$$
-
-*   **Positive value ($>0$)**: Worse price (unfavorable slippage).
-*   **Negative value ($<0$)**: Better price (favorable slippage).
-*   **Warning Threshold**: Triggered when $S_{pct} \ge 0.03\%$.
-
-### 3.3 Position Drift Formula
-Drift percentage ($D_{pct}$) checks if followers' net positions have drifted from their expected size:
-
-$$ExpectedSize = Size_{master} \times \left( \frac{A_{f}}{100} \right)$$
-
-$$D_{pct} = \left| \frac{Size_{follower} - ExpectedSize}{ExpectedSize} \right| \times 100$$
-
-*   **Desynced Trigger**: If $D_{pct} > 5\%$, the follower position is marked as `desynced` in Supabase and a Warning Alert is logged.
+The listener marks a master order **filled** (Redis `masterfilled:<id>`, 24h) only when it is **completely** filled — a first partial fill does not.
 
 ---
 
-## 4. Code Architecture (Backend Layout)
+## 3. Dispatch and locking (`main.py`, `core/leg_locks.py`)
 
-*   [delta_client.py](file:///d:/Work/Projects/trades_copy/backend/app/services/delta_client.py): Async HTTP client utilizing standard Python `httpx` to handle signed HMAC requests to Delta Exchange API.
-*   [risk_engine.py](file:///d:/Work/Projects/trades_copy/backend/app/core/risk_engine.py): Performs pre-trade allocation sizing and check limits.
-*   [order_executor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/order_executor.py): Handles parallel order dispatch with HTTP connection pooling. It tracks follower health statuses and implements a circuit breaker (5 consecutive failures block the account).
-*   [copy_engine.py](file:///d:/Work/Projects/trades_copy/backend/app/core/copy_engine.py): Contains the broker-consumer loop, translating master trade events from Redis into multiple parallel follower execution tasks.
-*   [connection_manager.py](file:///d:/Work/Projects/trades_copy/backend/app/core/connection_manager.py): Client WebSocket session pool manager running singleton exports to stream real-time updates to connected browsers.
-*   [trade_listener.py](file:///d:/Work/Projects/trades_copy/backend/app/core/trade_listener.py): Real-time trade filter service that listens to the Delta Exchange Master WS stream, parses raw fill payloads, and serializes copyable events to the Redis queue.
-*   [position_monitor.py](file:///d:/Work/Projects/trades_copy/backend/app/core/position_monitor.py): Periodic task that audits open position sync status and flags desynced profiles when size drift surpasses 5%.
-*   [order_ledger.py](file:///d:/Work/Projects/trades_copy/backend/app/core/order_ledger.py): Redis order-ID ledger recording every master order and each follower's outcome; distinguishes "never placed" from "placed and never filled".
-*   [slippage_tracker.py](file:///d:/Work/Projects/trades_copy/backend/app/core/slippage_tracker.py): Tracks trade copy metrics, calculates exact slippage margins, and posts warnings if the execution price variance is greater than 0.03%.
+* `redis_consumer` / `order_consumer` `BRPOP` and start **one task per event**.
+* Each event with a symbol runs inside `leg_locks.hold(master_id, symbol)`. Locks are per **(master, symbol)** — two masters on one strike never block each other.
+* **Live events** wait `LIVE_ACQUIRE_TIMEOUT = 30s`, then run anyway (a master trade must not be dropped). **Reconciler** corrections and **confirm-copy** take the same lock; the reconciler waits `ACQUIRE_TIMEOUT = 5s` and skips the leg if busy.
+* Locks are not re-entrant; a path that holds one never asks again. Idle locks are evicted after an hour.
 
 ---
 
-## 5. Multi-tenant, Auth & Admin (additions)
+## 4. Copy paths (`core/copy_engine.py`)
 
-### Schema (migrations)
-* `profiles(id → auth.users, email, role[user|admin], created_at)` with a `handle_new_user()` trigger that auto-creates a profile on signup (default role `user`).
-* `auth_otps(user_id, code_hash, purpose, expires_at, attempts, consumed_at)` for email-OTP 2FA.
-* `owner_id uuid` added to `accounts`, `trades`, `trade_copies`, `positions`, `alerts`; `allocated_balance` on `accounts`.
-* `002_row_level_security.sql`: enables RLS with `owner_id = auth.uid() OR public.is_admin()` on all owner-scoped tables (service-role backend bypasses).
+### 4.1 Market fills — `process_fill`
+1. **Stale entry guard:** an entry event older than `FRESH_ENTRY_SEC` (180s) is dropped.
+2. **Claim** (`_claim_master_fill`): read the `trades` row for the order id. None → insert (`quantity = filled so far`). Exists with `quantity < filled so far` → conditional update `quantity: old → new`; only the winner of a race proceeds, with `copied_before = old`. Otherwise skip (a repeat or a late piece).
+3. **Group:** `_split_accounts(master_id=event.master_account_id)` → this master's active followers only.
+4. **Classify:** a fill that leaves the master not on the side it would open is reclassified as an exit (an unflagged close).
+5. **Size per follower** (all targets use `ceil(master_size × ratio)`, `min_one=False`):
+   * **Entry, first claim:** `share(filled so far)`.
+   * **Entry, further piece:** `share(filled so far) − share(copied_before)`, capped at `target(master position) − held`.
+   * **Exit, in one go** (`copied_before == 0` and the order is complete): `held − target(master remaining)`; skip inside the deadband.
+   * **Exit, in pieces** (`copied_before > 0` or `unfilled_size > 0`): `floor_share(filled so far) − floor_share(copied_before)`, capped at `held − target`; if the master is now flat and this is the last piece, `held` (close the remainder). Master size read fresh.
+6. **Execute** via `order_executor.execute` (§4.6) and record legs, ledger and status.
 
-### Auth (`core/auth.py`, `api/auth.py`)
-* Token verified via Supabase `/auth/v1/user` introspection → `CurrentUser{id,email,role}`.
-* `scope_owned(query, user)` appends `.eq('owner_id', user.id)` unless admin; `require_admin` guards admin routes.
-* Login: password grant → session; if `TWOFA_ENABLED`, an OTP is emailed (Resend) and a pending session held in Redis until `/verify-2fa`. A `ADMIN_MAGIC_CODE` password shortcut performs a server-side password grant into `ADMIN_EMAIL`.
+### 4.2 Resting orders — `_mirror_place`
+* **Idempotency:** `ordermap:<master order>` → `{follower: follower order}`. An existing live mirror is left alone unless the event is an edit; one that **filled** (`mirrordone:<order>:<follower>`) is never re-placed; one the master cancelled (`ocancel:<order>` tombstone) is never resurrected.
+* **Stale events** older than `STALE_EVENT_RECHECK_SEC` (3s) are re-checked against the exchange.
+* **Settled?** `_master_order_settled`: (1) the `masterfilled` marker → yes; (2) present in a fresh read of the master's resting book → no; (3) ask the exchange: done → yes; **open with a partial fill → no (still rests)**; cancelled → yes if anything filled. The unfilled amount from (3) is remembered for sizing.
+* **Entry sizing:** still resting → treat the master's resting entries on the symbol as one ladder: `target(master position + Σ unfilled rungs) − held`, split across rungs by largest remainder (`core/ladder.py`). Already filled → `target(master position) − (held + the follower's resting orders on that side)`, holding read fresh (`_held_plus_resting`).
+* **Exit sizing:** filled → `held − target − the follower's resting exits`; resting → coverage of the master's exit ladder; then capped at the follower's uncovered position (`_cap_close_to_room`).
+* **Protective orders** route to their own branch, sized to the held position, trigger from `_follower_trigger` (§4.5).
+* **Edits** edit the follower's copy (price and size). If the edit fails while the copy is still resting, it is **cancelled first**; if that cancel fails, nothing is re-placed.
+* **Placement** through `_place_order_with_retry` with `client_order_id = mo<master order id>_<6 hex>` (§4.7). A copy that came from the 30s re-push means the live copy never landed → a Mismatch + Reconciler-corrected alert.
+* **Followers** are the event's group only (`_split_accounts(master_id=event.master_account_id)`).
 
-### Per-user engine (`core/trade_listener.py`)
-* `ListenerManager` maps `master_account_id → TradeListener`; startup spins one per active master, and account create/pause/resume/promote/delete start/stop the relevant listener. Events carry `owner_id`; the Copy Engine scopes followers to that owner.
+### 4.3 Cancels — `_mirror_cancel`
+1. Tombstone `ocancel:<order>`.
+2. **Master** = `_event_master(event)` (the one the event names; a demoted master → none).
+3. A cancelled **stop**: propagate only on `reason=stop_cancel`; a fired stop leaves the follower's alone.
+4. **Targets** = the order's `ordermap`; if empty, this master's followers only (`_follows`: `master_id` equal).
+5. Per target (skipping any follower of another master): cancel the mapped copy, or **self-heal** with `_find_follower_order` — exact `client_order_id` prefix `mo<order>_`; else (untagged legacy copies) same side **and** exact price, never a copy tagged for another order; no price → nothing.
+6. **Settle** (`_settle_exit_after_cancel`, plain orders): unless hands-off, close `held − target(master now) − the follower's resting exits`, at market, reduce-only, outside the deadband. An unreadable book counts as nothing resting.
 
-### Secrets & PnL
-* `core/crypto.py`: Fernet encrypt/decrypt (`enc:v1:` prefix, tolerant of legacy plaintext); `DeltaClient.__init__` decrypts, `accounts` writes encrypt.
-* `api/positions.py`: `today_pnl` = realized (sum of `cashflow`/`settlement`/`commission`/`funding` USD ledger entries since IST midnight, via `DeltaClient.get_wallet_transactions`) + live unrealized MTM.
+### 4.4 After a master limit fills
+* `_escalate_after_master_fill`: a **partial** master fill keeps the copy queued (no clock). On a full fill each mirror gets `ESCALATE_WAIT_SEC` (5s); the remainder is cancelled and sent at market, sized from the follower's own order, at most once per mirror (`escalating:<order>` claim).
+* `_confirm_order_copied` (separate task, after `ORDER_CONFIRM_SETTLE_SEC` = 3s): once per (order, follower) (`confirmed:` marker), defer while the mirror still rests; otherwise, **inside the leg lock with a fresh read**, buy `min(order share − legs filled, position target − held)`. With nothing mirrored it checks this master's followers only.
 
-### Admin API (`api/admin.py`)
-`/api/admin/overview`, `/users/{id}/role`, `/accounts`, `/positions`, `/trades`, `/alerts` — all `require_admin`, aggregating across tenants with owner email joins.
+### 4.5 Stops — `_follower_trigger`
+`trigger = master ± offset`, where offset = master's `tp_sl_offset` or 50, and the sign moves **away from the current price**: `+` if the master's trigger is above it, `−` if below. The current price comes from the contract's public ticker field for the order's trigger method (`spot_price` / `mark_price` / `close`). Unreadable price, or a result ≤ 0 → the master's own trigger. Used by bracket mirrors (incl. edits), protective mirrors and `_sync_protection`.
+
+When the master's stop fires: `master_stop_filled` → `handsoff:<owner>:<follower>:<symbol>` (24h). The reconciler and the post-cancel settle leave that leg alone; the orphan alert is suppressed. Cleared when the follower is flat or the master re-enters.
+
+### 4.6 Executing a market copy — `order_executor.execute`
+Rest a limit at the master's price for up to `FILL_WAIT_SEC` (5s, polling every 0.25s), then market the remainder; record the leg (`trade_copies`), slippage and latency. Consecutive failures feed the account's circuit breaker; success resets it.
+
+### 4.7 Placing with retry — `_place_order_with_retry`
+Every order carries a `client_order_id` (`mo<order>_<hex>` for mirrors, `me<28 hex>` otherwise; Delta: string ≤ 32 chars, unique across open orders). A 4xx other than 429 is raised. On a timeout / 5xx / 429, wait 5s, then look for the id in the follower's open orders and recent history — **found means the first attempt landed** and it is returned instead of placing again.
 
 ---
 
-## 6. Execution, latency & reliability (updates)
+## 5. Reconciler — `_reconcile_positions` (every 10s per master)
 
-### Low-latency copy pipeline
-* `delta_client._ws_loop` drains the socket **non-blocking** into two `asyncio.Queue`s; a worker (`_ws_worker`) processes **fills before order-churn** so a real trade never waits behind the master's SL/TP re-quote flood. The order-churn queue is capped (drop-oldest) to bound memory.
-* `main.redis_consumer` / `order_consumer` dispatch each event as a task with a **per-symbol lock** — same-symbol events stay ordered (place→cancel→fill), different symbols run concurrently.
-* `[WSLAG]` / `[LATENCY]` log lines instrument WS staleness and end-to-end copy time.
+For each follower of the event's master (`fpos` read strictly; a failed read skips the follower):
 
-### Fill logic (`order_executor.execute`)
-* A follower copy first rests a limit at the master's price; any unfilled remainder is then sent as a **market** order so the copy completes. Delta rejects `fok`, so it is not used.
+| Follower vs target | Action | Extra conditions |
+|---|---|---|
+| holds, master flat | **close** | not hands-off; manual master exit, or `STALE_ORPHAN_SEC` (60s) past the master's exit |
+| opposite side | **close** | |
+| right side, too big | **trim** | not while the master is working an order on the leg |
+| right side, too small | **top up** | not below the master's peak (`mpeak`); `TRIM_SETTLE_SEC` (10s) since the master's last fill |
+| flat, master holds | **open** | master's last **opening** fill on the leg ≤ `FRESH_ENTRY_SEC` (180s), else ℹ️ Left out of sync |
 
-### Unfilled-limit escalation (`copy_engine._escalate_unfilled_limit`)
-* The `ESCALATE_WAIT_SEC` (5s) window is measured from the **master's fill**, not from our placement. `trade_listener.on_order_fill` emits a `master_filled` event on a plain limit fill; `_escalate_after_master_fill` then gives each follower's mirror 5s to fill and markets the remainder, **sized from the follower's own order** (the master's 3000 lots are the follower's 30).
-* While the master's own order is still resting, `_escalate_unfilled_limit` returns immediately — **no market and no cancel**. Timing from placement instead both front-ran the master and, because a mirrored reduce-only order reported "nothing to close", cancelled it; the 30s order reconcile then re-placed it, producing an endless place/cancel loop.
-* SL/TP brackets are excluded (they rest until triggered).
+Every action: seen on **two consecutive passes**; outside the deadband `max(1 lot, RECON_SIZE_TOLERANCE_PCT = 5%)`; inside the leg lock; **last look** (`_live_signed_fresh` + `_still_worth_acting`, or the inline equivalent for open) so it sends the smaller of what it planned and what is still true. Each leg is isolated: one leg's exception costs that leg only and raises 🔥 Engine error. A discrepancy still present after `STUCK_AFTER_SEC` (60s) raises ⏳ Not corrected.
 
-### Protective cancel: trigger vs. manual (`copy_engine._mirror_cancel`)
-* Follower stops are jittered, so the master's stop firing implies nothing about the follower's. Discriminated on Delta's `reason`: only `stop_cancel` propagates the cancel; `stop_trigger`, a fill, or an unknown reason leaves the follower's stop in place. Biased toward keeping protection — an orphan stop is harmless and the protection sweep clears it; a stripped stop leaves a naked position.
+`_sync_protection` (every 30s): places a follower SL/TP the master has and the follower lacks (after two sweeps), cancels one the master dropped.
 
-### Sizing basis and fail-closed behaviour (`risk_engine`)
-* `auto_ratio` divides **equity** (`allocated_balance` → `balance` → `available_margin`), not free margin. Free margin moves as positions lock margin up, so a ratio built on it drifts with the book: the same unchanged positions read "expected 22" and later "expected 30" (~30%), firing false mismatch alerts and giving the reconciler a moving target. Applied consistently in `risk_engine`, `copy_engine` and `position_monitor`.
-* Sizing **returns 0 rather than guessing** when it cannot be computed — unreadable balances, no `allocation_mode`, no `allocation_value`, or an unrecognised mode. There is no 1:1 fallback anywhere: on a follower far smaller than the master, copying its size verbatim is the most dangerous value the function can return (a 610-lot target on a 70 USD account was computed live). Callers treat 0 as *skip*, never as a quantity, and a 0 target while the master still HOLDS means "unavailable", not "close everything".
-* `api/positions.py` reads the settlement balance by `asset_symbol in (USD, USDT)` and uses `available_balance`; it also refuses to overwrite a known-good balance with 0. The previous lookup matched a non-existent `asset` field and fell through to `balances_list[0]`, so any reordering wrote a zero — which then fed the sizing fallback above.
+---
 
-### Target sizing (one definition everywhere)
-* Every path — live close (`process_fill`), mirrored close (`_mirror_place`), escalation (`_follower_close_qty`), reconciler trim/top-up, post-cancel settle — computes the follower target as `ceil(master_size × ratio)` with `min_one=False` so a fully-exited master can still take the follower to 0. Mixing `ceil` and `floor` between paths made two of them each close a lot off the same 1-lot difference.
-* Resizing requires `|held − target| ≥ max(1 lot, RECON_SIZE_TOLERANCE_PCT%)`. The target moves with a live balance ratio, so a 1-lot difference on a 30-lot leg is noise; acting on it churns trim→top-up→trim.
+## 6. Redis keys (beyond the queues)
 
-### Reconciliation (`copy_engine._reconcile_positions`, `_sync_protection`)
-* **Positions, every 15s** — open a leg the follower is missing, close an orphan or wrong-side leg, **trim** an over-exposed one, **top up** an under-exposed one. Two-pass confirmation on every action; `TRIM_SETTLE_SEC` (45s) since the master's last fill before resizing.
-* **Recovery price guard** — a stale leg is recovered only if the mark is within `SYNC_PRICE_TOLERANCE_PCT` of the master's entry, otherwise it alerts. Gating on *age* alone (the previous behaviour) meant a missed entry was refused forever and the follower diverged permanently.
-* **Protection, every 30s** — cancels a follower SL/TP the master no longer has **and places one the follower is missing**. Brackets are excluded from the ordinary re-mirror, so without this a stop that failed to mirror once was never restored. Two-sweep confirmation plus a read-success check so a partial order read can't double-place a stop.
-* A master SL/TP is `reduce_only` but is **not** a close-now order: `_mirror_place` routes protective orders to their own branch, sized to cover the held position. Running them through the close-rebalance branch asks "how much must this follower close right now?" — always zero for a correctly-sized follower — which silently dropped the protection.
+| Key | Holds | TTL |
+|---|---|---|
+| `ordermap:<master order>` | `{follower: follower order}` | 7d |
+| `ordersize:<master order>` | master size each mirror reflects (resize detection) | 7d |
+| `mirrordone:<order>:<follower>` | this mirror filled — never re-place | 7d |
+| `ocancel:<order>` | the master cancelled it — never resurrect | 10 min |
+| `masterfilled:<order>` | master order completely filled | 24h |
+| `escalating:<…>`, `confirmed:<order>:<follower>` | once-only claims | 7d |
+| `oledger:<order>`, `oledger:sym:<owner>:<symbol>` | per-order ledger: master order + each follower's outcome | 7d |
+| `handsoff:<owner>:<follower>:<symbol>` (+ index) | leave this leg to the follower's own stop | 24h |
+| `mpeak:<master>:<symbol>` | master high-water mark (unwind detection) | — |
+| alert keys (`recon:`, `drift:`, `stale:`, `orphan:`, …) | once-per-episode alert suppression | episode / window |
 
-### Recorded decisions the reconciler consults (`core/order_ledger.py`)
-Position sizes cannot express "do nothing here", so two states are written down when the evidence appears and read back each pass instead of being re-inferred:
-* **Hands-off** (`handsoff:{owner}:{follower}:{symbol}`, + a per-follower index so marks can be enumerated and released). Raised on `master_stop_filled` or a protective order vanishing with `reason=stop_trigger` — **positive proof the stop fired**, never merely "not a deliberate cancel", since the mark suspends reconciliation on the leg and would otherwise block the follower being closed when the master exits gradually. Consulted by the reconciler's master-flat branch and `_settle_exit_after_cancel`. Cleared when the follower goes flat or the master re-enters.
-* **Peak** (`mpeak:{owner}:{symbol}` via `bump_peak` / `clear_peak`). While the master holds below the largest size it has held on a symbol it is net-reduced there, and top-ups are refused. Replaced a 15-minute "recently reduced" timer that expired 45s before a top-up bought back into an unwind still in progress, and that also blocked legitimate top-ups for 15 minutes after any wobble at full size. Both live in Redis: in-process state is lost on every deploy, which is exactly when these guards matter.
+---
 
-Throughout, the asymmetry is deliberate — **reducing** the follower on stale information is self-correcting, **adding** to it is not. Trims proceed while the master unwinds; top-ups do not.
+## 7. Alerts (`services/telegram_client.py`)
 
-### Duplicate protection (`_mirror_place`)
-* Idempotent per (master order, follower) via `ordermap`, but the *reason* a mirror is no longer resting decides what happens next: a mirror that **filled** is done and never re-placed; only one **cancelled without filling** is re-placed. Treating filled as gone double-exited a leg (master exited once, follower twice, same P&L booked twice).
-* An event older than `STALE_EVENT_RECHECK_SEC` (10s, above p95 latency so the hot path is untouched) is re-checked against the exchange first and skipped if the master's order is no longer resting.
-* Escalation refuses to market anything when `_follower_close_qty` returns `None` (sizing unavailable). Reading that as "no cap" marketed the follower's entire order — 7 then 9 lots against a target of 2 — flattening the position, which the reconciler then bought back and which cost the leg its TP.
+| Function | Message |
+|---|---|
+| `notify_mismatch` | ⚠️ Mismatch (stage one, at the second sighting) |
+| `notify_correction` | 🔧 Reconciler corrected |
+| `notify_holding` | ⏸ Holding on purpose |
+| `notify_stuck` | ⏳ Not corrected |
+| `notify_fail` | ⚠️ Mirror Failed / 🔥 Engine error / 🛑 Stopped retrying / ℹ️ Left out of sync (deliberate skips) |
+| `send_alert` | forwarded feed alerts: high slippage, no liquidity |
 
-### Order-ID ledger (`core/order_ledger.py`)
-* Redis, 7-day TTL. `oledger:{master_order_id}` holds the master order plus one leg per follower (`placed` / `filled` / `skipped` + reason / `failed` / `cancelled`); `oledger:sym:{owner}:{symbol}` indexes by symbol. Writes are pipelined into one round trip and are best-effort — a ledger failure can never block a copy.
-* Answers what a position-only view cannot: **"never placed"** vs **"placed and never filled"**. Exposed read-only at `/api/trades/ledger/order/{id}` and `/api/trades/ledger/symbol/{symbol}?missing_only=true`, owner-scoped.
+`position_mismatch` rows are in-app only (`SILENT_ALERT_TYPES`). Routing: `TELEGRAM_CHAT_ROUTES` by owner, else `TELEGRAM_CHAT_ID`. A chat upgraded to a supergroup is followed automatically (`migrate_to_chat_id`), but update the `.env` too. `notify_open` / `notify_close` exist and are deliberately never called.
 
-### Alerts
-* `position_monitor.check_sync_and_alert` raises mismatch on **both** follower and master, `owner_id`-stamped, once per episode (gated on an unresolved alert row) and re-arming when it resolves.
-* `socket_manager.emit_alert` forwards non-resolved alerts to Telegram (`services/telegram_client.py`; inert unless `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` set).
-* Suppression is **Redis-backed** (`SET NX EX`) so it survives a reload — in-process state alone meant every deploy re-alerted every ongoing condition. Persistent conditions send once per `STATE_ALERT_WINDOW` (6h) and are cleared via `clear_alert()` when resolved, making alerts edge-triggered; identical trade events collapse within `DUP_EVENT_WINDOW` (45s).
+---
+
+## 8. Timers and limits
+
+| Name | Value | Where |
+|---|---|---|
+| Position reconcile | 10s | `POSITION_RECONCILE_SEC` |
+| Order sweep / protection sync | 30s | `RECONCILE_INTERVAL_SEC` |
+| Limit copy fill window after the master's fill | 5s | `ESCALATE_WAIT_SEC` |
+| Executor limit-before-market | 5s | `FILL_WAIT_SEC` |
+| Confirm-copy settle | 3s | `ORDER_CONFIRM_SETTLE_SEC` |
+| Stale event re-check | 3s | `STALE_EVENT_RECHECK_SEC` |
+| Late-entry cut-off | 180s | `FRESH_ENTRY_SEC` |
+| Settle before resizing | 10s | `TRIM_SETTLE_SEC` |
+| Orphan after the master left | 60s | `STALE_ORPHAN_SEC` |
+| Mismatch alert after | 8s | `MISMATCH_ALERT_AFTER_SEC` |
+| Not-corrected alert after | 60s | `STUCK_AFTER_SEC` |
+| Deadband | 5% / 1 lot | `RECON_SIZE_TOLERANCE_PCT` |
+| Leg lock wait — live / reconciler | 30s / 5s | `LIVE_ACQUIRE_TIMEOUT` / `ACQUIRE_TIMEOUT` |
+| Follower SL/TP offset | 50 | `DEFAULT_TP_SL_OFFSET`, per master `tp_sl_offset` |
+| Slippage alert | > 2% and ≥ $5 | `SLIPPAGE_ALERT_PCT`, `SLIPPAGE_ALERT_MIN_USD` |
+| Masters per owner / followers per master | 5 / 2 | `api/accounts.py` |
+
+---
+
+## 9. Tests (`backend/tests/`)
+
+Self-contained scripts; `python backend/tests/run_all.py` runs them all. The in-memory exchange (`test_end_to_end.py`) holds positions and an order book, fills market orders, rests limits and applies reduce-only rules. Files most relevant to the rules above:
+
+| File | Covers |
+|---|---|
+| `test_end_to_end.py` | a full session: open, mirror, edit, cancel, stale re-mirror, top-up, trim, hands-off, two masters on one owner |
+| `test_split_fill.py` | market orders filling in pieces — entries and exits, overlapping, slow, repeated, out of order |
+| `test_cancel_cross_group.py` | one master's cancel / confirm-copy never acts on another group; demoted and masterless cases |
+| `test_concurrency_guards.py` | live leg wait, open last look, failed edit, lost-response retry, settle with resting exits, two master orders seconds apart, confirm-copy lock |
+| `test_partial_and_selfheal.py` | a part-filled master order still rests; self-heal cancels only the exact copy; mirror ids |
+| `test_stop_after_master.py` | follower SL/TP beyond the master's |
+| `test_settled_race.py`, `test_confirm_copy.py`, `test_escalation_race.py` | the settled check, confirm-copy, one escalation per mirror |
+| `test_reconcile_unbound.py`, `test_last_look.py`, `test_leg_locks.py` | reconciler robustness, last look, lock keying |
+| `test_fill_compare.py`, `test_order_history.py`, `test_pending_legs.py` | comparison report and copy history |

@@ -1,122 +1,157 @@
-# Mirror Engine - High-Level Design (HLD)
+# Mirror Engine — High-Level Design
 
-Mirror Engine is a real-time, institutional-grade copy trading system designed for Delta Exchange India. It allows manual trades executed on a master account to be replicated near-instantaneously (with a target latency of $<200\text{ms}$ and a copy slippage margin of $\le 0.03\%$) across multiple follower accounts.
+Mirror Engine copies a master account's trading on Delta Exchange India to its follower accounts, sized to each follower, in about 1–2 seconds, and then keeps checking that the followers still match.
+
+Reflects the code at commit `5982fe8` (24 Nov 2026). Exact rules, keys and timers are in the [LLD](lld.md).
 
 ---
 
-## 1. System Architecture
-
-The system utilizes an event-driven, decoupled microservices architecture designed to minimize latency on the trade execution path.
+## 1. Shape
 
 ```mermaid
 graph TD
-    %% External Entities
-    MasterExchange[Delta Exchange India<br/>Master WS Account Feed]
-    FollowerExchange[Delta Exchange India<br/>Follower API Endpoints]
-
-    %% Core Backend Services
-    subgraph backend [FastAPI Backend Engine]
-        Listener[Trade Listener Service]
-        CopyEngine[Parallel Copy Engine]
-        Risk[Risk Engine]
-        Executor[Order Executor]
-        API[FastAPI REST API]
-        SocketManager[Socket.IO Server]
+    subgraph Delta[Delta Exchange India]
+        MWS[Master WebSocket<br/>orders + positions]
+        FAPI[Follower REST API]
+        FWS[Follower WebSocket<br/>fills]
     end
 
-    %% Data Broker & Storage
-    Redis[(Upstash Redis<br/>Event Queue)]
-    DB[(Supabase PostgreSQL)]
+    subgraph Backend[FastAPI backend · Docker on EC2]
+        LM[ListenerManager<br/>one TradeListener per master]
+        Q[(Redis<br/>trade_events · order_events<br/>+ engine state)]
+        D[Dispatcher<br/>one task per event<br/>leg lock per master+symbol]
+        CE[Copy Engine]
+        REC[Reconciler<br/>positions every 10s<br/>orders every 30s]
+        RE[Risk Engine<br/>sizing]
+        EX[Order Executor]
+        PM[Position Monitor]
+        API[REST API + Socket.IO]
+        TG[Telegram client]
+    end
 
-    %% Frontend App
-    Frontend[Next.js Client Dashboard]
+    DB[(Supabase Postgres)]
+    UI[Next.js dashboard · Vercel]
 
-    %% Communications
-    MasterExchange -->|WebSocket: fills + order lifecycle| Listener
-    Listener -->|Market fills -> trade_events| Redis
-    Listener -->|Limit/stop place·edit·cancel -> order_events| Redis
-    Redis -->|Subscribe / Pop Event| CopyEngine
-    CopyEngine -->|1. Validate Size & Balance| Risk
-    Risk -->|2. Parallel Executions| Executor
-    Executor -->|3. Market / reduce-only orders| FollowerExchange
-    CopyEngine -->|3b. Mirror limit & bracket orders| FollowerExchange
-    Executor -->|4. Log Results & Slippage| DB
-    
-    API -->|Fetch Status / History| DB
-    SocketManager -->|Real-time Socket.IO Stream| Frontend
-    CopyEngine -->|Emit Live Updates| SocketManager
+    MWS --> LM --> Q --> D --> CE
+    LM -->|reconcile events| Q
+    CE --> RE
+    CE --> EX --> FAPI
+    CE -->|limits, edits, cancels, stops| FAPI
+    REC --> FAPI
+    FWS --> PM
+    CE --> DB
+    CE --> TG
+    REC --> TG
+    API --> DB
+    API --> UI
 ```
 
----
-
-## 2. Technology Stack
-
-| Component | Technology | Role |
-| :--- | :--- | :--- |
-| **Backend Framework** | FastAPI (Python) | Host REST APIs, WebSocket handlers, and lifespan managers |
-| **Real-time Queue** | Upstash Redis | Low-latency pub/sub message broker for trade events |
-| **Database** | Supabase (PostgreSQL) | Persistent storage for accounts, trades, logs, and alerts |
-| **WebSockets** | python-socketio | Real-time push updates to the web frontend |
-| **Frontend Framework** | Next.js (TypeScript) | Admin console dashboard with light/dark theme toggle |
-| **Styling** | Tailwind CSS / CSS Variables | Dynamic custom-themed styles |
-| **Containerization** | Docker / Docker Compose | Standardized environment setups |
+| Component | Responsibility |
+|---|---|
+| **TradeListener** (`core/trade_listener.py`) | One per active master. Reads the master's order and position updates; emits **fill events** (market orders), **order events** (resting limits and stops placed / edited / cancelled, a limit filled, a stop fired) and periodic **reconcile events**. Every event carries the master's account id. |
+| **Dispatcher** (`main.py`) | Pops events from Redis and runs each as its own task. Events for the same master and symbol take a shared **leg lock**, so they run one after another; different legs run in parallel. |
+| **Copy Engine** (`core/copy_engine.py`) | Decides what each follower must do for an event and does it. Also hosts the reconciler and protection sync. |
+| **Risk Engine** (`core/risk_engine.py`) | Follower size for a given master quantity: auto ratio, multiplier, fixed or capital %. Fail-closed. |
+| **Order Executor** (`core/order_executor.py`) | Places a follower's copy of a market fill: a limit at the master's price, then market for any remainder. |
+| **Position Monitor** (`core/position_monitor.py`) | Checks positions as updates arrive; raises in-app mismatch rows and the orphan alert. |
+| **Order Ledger** (`core/order_ledger.py`) | Redis records the engine consults: what happened to each master order per follower, hands-off marks, master peaks. |
+| **REST API / Socket.IO** (`api/`, `websocket/`) | Dashboard data, account management, comparison reports, auth. |
+| **Telegram client** (`services/telegram_client.py`) | Alert wording, per-owner routing, once-per-episode de-duplication. |
 
 ---
 
-## 3. High-Level Data Flow
+## 2. Groups, tenants and isolation
 
-The lifecycle of a copy trade execution consists of three phases:
+* **Owner** (a user) → up to **5 masters** → each with up to **2 followers**. A follower names its master in `accounts.master_id`.
+* **Every event names its master**, and the engine acts only on followers whose `master_id` *is* that master. A follower is sized only against its own master's position and balance. A follower whose master was deleted follows nobody and is never traded.
+* An admin is exempt from owner scoping in the API (sees and manages every tenant); the engine's isolation does not depend on the API at all.
+* All shared state is keyed per master or per follower: caches, two-pass confirmation, leg locks, hands-off marks, peaks.
 
-### Phase 1: Ingestion ($<15\text{ms}$)
-1. A trader places a trade on the **Delta Exchange Master Account**.
-2. The exchange triggers a fill event broadcasted over WebSockets.
-3. The backend **Trade Listener Service** captures the JSON payload, checks it against the Master account filters, and serializes it into the Redis `trade_events` queue.
-
-### Phase 2: Copy & Risk Evaluation ($<35\text{ms}$)
-1. The **Copy Engine** (running parallel worker threads) pops the event from Redis.
-2. It queries active followers in Supabase and routes them to the **Risk Engine**.
-3. The **Risk Engine** validates follower margin balances and computes customized order sizes using the follower's allocation mode:
-   * **Auto Balance Ratio** — `ceil(master_size × (follower_equity ÷ master_equity))`. Built on **equity, not free margin**: free margin moves as positions lock it up, so a ratio built on it drifts with the book instead of with account size. The same rounding defines the follower's target on every path (open, close, escalation, reconcile) so no two can disagree about what "in sync" means. Sizing is **fail-closed** — if it cannot be computed it returns 0 and callers skip, never falling back to copying the master 1:1.
-   * **Multiplier** — a fixed scale of the master size.
-   * An optional per-account **allocated balance** overrides the real balance for this ratio (useful for testing across very different balances).
-
-### Phase 2b: Order Mirroring (non-fill events)
-Pending **limit** and **stop / SL / TP (bracket)** orders the master places, edits or cancels are routed through a separate `order_events` queue. The Copy Engine mirrors them onto followers — placing limit orders, attaching brackets via Delta's bracket endpoint (with the master's Mark/Index trigger), editing in place on price/trigger changes, and cancelling (with a self-heal lookup if the id map is stale). A master→follower order-id map is kept in Redis. Each follower's SL/TP trigger is jittered by ±(0–20) so they don't all fire simultaneously.
-
-A mirrored limit **rests for as long as the master's rests**; only when the master's own order fills does the follower's mirror get 5s to fill before the remainder is forced to market. Because the follower's stop is jittered to a different price, a *cancel* of the master's protection is propagated only when Delta reports `reason=stop_cancel` (a deliberate cancel) — a triggered stop leaves the follower's own protection alone.
-
-Two situations look identical to a size comparison but demand opposite actions, so each is recorded when the evidence appears rather than re-inferred: **hands-off** (the master's SL/TP triggered, so the follower's own jittered stop must be left to close the leg) and **below peak** (the master is unwinding, so the follower is never topped up into it). Both live in Redis so a deploy cannot lose them. The asymmetry is deliberate — reducing the follower on stale information is self-correcting, adding to it is not.
-
-### Phase 2c: Reconciliation (state, not events)
-Live copying can fail for reasons the copy path cannot control — a margin rejection, a late request, a WebSocket gap, a limit that never fills. Rather than enumerating those, the engine periodically compares **state**: every 15s it opens a missing leg, closes an orphan or wrong-side leg, trims an over-exposed one and tops up an under-exposed one; every 30s it re-mirrors resting limits and syncs protection **in both directions** (cancelling an orphaned follower stop *and* placing one the follower is missing). Every action requires two consecutive confirming passes and clears a size deadband, so ratio noise can't trigger a trade. Separately, an **order-ID ledger** records each master order and each follower's outcome, so a mismatch can be attributed to a specific master order id — distinguishing "never placed" from "placed and never filled".
-
-### Phase 3: Parallel Execution & Logging ($<150\text{ms}$)
-1. The **Order Executor** converts the allocation into direct REST market orders on Delta Exchange.
-2. Orders for all followers are fired concurrently using asynchronous requests.
-3. Post-execution prices are compared against the Master's entry price to log slippage.
-4. Records are written to Supabase and immediately pushed to active frontend browsers via **Socket.IO**.
+> **Why this is strict.** On 24 Nov 2026 a cancel on one master, with no follower copy on record, fell back to "every follower in the system" and sized another group's follower against the wrong master: 2602 lots closed. Isolation is now enforced at each selection point and covered by tests.
 
 ---
 
-## 4. Key Performance Indicators (KPIs)
+## 3. How a master action reaches a follower
 
-* **Execution Latency**: Target end-to-end copy latency is $<200\text{ms}$ from master fill detection to follower submission.
-* **Slippage Threshold**: Maximum acceptable price difference between Master and Follower is $0.03\%$ (3 basis points). Any slippage exceeding this limit raises a warning alert.
+### 3.1 Market order (fill event)
+1. The listener sees the fill and pushes `{master order id, how much has filled so far}`.
+2. The engine **claims** the not-yet-copied part of that order in the database (atomically), so a repeated or out-of-order update copies nothing twice.
+3. Per follower:
+   * **Entry** — copy this piece's share of the order, capped at what keeps the follower at its share of the master's live position.
+   * **Exit, filled in one go** — close the follower down to its share of what the master still holds.
+   * **Exit, filled in pieces** — each piece sells only its share, never taking the follower below its share; the last piece to a flat master closes whatever is left.
+4. The Order Executor places it: limit at the master's price, then market.
+
+### 3.2 Resting limit order (order event)
+* **Place** → the follower gets the same order at the same price, sized as part of the master's whole ladder on that strike. A part-filled master order is still resting and is sized by what is left.
+* **Edit** → the follower's copy is edited; a failed edit cancels the old copy before re-placing.
+* **Cancel** → the follower's copy is cancelled, found by an id tied to the master's order. Then a **settle** closes the follower down to its share if the master abandoned an exit — counting the follower's other resting exits first.
+* **Master's limit fills** → the follower's copy gets 5s to fill at the same price, then the remainder goes at market. A partial master fill keeps the copy queued. When the master's order is final, **confirm-copy** checks each follower got its share and tops up any shortfall.
+
+### 3.3 Stop-loss / take-profit
+* Each follower gets its own copy, placed **`tp_sl_offset` (default 50) beyond the master's trigger** on the side away from the current price, so the master always exits first. If the price can't be read, the copy goes exactly on the master's trigger — never in front of it. *(Temporary desk rule since 24 Nov 2026.)*
+* When the **master's stop fires**, the follower's leg is marked **hands-off**: its own stop is left to close it, and nothing is forced.
+* The order sweep **places a missing follower stop** and **cancels an orphaned one**.
 
 ---
 
-## 5. Multi-tenancy, Authentication & Admin
+## 4. The safety net (reconciler)
 
-Mirror Engine is multi-tenant: every user manages their own master + followers in isolation.
+Live copying can fail for reasons it cannot control — a margin rejection, a WebSocket gap, a limit that never fills. So the engine also compares **state**:
 
-* **Identity** — Supabase Auth (GoTrue). Tokens are verified via the `/auth/v1/user` introspection endpoint. Roles (`user` / `admin`) live in a `profiles` table. Auth methods: email+password, optional email-OTP 2FA (Resend, gated by `TWOFA_ENABLED`), Google OAuth, and a server-side "quick-admin" passphrase that logs into a shared admin account.
-* **Data isolation** — every domain row carries `owner_id`. API queries are owner-scoped (`scope_owned`), admins bypass scoping (`require_admin`). Postgres **Row-Level Security** (`owner_id = auth.uid() OR is_admin()`) enforces the same at the DB layer; the service-role backend bypasses RLS.
-* **Per-user engine** — a **`ListenerManager`** runs one master WebSocket `TradeListener` per user, so all tenants' masters trade concurrently. Fill/order events are tagged with the master's `owner_id` and the Copy Engine only mirrors to that owner's followers.
-* **Secrets at rest** — Delta API keys/secrets are Fernet-encrypted (`crypto.py`) and decrypted transparently inside `DeltaClient`.
-* **Today's PnL** — computed per account as realized PnL for the IST day (summed from Delta's wallet ledger) plus current unrealized MTM PnL.
-* **Admin console** — a dedicated cross-tenant UI (users, all accounts, all positions, trades, alerts) served under `/admin` and guarded by role.
+* **Every 10s per master** it compares each follower leg with its target (its share of the master's position) and opens a missing leg, trims an oversized one, tops up an undersized one, or closes one the master has left.
+* **Every 30s** it re-pushes the master's resting limits (idempotent — only a missing copy is placed) and syncs protection.
 
-## 6. Deployment Topology
+What keeps it from doing harm:
 
-Frontend is hosted on **Vercel** (Next.js); backend + Redis run in **Docker** on the server. `NEXT_PUBLIC_*` values are baked into the client build on Vercel; all real secrets (Supabase service key, Resend, admin credentials, encryption key, Delta keys) stay in the backend `.env`.
-* **Circuit Breakers**: If a follower account encounters 5 consecutive execution failures, the account status is automatically set to `blocked` and copy activities are suspended.
+| Guard | Why |
+|---|---|
+| **Two sightings** before acting | a book read mid-trade looks wrong for one pass |
+| **Deadband** — under 5% or 1 lot is ignored | the ratio moves with balances; acting on noise churns |
+| **No late entries** — a missing leg is opened only if the master's last *entry* on it is under 3 minutes old; an exit never counts as an entry | buying in late at a new price is worse than staying out; it alerts instead |
+| **Hold while the master is working an order or reducing** (below his peak) | his own order settles it; topping up into an unwind is wrong |
+| **Hands-off** after the master's stop fired | the follower's own stop closes it |
+| **Last look** — re-read the follower inside the leg lock before placing | a live copy may have just changed the leg |
+| **Leg lock**, skip if busy for 5s | never act alongside another writer on the same leg |
+
+Asymmetry throughout: **reducing** a follower on stale information is self-correcting; **adding** is not. Opens and top-ups are the most guarded actions.
+
+---
+
+## 5. Concurrency model
+
+* Each event is its own asyncio task; there is no single queue worker to block on.
+* The **leg lock** `(master, symbol)` serialises everything that can trade a follower's leg: live fill and order events, the reconciler's corrections, confirm-copy.
+  * **Live events wait up to 30s** for the lock — longer than one copy takes (limit, 5s wait, market, confirm) — and only run unlocked if something is genuinely stuck, so a master trade is never dropped.
+  * **The reconciler waits 5s** and skips the leg if busy; the next pass retries.
+* **Idempotency** by master order id: the per-order claim for fills, `ordermap` for resting copies, a `client_order_id` on every placed order, and once-per-order markers for escalation and confirm-copy.
+
+---
+
+## 6. Alerting
+
+* Routine copies are silent; Telegram carries only what needs a look (see README). Mismatch rows also appear in the in-app feed.
+* Alerts are once per episode (Redis-backed, survives a restart) and re-arm when the problem clears.
+* Each owner's alerts go to their own chat (`TELEGRAM_CHAT_ROUTES`).
+* A daily report compares master and follower fills from the exchange and posts the result at 23:45 IST.
+
+---
+
+## 7. Deployment
+
+| Piece | Where |
+|---|---|
+| Frontend (Next.js) | **Vercel**, deploys on push to `main` |
+| Backend (FastAPI) + Redis | **Docker on EC2**; backend bind-mounted with `uvicorn --reload`, so a `git pull` restarts it in ~3s |
+| Database + auth | **Supabase** (Postgres, Mumbai) |
+| Monitoring | `ops/watchdog.sh` (on-host cron, restarts a hung backend, alerts); `.github/workflows/uptime.yml` (external health check) |
+
+Secrets live only in `backend/.env` on the host. Delta API secrets are Fernet-encrypted at rest. Login is email-only (passwordless) with an admin passphrase; optional email-OTP 2FA.
+
+---
+
+## 8. Open decisions
+
+* **Follower stopped out by its own stop.** Proposed: the follower stays out of that leg until the master closes it, with no false alerts and a "closed by own stop" label on the dashboard. Built and tested; waiting on the desk. Until then, a master add or partial exit on that leg can buy the follower back in.
+* **Where follower stops sit** once the above lands (the "always after the master" rule is temporary).
+* **Pause / resume baseline:** on resume the engine treats positions already on a follower as its own and adjusts them to match the master. Alternative: leave pre-existing positions alone.

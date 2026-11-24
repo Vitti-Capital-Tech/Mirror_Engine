@@ -1,0 +1,1006 @@
+# Runnable from anywhere: put backend/ (the `app` package) on the path.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+"""Regression test for the order-ID ledger and the size-aware reconciler.
+
+Replays the real incident on C-BTC-67200-300726 (2026-07-29), reconstructed from the
+backend logs - NOT the "the event was lost during an outage" story it first looked
+like. There was no outage; the timeline was:
+
+  18:26:41  master rests a full-size exit LIMIT (order 1442271322)
+  18:26:45  engine mirrors it correctly -> follower order 1442271534
+            master's order half-fills (master -3000 -> -1464)
+            follower's limit is behind it in the queue and fills NOTHING
+  20:56:43  master cancels the remainder -> engine cancels the follower's copy too,
+            taking it out of the queue while it still held all 30 lots
+
+So the follower held 30 when it should have held 15, on the CORRECT side - invisible
+to the old side-only reconciler, and left there because (a) escalation to market was
+switched off for exits by design, and (b) mirroring the master's cancel is literally
+faithful but semantically backwards when the master got what it wanted and the
+follower got nothing.
+
+Covers all three fixes: the cancel-time settle (primary), the reconciler's size/ratio
+check (backstop), and the ledger's order-ID trail. Also asserts the look-alikes do
+NOT trigger a trim: a correctly-sized follower, ordinary ceil/floor rounding, a
+position still being built, or master activity too recent to have settled.
+
+No network, no Redis, no Supabase: everything is faked. Run it directly:
+    python test_order_ledger.py
+Exits non-zero if any check fails.
+"""
+import asyncio, os, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Fake-but-well-formed creds so the module-level Supabase client constructs.
+# Nothing here ever talks to Supabase - the engine gets FakeDB injected. Set
+# before importing app.* so a real .env can never be picked up by this test.
+_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.notreal"
+os.environ["SUPABASE_URL"] = "https://fake.supabase.co"
+os.environ["SUPABASE_KEY"] = _JWT
+os.environ["SUPABASE_SERVICE_KEY"] = _JWT
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
+
+from app.core import order_ledger as ledger
+
+
+# ---------------------------------------------------------------- fake redis
+class FakeRedis:
+    def __init__(self):
+        self.h = {}   # key -> {field: value}
+        self.z = {}   # key -> {member: score}
+        self.kv = {}  # key -> string
+        self.s = {}   # key -> set
+
+    async def hset(self, key, field=None, value=None, mapping=None):
+        d = self.h.setdefault(key, {})
+        if mapping:
+            d.update({str(k): str(v) for k, v in mapping.items()})
+        else:
+            d[str(field)] = str(value)
+
+    async def hget(self, key, field):
+        return self.h.get(key, {}).get(str(field))
+
+    async def hgetall(self, key):
+        return dict(self.h.get(key, {}))
+
+    async def hdel(self, key, field):
+        self.h.get(key, {}).pop(str(field), None)
+
+    async def delete(self, key):
+        self.h.pop(key, None)
+        self.kv.pop(key, None)
+        self.s.pop(key, None)
+
+    async def expire(self, key, ttl):
+        pass
+
+    async def zadd(self, key, mapping):
+        self.z.setdefault(key, {}).update(mapping)
+
+    async def zremrangebyscore(self, key, lo, hi):
+        z = self.z.get(key, {})
+        for m in [m for m, s in z.items() if lo <= s <= hi]:
+            z.pop(m)
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return None
+        self.kv[key] = str(value)
+        return True
+
+    async def get(self, key):
+        return self.kv.get(key)
+
+    async def sadd(self, key, *vals):
+        self.s.setdefault(key, set()).update(str(v) for v in vals)
+
+    async def srem(self, key, *vals):
+        self.s.get(key, set()).difference_update(str(v) for v in vals)
+
+    async def smembers(self, key):
+        return set(self.s.get(key, set()))
+
+    async def zrevrange(self, key, start, stop):
+        items = sorted(self.z.get(key, {}).items(), key=lambda kv: kv[1], reverse=True)
+        return [m for m, _ in items[start:stop + 1]]
+
+    def pipeline(self, transaction=False):
+        """Mimics redis.asyncio pipelining: queue sync calls, flush on execute()."""
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    def __init__(self, r):
+        self.r = r
+        self.ops = []
+
+    def __getattr__(self, name):
+        def queue(*a, **k):
+            self.ops.append((name, a, k))
+            return self
+        return queue
+
+    async def execute(self):
+        out = []
+        for name, a, k in self.ops:
+            out.append(await getattr(self.r, name)(*a, **k))
+        self.ops.clear()
+        return out
+
+
+# ------------------------------------------------------------- fake supabase
+MASTER = {"id": "m1", "name": "Master", "is_master": True, "api_key": "k",
+          "api_secret": "s", "environment": "demo", "allocated_balance": 100000,
+          "owner_id": "u1"}
+FOLLOWER = {"id": "f1", "name": "Prathav-Follower", "is_master": False,
+            "status": "active", "api_key": "k", "api_secret": "s",
+            "environment": "demo", "allocation_mode": "multiplier",
+            "allocation_value": 0.01, "owner_id": "u1",
+            "master_id": "m1"}   # a follower names its master (all live ones do)
+
+
+class Res:
+    def __init__(self, data): self.data = data
+
+
+class Query:
+    def __init__(self, rows): self.rows = rows; self.f = {}
+    def select(self, *a, **k): return self
+    def eq(self, col, val): self.f[col] = val; return self
+    def execute(self):
+        out = [r for r in self.rows if all(r.get(c) == v for c, v in self.f.items())]
+        return Res(out)
+
+
+class FakeDB:
+    def table(self, name):
+        return Query([MASTER, FOLLOWER] if name == "accounts" else [])
+
+
+# --------------------------------------------------------------- fake client
+class FakeClient:
+    def __init__(self, positions, orders=()):
+        self._pos = positions
+        self._orders = list(orders)
+        self.placed = []
+        self.cancelled = []
+        self.order_reads = 0
+        self.orders_fail = False
+
+    async def get_positions(self, strict=False): return self._pos
+    async def get_open_orders(self, state=None):
+        self.order_reads += 1
+        if self.orders_fail:
+            raise RuntimeError("simulated exchange read failure")
+        return self._orders if state == "open" else []
+    async def place_order(self, **kw): self.placed.append(kw); return {"id": "new1"}
+    # The current price a follower's SL/TP is placed relative to (2026-11-24:
+    # follower stops sit BEYOND the master's, on the side away from it).
+    async def get_ticker(self, symbol): return {"spot_price": 65000, "mark_price": 1.2, "close": 1.2}
+    async def cancel_order(self, oid, product_id=None):
+        self.cancelled.append(str(oid))
+    async def close(self): pass
+
+
+class FakeConnMgr:
+    def __init__(self, client): self.client = client
+    def get_client(self, _id): return self.client
+    async def connect_account(self, _acc): return self.client
+
+
+class FakeSocket:
+    async def emit_trade_copy(self, *a, **k): pass
+    async def emit_account_update(self, *a, **k): pass
+
+
+SYM = "C-BTC-67200-300726"
+
+
+def build(follower_size, master_size, orders=(), last_master_fill_age=600.0,
+          mark=1.2, entry=None, master_working=False):
+    from app.core.copy_engine import CopyEngine
+    client = FakeClient([{"product_symbol": SYM, "size": follower_size}], orders)
+    eng = CopyEngine(FakeDB(), FakeRedis(), FakeSocket(), FakeConnMgr(client))
+    # Stub the REST-backed helpers the reconciler uses.
+    age = last_master_fill_age
+    async def fake_fresh(_master_row):
+        return {SYM: time.time() - age}
+    eng._master_recent_fill_ts = fake_fresh
+    async def fake_classify(_m, _s): return "unknown"
+    eng._classify_master_exit = fake_classify
+    async def fake_master_size(_row, _sym, fresh=False): return abs(master_size)
+    eng._master_position_size = fake_master_size
+    # Is the master still WORKING an order on this symbol? These scenarios have him
+    # finished (his last fill is `last_master_fill_age` old), so the honest answer is
+    # no — pass master_working=True to model an exit still in flight.
+    async def fake_working(_row, _sym, _msz): return master_working
+    eng._master_working_reducer = fake_working
+    event = {"owner_id": "u1", "positions": (
+        [{"symbol": SYM, "size": master_size, "mark": mark, "entry": entry}]
+        if master_size else []
+    )}
+    return eng, client, event
+
+
+def _order_lookup(orders):
+    """Stub for CopyEngine._safe_get_order backed by a dict of {id: order}."""
+    async def _get(_client, order_id):
+        return orders.get(str(order_id), {})
+    return _get
+
+
+def _master_key(eng, event):
+    """The bucket _reconcile_positions will use for this event.
+
+    Derived the same way the engine derives it, so seeding a two-pass memory in
+    a test cannot drift from where the engine looks for it.
+    """
+    return str((event or {}).get("master_account_id")
+               or (event or {}).get("owner_id") or "")
+
+
+async def passes(eng, event, n=2):
+    for _ in range(n):
+        await eng._reconcile_positions(event)
+
+
+def check(name, cond, detail=""):
+    print(f"{'PASS' if cond else 'FAIL'}  {name}{(' --- ' + detail) if detail else ''}")
+    return cond
+
+
+async def main():
+    ok = True
+
+    # ---- 1. The 67200 bug: master trimmed to 1464, follower still holds 30.
+    eng, client, event = build(-30, -1464)
+    await eng._reconcile_positions(event)
+    ok &= check("pass 1 does NOT act (two-pass confirmation)", client.placed == [],
+                f"placed={client.placed}")
+    await eng._reconcile_positions(event)
+    ok &= check("pass 2 trims the missed partial exit", len(client.placed) == 1)
+    if client.placed:
+        o = client.placed[0]
+        ok &= check("trim is buy 15 reduce-only market on the right symbol",
+                    o["side"] == "buy" and o["size"] == 15 and o["reduce_only"] is True
+                    and o["order_type"] == "market_order" and o["symbol"] == SYM,
+                    str(o))
+
+    # ---- 2. No false positive when the follower is already correct.
+    eng, client, event = build(-15, -1464)
+    await passes(eng, event)
+    ok &= check("correctly-sized follower is left alone", client.placed == [],
+                f"placed={client.placed}")
+
+    # ---- 3. Rounding must never look like over-exposure (ceil on open).
+    for msz, held in ((-150, -2), (-100, -1), (-101, -2), (-3000, -30)):
+        eng, client, event = build(held, msz)
+        await passes(eng, event)
+        ok &= check(f"rounding safe: master {msz} / follower {held}",
+                    client.placed == [], f"placed={client.placed}")
+
+    # ---- 4. A resting order that would ADD to the position means the size isn't
+    #         settled (follower may be building) -> don't trim.
+    eng, client, event = build(-30, -1464, orders=[
+        {"product_symbol": SYM, "id": "o9", "side": "sell"}])  # sell adds to a short
+    await passes(eng, event)
+    ok &= check("resting ADD order suppresses the trim", client.placed == [],
+                f"placed={client.placed}")
+
+    # ---- 4a. An order with an unreadable side is treated as adding (conservative).
+    eng, client, event = build(-30, -1464, orders=[{"product_symbol": SYM, "id": "o9"}])
+    await passes(eng, event)
+    ok &= check("unknown-side resting order suppresses the trim", client.placed == [],
+                f"placed={client.placed}")
+
+    # ---- 4c. THE 67200 CASE: the follower's mirrored EXIT is resting and stuck
+    #          (buy, reducing a short) and never filled. The old guard skipped the
+    #          trim for as long as it rested - i.e. forever. It must now cancel the
+    #          stuck close FIRST (so it can't fill on top of the market close) and
+    #          then trim.
+    eng, client, event = build(-30, -1464, orders=[
+        {"product_symbol": SYM, "id": "1442271534", "side": "buy", "product_id": 42}])
+    await passes(eng, event)
+    ok &= check("stuck EXIT order does NOT suppress the trim", len(client.placed) == 1,
+                f"placed={client.placed}")
+    ok &= check("stuck EXIT order is cancelled before the trim",
+                client.cancelled == ["1442271534"], f"cancelled={client.cancelled}")
+
+    # ---- 4b. A resting SL/TP must NOT suppress it (followers almost always
+    #          have one, so keying off it would disable trimming entirely).
+    eng, client, event = build(-30, -1464, orders=[
+        {"product_symbol": SYM, "id": "o9", "stop_order_type": "stop_loss_order"}])
+    await passes(eng, event)
+    ok &= check("resting SL/TP does NOT suppress the trim", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # ---- 5. Too soon after the master's fill -> wait (don't race a live close).
+    eng, client, event = build(-30, -1464, last_master_fill_age=5.0)
+    await passes(eng, event)
+    ok &= check("recent master fill defers the trim", client.placed == [],
+                f"placed={client.placed}")
+
+    # ---- 6. Stale-orphan escape: master FLAT, follower holds behind a stop,
+    #         classify returns 'unknown' (grid master, close rolled out of the
+    #         history window). Old behaviour: deferred forever.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "o9", "stop_order_type": "stop_loss_order"}])
+    await passes(eng, event)
+    ok &= check("stale unknown-exit orphan gets closed", len(client.placed) >= 1,
+                f"placed={client.placed}")
+
+    # ---- 6b. ...but a RECENT unknown exit still waits for the follower's stop.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "o9", "stop_order_type": "stop_loss_order"}],
+        last_master_fill_age=10.0)
+    await passes(eng, event)
+    ok &= check("recent unknown-exit is still deferred", client.placed == [],
+                f"placed={client.placed}")
+
+    # ---- 7. Cancel-time settle - the primary 67200 fix. At 20:56 the master
+    #         cancelled the remainder of its exit limit after getting ~half filled.
+    #         The follower's mirrored exit had filled NOTHING, so cancelling its copy
+    #         left it holding everything. The settle must finish the exit instead.
+    eng, client, event = build(-30, -1464)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("cancel settle finishes the follower's unfilled exit",
+                len(client.placed) == 1, f"placed={client.placed}")
+    if client.placed:
+        o = client.placed[0]
+        ok &= check("settle closes exactly 15 (30 -> target 15), reduce-only market",
+                    o["side"] == "buy" and o["size"] == 15 and o["reduce_only"] is True
+                    and o["order_type"] == "market_order", str(o))
+
+    # ---- 7b. Same target math as the reconciler's trim - if the two disagreed they
+    #          would fight each other forever (settle closes to 14, trim wants 15).
+    eng, client, event = build(-15, -1464)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle is a no-op when the follower is already at target",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 7c. A cancel on a symbol the follower is flat on must do nothing.
+    eng, client, event = build(0, -1464)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle is a no-op when the follower is flat", client.placed == [],
+                f"placed={client.placed}")
+
+    # RECENCY, not price (desk call, Prathav 2026-09-02: drop the drift test, copy
+    # recent trades only, no stale entries). Sections 8-9 below used to turn on
+    # whether the mark had wandered from the master's entry; they now turn on how
+    # long ago the master filled. FRESH = 30s, which clears TRIM_SETTLE_SEC (10s)
+    # and is inside FRESH_ENTRY_SEC (180s). The build() default of 600s is STALE.
+    FRESH = 30.0
+
+    # ---- 8. UNDER-exposed top-up. The 2026-07-30 audit found 4 symbols where the
+    #         follower sat below target with nothing to correct it: the trim only
+    #         handles over-exposure and the open path only fires when FLAT.
+    #         (C-BTC-64800: master 500 long, follower 3, target 5.)
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
+    await eng._reconcile_positions(event)
+    ok &= check("top-up pass 1 does NOT act", client.placed == [], f"placed={client.placed}")
+    await eng._reconcile_positions(event)
+    ok &= check("top-up pass 2 buys the shortfall", len(client.placed) == 1,
+                f"placed={client.placed}")
+    if client.placed:
+        o = client.placed[0]
+        ok &= check("top-up is buy 2 (3 -> target 5), NOT reduce-only",
+                    o["side"] == "buy" and o["size"] == 2 and o["reduce_only"] is False,
+                    str(o))
+
+    # ---- 8b. Same, short side: master -3050, follower -29, target 31 -> sell 2.
+    eng, client, event = build(-29, -3050, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("top-up on a short sells to increase the short",
+                len(client.placed) == 1 and client.placed[0]["side"] == "sell"
+                and client.placed[0]["size"] == 2, f"placed={client.placed}")
+
+    # ---- 8b-ii. The two-pass confirmation must LATCH across a wobbling shortfall.
+    #          It is keyed on (follower, symbol) — it used to include the shortfall
+    #          itself, so the number had to be byte-identical on both passes. The
+    #          target comes from a live balance ratio that moves a lot or two between
+    #          passes (2026-08-03: the same unchanged positions read "expected 22"
+    #          then "expected 30"), so a real miss could restart confirmation
+    #          forever — and the shorter the reconcile interval, the more often that
+    #          happens. Seed a DIFFERENT previous observation and check it still acts,
+    #          on the SMALLER of the two so a wobble can only under-open.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
+    # Seeded through the engine's own key, not a hand-written one: these
+    # two-pass memories became per-MASTER dicts on 2026-11-19 (one master's
+    # pass used to wipe another's), and a test that still seeds the old flat
+    # shape silently stops exercising the latch it is here to protect.
+    _mk = _master_key(eng, event)
+    eng._recon_topup_prev = {_mk: {("f1", SYM): 5}}   # last pass saw a bigger shortfall
+    await eng._reconcile_positions(event)             # this pass sees 2
+    ok &= check("confirmation latches despite a changed shortfall",
+                len(client.placed) == 1, f"placed={client.placed}")
+    if client.placed:
+        ok &= check("acts on the SMALLER observation (2, not 5)",
+                    client.placed[0]["size"] == 2, str(client.placed[0]))
+
+    # A first sighting still must not act, whatever the size.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2, last_master_fill_age=FRESH)
+    eng._recon_topup_prev = {}
+    await eng._reconcile_positions(event)
+    ok &= check("a first sighting still waits for confirmation",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 8c. A STALE shortfall is left alone however close the price is. This is
+    #          the cost of the policy and it is deliberate: a leg the follower missed
+    #          by more than FRESH_ENTRY_SEC is abandoned, so its book differs from the
+    #          master's until the master trades that symbol again. It alerts.
+    eng, client, event = build(3, 500, mark=1.2, entry=1.2)      # 600s old
+    await passes(eng, event)
+    ok &= check("stale shortfall is NOT topped up, even at the master's price",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 8d. And a drifted price no longer blocks a FRESH one. Live 2026-09-01
+    #          20:24 P-BTC-75200-020926: master short at 18.0162, mark ran to 22.8,
+    #          the old guard refused five passes at 23.6-27.8% — yet opening that
+    #          short at 22.8 was ~25% BETTER than the master's own entry. Follower
+    #          sat 19 lots short of target 23 for 2m21s.
+    eng, client, event = build(3, 500, mark=2.0, entry=1.2, last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("drift no longer blocks a fresh top-up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # ---- 9. A STALE missing leg is NOT recovered. Price is irrelevant now.
+    eng, client, event = build(0, -1500, mark=1.2, entry=1.15)   # 600s old
+    await passes(eng, event)
+    ok &= check("stale missing leg is NOT recovered (price close)",
+                client.placed == [], f"placed={client.placed}")
+
+    eng, client, event = build(0, -1500, mark=3.0, entry=1.15)   # 600s old
+    await passes(eng, event)
+    ok &= check("stale missing leg is NOT recovered (price far)",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 9b. A FRESH missing leg IS recovered, and the price does not gate it.
+    eng, client, event = build(0, -1500, mark=3.0, entry=1.15,
+                               last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("fresh missing leg IS recovered regardless of price",
+                len(client.placed) == 1 and client.placed[0]["side"] == "sell"
+                and client.placed[0]["reduce_only"] is False, f"placed={client.placed}")
+
+    # ---- 9c. An unknown entry price is no longer consulted at all.
+    eng, client, event = build(0, -1500, mark=1.2, entry=None,
+                               last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("unknown master entry is irrelevant to a fresh recovery",
+                len(client.placed) == 1, f"placed={client.placed}")
+
+    # ---- 10. ROOT CAUSE of the missing TP/SL. A master SL/TP is reduce_only but is
+    #          NOT a close-now order. It used to fall into the close-rebalance branch,
+    #          which asks "how much must this follower close right now?" - and for a
+    #          correctly-sized follower that is always "nothing", so the protection
+    #          was dropped. Live logs showed this 175x for C-BTC-65400-300726
+    #          ("nothing to rest (holds 1, target 1)") while the follower had no TP.
+    prot_event = {
+        "action": "place", "master_order_id": "1442619685", "symbol": SYM,
+        "product_id": 144020, "side": "sell", "size": 150,
+        "order_type": "market_order", "limit_price": None, "stop_price": 5.0,
+        "stop_order_type": "take_profit_order", "stop_trigger_method": "mark_price",
+        "reduce_only": True, "is_bracket": False, "is_update": False, "owner_id": "u1",
+    }
+    eng, client, _ = build(2, 150)
+    await eng._mirror_place(prot_event, "1442619685")
+    ok &= check("master TP/SL is now MIRRORED, not dropped as a no-op close",
+                len(client.placed) == 1, f"placed={client.placed}")
+    if client.placed:
+        o = client.placed[0]
+        ok &= check("mirrored protection carries the stop type and is sized to the position",
+                    o.get("stop_order_type") == "take_profit_order"
+                    and o.get("size") == 2 and o.get("reduce_only") is True, str(o))
+        ok &= check("mirrored protection trigger is jittered off the master's 5.0",
+                    o.get("stop_price") is not None and o["stop_price"] != 5.0,
+                    f"stop_price={o.get('stop_price')}")
+
+    # ---- 10b. Nothing to protect -> skip cleanly (don't place a naked stop).
+    eng, client, _ = build(0, 150)
+    await eng._mirror_place(prot_event, "1442619685")
+    ok &= check("no protection placed when the follower holds nothing",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 11. DEADBAND. auto_ratio derives the target from a LIVE balance ratio, so
+    #          it drifts continuously; a 3050-lot master leg sat right on the 30/31
+    #          boundary. Acting on that 1-lot difference churned real money live on
+    #          2026-07-30 (trimmed P-BTC-60000 and P-BTC-60500 by 1 each, which the
+    #          top-up would then buy back). Differences within 5% must be ignored.
+    # master -3000 -> target ceil(30.0) = 30, so +/-1 lot is 3.3% - inside the band.
+    eng, client, event = build(-31, -3000, mark=1.2, entry=1.2)
+    await passes(eng, event)
+    ok &= check("1-lot noise on a 30-lot leg does NOT trim",
+                client.placed == [], f"placed={client.placed}")
+
+    eng, client, event = build(-29, -3000, mark=1.2, entry=1.2)
+    await passes(eng, event)
+    ok &= check("1-lot noise on a 30-lot leg does NOT top up",
+                client.placed == [], f"placed={client.placed}")
+
+    # ...but a genuine miss still clears the deadband comfortably.
+    eng, client, event = build(-15, -3000, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
+    await passes(eng, event)
+    ok &= check("a real 15-lot shortfall still tops up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    eng, client, _ = build(-30, -1464)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle still fires on a real 15-lot excess", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    eng, client, _ = build(-31, -3000)
+    await eng._settle_exit_after_cancel(FOLLOWER, client, SYM, MASTER, ref_price=1.2)
+    ok &= check("settle ignores 1 lot on a 30-lot leg (no churn against the trim)",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 12. Liveness cache. This is the hottest call in the engine (every repeat
+    #          of a master resting order asked the exchange twice PER FOLLOWER), and
+    #          that REST volume delayed order placement past Delta's ~5s signature
+    #          window - orders were rejected with expired_signature 13-21s late.
+    #          The cache must be ASYMMETRIC: a hit may only ever answer "live".
+    #          A stale "not live" would place a DUPLICATE order.
+    eng, client, _ = build(-30, -1464, orders=[{"product_symbol": SYM, "id": "555"}])
+    ok &= check("first liveness check reads the exchange",
+                await eng._order_is_live(client, "555", "f1") is True and client.order_reads > 0,
+                f"reads={client.order_reads}")
+    before = client.order_reads
+    ok &= check("repeat check for a LIVE order is served from cache (no REST call)",
+                await eng._order_is_live(client, "555", "f1") is True
+                and client.order_reads == before, f"reads={client.order_reads}")
+
+    # An id NOT in the cached set must be re-verified fresh, never answered "gone"
+    # from cache - that is the direction that causes duplicate orders.
+    before = client.order_reads
+    ok &= check("unknown id is re-checked fresh, not answered from cache",
+                await eng._order_is_live(client, "999", "f1") is False
+                and client.order_reads > before, f"reads={client.order_reads}")
+
+    # A read failure must answer "live" so we never double-place on a hiccup.
+    eng, client, _ = build(-30, -1464, orders=[{"product_symbol": SYM, "id": "555"}])
+    client.orders_fail = True
+    ok &= check("exchange read failure answers LIVE (never risk a duplicate)",
+                await eng._order_is_live(client, "555", "f1") is True)
+
+    # ---- 12b. Master client reuse. Four hot helpers used to construct AND close a
+    #           DeltaClient per call - a fresh TLS handshake to Delta every time,
+    #           several times per 15s reconcile pass. That handshake cost sat on the
+    #           event loop and helped push signed orders past the ~5s window.
+    eng, _, _ = build(-30, -1464)
+    c1 = eng._get_master_client(MASTER)
+    c2 = eng._get_master_client(MASTER)
+    ok &= check("master client is reused across calls (no TLS handshake per call)",
+                c1 is c2 and c1 is not None)
+
+    rotated = dict(MASTER, api_key="rotated-key")
+    c3 = eng._get_master_client(rotated)
+    ok &= check("rotated credentials build a fresh client, not a stale one",
+                c3 is not c1)
+    ok &= check("only one client kept per master after rotation",
+                len([k for k in eng._master_clients if k[0] == MASTER["id"]]) == 1,
+                f"clients={list(eng._master_clients)}")
+    ok &= check("a missing master row yields no client rather than raising",
+                eng._get_master_client(None) is None)
+
+    # ---- 12c. THE PLACE/CANCEL LOOP (live incident 2026-07-31, P-BTC-62800).
+    #           The 30s order reconcile re-mirrored the master's resting reduce-only
+    #           limit; escalation decided 5s later that no close was needed and
+    #           CANCELLED it; the reconciler re-placed it 30s later; repeat forever.
+    #           Root cause: the 5s clock started when WE placed, not when the MASTER
+    #           filled. While the master's own order is still resting, escalation
+    #           must do nothing at all - no market, and above all no cancel.
+    eng, client, _ = build(-30, -3000)
+    eng._safe_get_order = _order_lookup({
+        "F1": {"id": "F1", "size": 30, "state": "open", "unfilled_size": 30},
+        "M1": {"id": "M1", "size": 3000, "state": "open", "unfilled_size": 3000},
+    })
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F1", 42, SYM, "buy", 30, True, MASTER,
+        limit_price=1.2, master_order_id="M1",
+    )
+    ok &= check("master order still resting -> follower's mirror is NOT cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+    ok &= check("master order still resting -> follower is NOT forced to market",
+                client.placed == [], f"placed={client.placed}")
+
+    # ---- 12d. Once the master HAS filled, the same unfilled mirror must be forced
+    #           through - this is the C-BTC-67200 case (master exited, follower's
+    #           mirror never filled, follower left holding).
+    eng, client, _ = build(-30, 0)
+    eng._safe_get_order = _order_lookup({
+        "F1": {"id": "F1", "size": 30, "state": "open", "unfilled_size": 30},
+    })
+    async def _close_qty(_c, _f, _s, _m, ref_price=0.0): return 30, 30
+    eng._follower_close_qty = _close_qty
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F1", 42, SYM, "buy", 30, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("after master fill, unfilled mirror IS forced to market",
+                len(client.placed) == 1 and client.placed[0]["order_type"] == "market_order"
+                and client.placed[0]["reduce_only"] is True, f"placed={client.placed}")
+
+    # ---- 12e. TRIGGERED vs MANUALLY CANCELLED protection. Follower stops are
+    #           jittered to a different price, so the master's stop firing says
+    #           NOTHING about whether the follower's has fired. Cancelling the
+    #           follower's copy on a trigger would leave it unprotected.
+    async def _cancel_probe():
+        eng, client, _ = build(-30, -3000)
+        await eng.redis.hset("ordermap:S1", "f1", "FS1")
+        return eng, client
+
+    base = {"action": "cancel", "master_order_id": "S1", "symbol": SYM,
+            "product_id": 42, "side": "buy", "stop_order_type": "stop_loss_order",
+            "stop_price": 5.0, "owner_id": "u1"}
+
+    eng, client = await _cancel_probe()
+    await eng._mirror_cancel("S1", dict(base, reason="stop_trigger"))
+    ok &= check("master stop TRIGGERED -> follower's stop is NOT cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    eng, client = await _cancel_probe()
+    await eng._mirror_cancel("S1", dict(base, reason=None))
+    ok &= check("unknown reason -> follower's stop is NOT cancelled (fail safe)",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    eng, client = await _cancel_probe()
+    async def _msz(_row, _sym, fresh=False): return 3000.0
+    eng._master_position_size = _msz
+    await eng._mirror_cancel("S1", dict(base, reason="stop_cancel"))
+    ok &= check("master stop MANUALLY cancelled -> follower's stop IS cancelled",
+                client.cancelled == ["FS1"], f"cancelled={client.cancelled}")
+
+    # ---- 12f. NEVER ADD WHILE THE MASTER IS UNWINDING (live incident
+    #           2026-08-02, P-BTC-63000-030826). The master was 2 minutes into a
+    #           multi-hour exit but still showed +560, so the top-up bought a lot
+    #           back 79s after the master had sold — and the whole position was
+    #           closed as an orphan two hours later. Every individual guard passed;
+    #           none of them asked which DIRECTION the master was going.
+    eng, client, event = build(5, 560, mark=1.2, entry=1.2)
+    # Master seen larger on the previous pass => it is reducing.
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master REDUCING -> no top-up (never add into an unwind)",
+                client.placed == [], f"placed={client.placed}")
+
+    # Same shortfall, but the master is holding steady -> top-up is correct.
+    eng, client, event = build(5, 560, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 560)
+    await passes(eng, event)
+    ok &= check("master steady -> shortfall IS topped up",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is False,
+                f"placed={client.placed}")
+
+    # Reducing must NOT block a trim — shedding risk on a snapshot is safe.
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master REDUCING still allows a TRIM (reducing risk is safe)",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
+                f"placed={client.placed}")
+
+    # ...but NOT while he is still WORKING that reduction. His order fills in
+    # pieces, so his position drops before ours does; trimming against each piece
+    # markets the difference over and over. 2026-09-21, P-BTC-79600: one 2400-lot
+    # cover produced five market trims in eleven minutes while our mirrored exit sat
+    # behind his in the queue. His fill or his cancel settles it, not a trim.
+    # (desk call, Prathav 2026-09-25 — no magnitude cap, no time limit.)
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2, master_working=True)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master still WORKING the reduction -> trim is HELD",
+                not client.placed, f"placed={client.placed}")
+
+    # An unreadable order book is not permission to trim, same as everywhere else.
+    eng, client, event = build(30, 560, mark=1.2, entry=1.2)
+    async def _unreadable(_row, _sym, _msz): return None
+    eng._master_working_reducer = _unreadable
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)
+    await passes(eng, event)
+    ok &= check("master order book unreadable -> trim is HELD",
+                not client.placed, f"placed={client.placed}")
+
+    # ---- 12g. UNAVAILABLE RATIO must never mean "copy 1:1" or "close everything".
+    #           Live 2026-08-02: the master's balance read as 0.0 five times in a
+    #           day; auto_ratio fell back to copying the master VERBATIM and the
+    #           reconciler computed a target of 610 lots for a 70 USD account. It
+    #           only failed to execute because the two-pass confirmation broke
+    #           first. Sizing must now refuse rather than guess.
+    from app.core.risk_engine import RiskEngine as _RE
+    _re = _RE()
+    broke = dict(FOLLOWER, allocation_mode="auto_ratio", allocation_value=1.0,
+                 master_balance=0.0, allocated_balance=70.0)
+    ok &= check("unreadable master balance sizes to 0, never 1:1",
+                _re.calculate_follower_quantity(610, 1.2, broke, round_up=True) == 0,
+                f"got {_re.calculate_follower_quantity(610, 1.2, broke, round_up=True)}")
+
+    okf = dict(FOLLOWER, allocation_mode="auto_ratio", allocation_value=1.0,
+               master_balance=7000.0, allocated_balance=70.0)
+    ok &= check("a readable ratio still sizes normally",
+                _re.calculate_follower_quantity(610, 1.2, okf, round_up=True) == 7,
+                f"got {_re.calculate_follower_quantity(610, 1.2, okf, round_up=True)}")
+
+    # ...and the reconciler must not read that 0 as "the follower should be flat".
+    # Reproduce the live condition: the MASTER's balance reads as 0.
+    eng, client, event = build(6, 610, mark=1.2, entry=1.2)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 610)   # at peak -> top-up allowed
+    FOLLOWER_SAVE, MASTER_SAVE = dict(FOLLOWER), dict(MASTER)
+    try:
+        FOLLOWER.update({"allocation_mode": "auto_ratio", "allocation_value": 1.0,
+                         "allocated_balance": 70.0})
+        MASTER["allocated_balance"] = 0         # <- the live failure
+        await passes(eng, event)
+        ok &= check("unavailable ratio -> reconciler leaves the position untouched",
+                    client.placed == [], f"placed={client.placed}")
+    finally:
+        FOLLOWER.clear(); FOLLOWER.update(FOLLOWER_SAVE)
+        MASTER.clear(); MASTER.update(MASTER_SAVE)
+
+    # ---- 12h. EVERY route to "copy the master 1:1" must be closed, not just the
+    #           auto_ratio one. A 1:1 size on a small follower is the single most
+    #           dangerous number this function can return.
+    for label, acct in (
+        ("unreadable master balance", dict(FOLLOWER, allocation_mode="auto_ratio",
+                                           master_balance=0.0, allocated_balance=70.0)),
+        ("no allocation_mode",        {"id": "x", "allocation_mode": None,
+                                       "allocation_value": None}),
+        ("no allocation_value",       {"id": "x", "allocation_mode": "multiplier",
+                                       "allocation_value": None}),
+        ("unknown allocation_mode",   {"id": "x", "allocation_mode": "typo_mode",
+                                       "allocation_value": 0.01}),
+    ):
+        got = _re.calculate_follower_quantity(610, 1.2, acct, round_up=True)
+        ok &= check(f"{label} -> refuses to size (never 1:1)", got == 0, f"got {got}")
+
+    # A properly configured account must still size normally.
+    good = {"id": "x", "allocation_mode": "multiplier", "allocation_value": 0.01}
+    ok &= check("configured multiplier still sizes normally",
+                _re.calculate_follower_quantity(610, 1.2, good, round_up=True) == 7,
+                f"got {_re.calculate_follower_quantity(610, 1.2, good, round_up=True)}")
+
+    # ---- 12i. HANDS-OFF. When the master's SL/TP triggers, the master goes flat
+    #           while the follower still holds — indistinguishable from an orphan
+    #           by position alone, but it must NOT be closed: the follower's own
+    #           jittered stop is what should close it. Live 2026-08-03 the settle
+    #           closed 29 lots of P-BTC-62000-030826 seconds after the master's TP
+    #           fired, and the reconciler then closed the remaining 1.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await eng._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await passes(eng, event)
+    ok &= check("master TP triggered -> reconciler does NOT close the follower",
+                client.placed == [], f"placed={client.placed}")
+
+    eng2, client2, _ = build(-30, 0)
+    await eng2._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await eng2._settle_exit_after_cancel(FOLLOWER, client2, SYM, MASTER, ref_price=1.2)
+    ok &= check("master TP triggered -> exit settle does NOT force a close",
+                client2.placed == [], f"placed={client2.placed}")
+
+    # Without the mark, the same stale orphan IS still closed (regression guard).
+    eng3, client3, event3 = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await passes(eng3, event3)
+    ok &= check("no hands-off mark -> a genuine stale orphan is still closed",
+                len(client3.placed) == 1, f"placed={client3.placed}")
+
+    # The mark is released once the follower goes flat (its own stop fired).
+    eng4, client4, event4 = build(0, 0)
+    await eng4._mark_hands_off({"symbol": SYM, "owner_id": "u1"}, "M9", "master TP triggered")
+    await eng4._reconcile_positions(event4)
+    ok &= check("hands-off is released once the follower is flat",
+                await ledger.is_hands_off(eng4.redis, "u1", "f1", SYM) is None)
+
+    # ---- 12j. Hands-off needs POSITIVE evidence the stop FIRED. "Not a deliberate
+    #           cancel" is not enough: an unknown reason would freeze the leg out of
+    #           reconciliation for a day, which would stop the follower being closed
+    #           when the master exits gradually via partial exits and ends up flat.
+    hoff_base = {"action": "cancel", "master_order_id": "S7", "symbol": SYM,
+                 "product_id": 42, "side": "buy",
+                 "stop_order_type": "stop_loss_order", "stop_price": 5.0,
+                 "owner_id": "u1"}
+
+    eng, client, _ = build(-30, -3000)
+    await eng._mirror_cancel("S7", dict(hoff_base, reason="stop_trigger"))
+    ok &= check("reason=stop_trigger -> leg IS marked hands-off",
+                await ledger.is_hands_off(eng.redis, "u1", "f1", SYM) is not None)
+
+    eng, client, _ = build(-30, -3000)
+    await eng._mirror_cancel("S7", dict(hoff_base, reason=None))
+    ok &= check("unknown reason -> NOT marked hands-off (reconciler stays free)",
+                await ledger.is_hands_off(eng.redis, "u1", "f1", SYM) is None)
+    ok &= check("unknown reason -> follower's stop still not cancelled",
+                client.cancelled == [], f"cancelled={client.cancelled}")
+
+    # A master that exits gradually (partial exits, no trigger) must still leave the
+    # follower flat — hands-off must not be blocking that path.
+    eng, client, event = build(-15, 0, orders=[
+        {"product_symbol": SYM, "id": "s1", "stop_order_type": "stop_loss_order"}])
+    await eng._mirror_cancel("S7", dict(hoff_base, reason=None))   # unknown, no mark
+    await passes(eng, event)
+    ok &= check("master flat via partial exits -> follower IS closed",
+                len(client.placed) == 1 and client.placed[0]["reduce_only"] is True,
+                f"placed={client.placed}")
+
+    # ---- 12k. Ratio must be built on EQUITY, not free margin. available_margin
+    #           swings as positions lock margin up, so the same unchanged position
+    #           was "expected 22" and later "expected 30" — a 30% move that fired
+    #           four false Position Mismatch alerts on 2026-08-03.
+    acct = {"id": "x", "allocation_mode": "auto_ratio", "allocation_value": 1.0,
+            "balance": 70.0, "available_margin": 49.8, "master_balance": 7241.0}
+    stable = _re.calculate_follower_quantity(3100, 1.2, acct, round_up=True)
+    # Simulate margin being consumed by new positions: equity unchanged, free
+    # margin down 40%. The target must not move.
+    acct_busy = dict(acct, available_margin=29.0)
+    busy = _re.calculate_follower_quantity(3100, 1.2, acct_busy, round_up=True)
+    ok &= check("target is unchanged when free margin swings (equity-based ratio)",
+                stable == busy and stable > 0, f"{stable} vs {busy}")
+
+    # ---- 12l. PEAK guard. The time-based reducing window expired 45s before a
+    #           top-up bought back into an unwind still in progress (2026-08-03
+    #           04:42, P-BTC-62600-030826: master 480 -> 280, follower bought 1 @67
+    #           having just sold 1 @76). A clock is the wrong test — while the
+    #           master sits below its high-water mark it is net-reduced on that leg,
+    #           however long ago the last sell was.
+    eng, client, event = build(3, 280, mark=1.2, entry=1.2)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)   # unwinding 480 -> 280
+    await passes(eng, event)
+    ok &= check("below peak -> no top-up even after the time window expired",
+                client.placed == [], f"placed={client.placed}")
+
+    # A genuinely new/growing position (at its peak) may still be topped up.
+    eng, client, event = build(3, 480, mark=1.2, entry=1.2,
+                               last_master_fill_age=FRESH)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)   # at the high-water mark
+    await passes(eng, event)
+    ok &= check("at peak -> shortfall IS still topped up", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # Peak must reset when the master closes the leg, so the next position is clean.
+    eng, client, event = build(0, 0)
+    await ledger.bump_peak(eng.redis, "u1", SYM, 480)
+    await eng._reconcile_positions(event)
+    ok &= check("peak resets once the master is flat",
+                SYM not in eng._master_size_peak, f"peak={eng._master_size_peak}")
+
+    # ---- 12m. The peak must SURVIVE A RESTART. Held in process memory, a deploy
+    #           makes a master mid-unwind at 280 look like a fresh position at its
+    #           peak and top-ups become possible again — and this backend reloads
+    #           several times a day. Same "state lost exactly when it matters"
+    #           failure as the alert dedupe re-firing on every deploy.
+    shared = FakeRedis()
+    await ledger.bump_peak(shared, "u1", SYM, 480)      # before the "restart"
+
+    from app.core.copy_engine import CopyEngine
+    client5 = FakeClient([{"product_symbol": SYM, "size": 3}])
+    eng5 = CopyEngine(FakeDB(), shared, FakeSocket(), FakeConnMgr(client5))
+    async def _fresh5(_m): return {SYM: time.time() - 600}
+    eng5._master_recent_fill_ts = _fresh5
+    async def _cls5(_m, _s): return "unknown"
+    eng5._classify_master_exit = _cls5
+    ev5 = {"owner_id": "u1", "positions": [{"symbol": SYM, "size": 280, "mark": 1.2,
+                                            "entry": 1.2}]}
+    await eng5._reconcile_positions(ev5)
+    await eng5._reconcile_positions(ev5)
+    ok &= check("peak survives a restart -> still no top-up mid-unwind",
+                client5.placed == [], f"placed={client5.placed}")
+
+    # ---- 12n. Escalation must NEVER market on an unknown ratio. `cq is None` from
+    #           _follower_close_qty means "sizing unavailable"; treating it as "no
+    #           cap" markets the follower's ENTIRE order. Live 2026-08-04 on
+    #           P-BTC-63000-040826 that sold 7 then 9 lots against a target of 2,
+    #           flattening the follower, which the reconciler then bought back and
+    #           which left the leg briefly unprotected.
+    eng, client, _ = build(-9, -173)
+    eng._safe_get_order = _order_lookup({
+        "F9": {"id": "F9", "size": 9, "state": "open", "unfilled_size": 9},
+    })
+    async def _no_size(_c, _f, _s, _m, ref_price=0.0):
+        return None, 9          # sizing unavailable
+    eng._follower_close_qty = _no_size
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F9", 42, SYM, "buy", 9, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("unknown close sizing -> escalation markets NOTHING",
+                client.placed == [], f"placed={client.placed}")
+
+    # With sizing available it still caps to what the follower actually owes.
+    eng, client, _ = build(-9, -173)
+    eng._safe_get_order = _order_lookup({
+        "F9": {"id": "F9", "size": 9, "state": "open", "unfilled_size": 9},
+    })
+    async def _cap2(_c, _f, _s, _m, ref_price=0.0): return 2, 9
+    eng._follower_close_qty = _cap2
+    await eng._escalate_unfilled_limit(
+        FOLLOWER, client, "F9", 42, SYM, "buy", 9, True, MASTER, limit_price=1.2,
+    )
+    ok &= check("known sizing -> escalation markets only the 2 lots owed",
+                len(client.placed) == 1 and client.placed[0]["size"] == 2,
+                f"placed={client.placed}")
+
+    # ---- 12o. A FILLED mirror must never be re-placed. Live 2026-08-04 on
+    #           P-BTC-63200-040826 the master exited ONCE but the follower exited
+    #           TWICE (booking the same 0.04 P&L twice): a 14s-stale event re-ran
+    #           the mirror after the follower's copy had already filled, and the
+    #           "is it still resting?" check reported "gone" and re-placed it.
+    dup_event = {
+        "action": "place", "master_order_id": "1451124876", "symbol": SYM,
+        "product_id": 42, "side": "sell", "size": 100, "order_type": "limit_order",
+        "limit_price": 110.0, "reduce_only": False, "is_bracket": False,
+        "is_update": False, "owner_id": "u1",
+    }
+
+    eng, client, _ = build(1, 100)
+    await eng.redis.hset("ordermap:1451124876", "f1", "FILLEDMIRROR")
+    eng._safe_get_order = _order_lookup({
+        # already filled: state closed, nothing unfilled
+        "FILLEDMIRROR": {"id": "FILLEDMIRROR", "size": 1, "state": "closed",
+                         "unfilled_size": 0},
+    })
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("filled mirror is NOT re-placed (no double exit)",
+                client.placed == [], f"placed={client.placed}")
+
+    # ...and the verdict is remembered, so repeated events don't re-ask the
+    # exchange. Same-symbol events are serialised, so an extra REST call per event
+    # lengthens the queue behind it (a 20s tail spike on a busy leg came from that).
+    reads_before = client.order_reads
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("repeat event costs no exchange call (cached verdict)",
+                client.placed == [] and client.order_reads == reads_before,
+                f"placed={client.placed} reads={client.order_reads} was={reads_before}")
+
+    # A mirror cancelled WITHOUT filling still leaves work outstanding -> re-place.
+    eng, client, _ = build(1, 100)
+    await eng.redis.hset("ordermap:1451124876", "f1", "DEADMIRROR")
+    eng._safe_get_order = _order_lookup({
+        "DEADMIRROR": {"id": "DEADMIRROR", "size": 1, "state": "cancelled",
+                       "unfilled_size": 1},
+    })
+    await eng._mirror_place(dup_event, "1451124876")
+    ok &= check("mirror cancelled unfilled IS re-placed", len(client.placed) == 1,
+                f"placed={client.placed}")
+
+    # ---- 13. The ledger itself.
+    r = FakeRedis()
+    await ledger.record_master_order(r, "1442114746", symbol=SYM, side="sell",
+                                     size=3000, kind="entry", owner_id="u1")
+    await ledger.record_follower_leg(r, "1442114746", "f1", status="filled", qty=30)
+    await ledger.record_master_order(r, "1442271322", symbol=SYM, side="buy",
+                                     size=1536, kind="exit", owner_id="u1")
+    # (no follower leg --- this is the exit that vanished)
+    await ledger.record_master_order(r, "1442552128", symbol=SYM, side="buy",
+                                     size=1464, kind="exit", owner_id="u1")
+    await ledger.record_follower_leg(r, "1442552128", "f1", status="filled", qty=15)
+
+    missing = await ledger.missing_for_follower(r, "u1", SYM, "f1", kind="exit")
+    ids = [m["master_order_id"] for m in missing]
+    ok &= check("ledger names exactly the un-mirrored exit order",
+                ids == ["1442271322"], f"got {ids}")
+
+    entry = await ledger.get_entry(r, "1442114746")
+    ok &= check("ledger round-trips the master order + follower leg",
+                entry["symbol"] == SYM and entry["size"] == 3000
+                and entry["legs"]["f1"]["status"] == "filled"
+                and entry["legs"]["f1"]["qty"] == 30, str(entry))
+
+    await ledger.record_follower_leg(r, "1442271322", "f1", status="skipped",
+                                     reason="already at target")
+    missing = await ledger.missing_for_follower(r, "u1", SYM, "f1", kind="exit")
+    ok &= check("a deliberate 'skipped' is accounted for, not missing",
+                missing == [], f"got {[m['master_order_id'] for m in missing]}")
+
+    await ledger.record_follower_leg(r, "1442271322", "f1", status="failed",
+                                     reason="insufficient margin")
+    missing = await ledger.missing_for_follower(r, "u1", SYM, "f1", kind="exit")
+    ok &= check("a FAILED leg counts as missing",
+                [m["master_order_id"] for m in missing] == ["1442271322"])
+
+    print("\n" + ("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED"))
+    return 0 if ok else 1
+
+
+sys.exit(asyncio.run(main()))
