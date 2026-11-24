@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Users, Activity, FileText, Bell, GitCompareArrows } from 'lucide-react';
+import { Users, Activity, FileText, Bell, GitCompareArrows, BookOpen } from 'lucide-react';
 
 export function MobileNav() {
   const pathname = usePathname();
@@ -12,6 +12,7 @@ export function MobileNav() {
     { href: '/trades', label: 'Trades', icon: FileText },
     { href: '/comparison', label: 'Match', icon: GitCompareArrows },
     { href: '/alerts', label: 'Alerts', icon: Bell },
+    { href: '/guide', label: 'Guide', icon: BookOpen },
   ];
   const links = traderLinks;   // see Sidebar.tsx for why there is one nav
 

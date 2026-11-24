@@ -93,6 +93,7 @@ export function TopBar() {
     '/positions': { title: 'Live Positions', subtitle: 'Real-time positions and orders mirrored from your master account' },
     '/trades': { title: 'Trade Log', subtitle: 'Full audit trail of every copied trade and its fills' },
     '/alerts': { title: 'Alerts', subtitle: 'Slippage, sync and connection events that need your attention' },
+    '/guide': { title: "Trader's Guide", subtitle: 'How your trades are copied, and what to keep in mind' },
     '/comparison': { title: 'Fill Comparison', subtitle: 'Master vs follower fills, matched order by order — delays, shortfalls and misses' },
     // Admin console
     '/admin': { title: 'Live Positions', subtitle: 'Open positions per user — master & followers' },

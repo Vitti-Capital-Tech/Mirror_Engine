@@ -2,7 +2,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, GitCompareArrows } from 'lucide-react';
+import { LayoutDashboard, Users, Activity, FileText, Bell, Zap, ChevronLeft, ChevronRight, Shield, LayoutGrid, GitCompareArrows, BookOpen } from 'lucide-react';
 // (Activity reused for admin Positions)
 import { useAuth } from '@/context/AuthContext';
 export function Sidebar() {
@@ -18,6 +18,7 @@ export function Sidebar() {
     { href: '/trades', label: 'Trades Log', icon: FileText },
     { href: '/comparison', label: 'Comparison', icon: GitCompareArrows },
     { href: '/alerts', label: 'Alert Feed', icon: Bell },
+    { href: '/guide', label: "Trader's Guide", icon: BookOpen },
   ];
 
   // ONE nav for everyone, and it is the trader's.

@@ -119,12 +119,6 @@ td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space
 td.w { color: var(--fg-mute); }
 td.act { font-family: var(--mono); font-weight: 600; color: var(--accent); white-space: nowrap; }
 td.nil { font-family: var(--mono); color: var(--fg-faint); }
-/* Manual tables (section 07): labels are phrases, not keys, so they wrap —
-   a one-line label pushed the explanation off a phone screen. */
-.manual td.k { white-space: normal; min-width: 8.5em; }
-.manual th { white-space: normal; }
-.manual-list { margin: 0 0 14px; padding-left: 20px; max-width: 66ch; color: var(--fg-mute); }
-.manual-list li { margin: 0 0 8px; }
 
 .math {
   font-family: var(--mono); font-size: 13.5px; background: var(--slab);
@@ -294,7 +288,7 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
           <tr><td class="k">no ratio</td><td class="w">Target reads 0, and trimming on that would close the whole position</td></tr>
           <tr><td class="k">master unwinding</td><td class="w">He has a working order reducing his own position. Trimming into it fills at a different price than his (desk call, 25 Sept)</td></tr>
           <tr><td class="k">follower building</td><td class="w">A resting order would still ADD to the position, so the size isn't settled</td></tr>
-          <tr><td class="k">his stop hit</td><td class="w">Hands-off — the follower's own stop closes that leg (section 07, situation A)</td></tr>
+          <tr><td class="k">his stop hit</td><td class="w">Hands-off — the follower's own jittered stop closes that leg</td></tr>
           <tr><td class="k">entry &gt; 180s old</td><td class="w">A missed leg is not chased once the price has moved on. It alerts instead</td></tr>
           <tr><td class="k">master below peak</td><td class="w">He has net-reduced on this leg; he is unwinding, not re-entering. No top-up</td></tr>
         </tbody>
@@ -428,73 +422,7 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
 </section>
 
 <section>
-  <h2><span class="num">07</span>Trader's guide: stop-loss &amp; take-profit</h2>
-
-  <p class="lead">For traders running a master account. What happens to your follower accounts when you set, move or hit a stop-loss or take-profit — and what to keep in mind.</p>
-
-  <h3>When you set a stop-loss or take-profit</h3>
-  <p>Your followers get the same stop, but <strong>50 points further away</strong> than yours. So <strong>you always exit first</strong>, and the followers exit just after you.</p>
-
-  <div class="slab manual">
-    <div class="slab-h">Example · BTC at 60,720</div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>You set</th><th>Follower gets</th></tr></thead>
-        <tbody>
-          <tr><td class="k">Take-profit at 61,850</td><td class="w"><strong>61,900</strong> — 50 higher</td></tr>
-          <tr><td class="k">Stop-loss at 60,000</td><td class="w"><strong>59,950</strong> — 50 lower</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-  <p>If you <strong>move</strong> your stop, the followers' stops move with it and stay 50 behind.</p>
-
-  <h3>Keep in mind</h3>
-  <ul class="manual-list">
-    <li><strong>On a stop-loss</strong>, the follower loses slightly more than you — its stop is 50 points further.</li>
-    <li><strong>On a take-profit</strong>, price must go 50 points past your target for the follower to exit. If price touches your target and turns back, <strong>you exit and the follower may not.</strong></li>
-    <li><strong>When your stop hits, the follower can still be holding</strong> for a while. That is normal — it closes by itself if price reaches its stop. If you want the follower out at the same time as you, close it yourself.</li>
-    <li><strong>Don't trade on the follower account yourself.</strong> The system keeps followers matching your account, so a trade placed directly on a follower can be "corrected" back.</li>
-    <li><strong>A missed copy is not entered late.</strong> If a follower missed your entry and more than 3 minutes have passed, it is not bought in at the new price — you get an alert instead.</li>
-  </ul>
-
-  <h3>The two situations you'll see</h3>
-  <div class="slab manual">
-    <div class="scroll">
-      <table>
-        <thead><tr><th></th><th>Your stop hits, follower still in</th><th>Follower's stop hits, you still in</th></tr></thead>
-        <tbody>
-          <tr><td class="k">Is it a problem?</td><td class="w">No — this is the usual case now</td><td class="w">No — but it should be rare now, since the follower's stop is further</td></tr>
-          <tr><td class="k">What happens</td><td class="w">The follower closes on its own stop, if price gets there</td><td class="w">The follower is out; you are still in. <strong>Careful:</strong> if you then add to or partly close that position, the follower can be bought back in (being fixed — see "Coming soon")</td></tr>
-          <tr><td class="k">What to do</td><td class="w">Nothing — or close the follower yourself if you want out together</td><td class="w">Nothing — re-enter the follower yourself only if you want it back in</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <h3>Alerts and what they mean</h3>
-  <div class="slab manual">
-    <div class="scroll">
-      <table>
-        <tbody>
-          <tr><td class="k">"Follower still holds… unprotected"</td><td class="w">Right after your stop hit: <strong>usually a false alarm</strong>. Check the follower still has its own stop — if yes, nothing to do</td></tr>
-          <tr><td class="k">Dashboard shows "no &lt;symbol&gt;" on a follower</td><td class="w">Right after the follower's stop hit: expected. The follower was stopped out</td></tr>
-          <tr><td class="k">Mirror failed · Not corrected · Engine error</td><td class="w"><strong>Real problem</strong> — a copy did not go through. Look at it</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <h3>Coming soon</h3>
-  <ul class="manual-list">
-    <li>If a follower's own stop closes a position while you are still in, the follower will <strong>stay out</strong> until you close yours — it won't jump back in when you add to or partly close the position. (On 23 Nov it did: the follower was stopped out, you partly closed, and it was bought back into one side of the spread.)</li>
-    <li>No more false alarms for either situation, and the dashboard will say <strong>"closed by own stop"</strong>.</li>
-    <li>Once that is in, the desk may change where follower stops sit. This guide will be updated if it does.</li>
-  </ul>
-</section>
-
-<section>
-  <h2><span class="num">08</span>Where it is weak</h2>
+  <h2><span class="num">07</span>Where it is weak</h2>
 
   <div class="open">
     <div>
@@ -516,7 +444,7 @@ master 800 lots  &rarr;  follower <span class="hl">715</span> lots
 
 <footer>
   <a href="/positions">&larr; Back to the dashboard</a><br><br>
-  Sections 01–06 and 08 reflect deployed code at commit fa49e8a · 20 Nov 2026. Section 07 reflects 34991c1 · 24 Nov 2026 · constants read from source, incident times from container logs and Delta's BTC spot index
+  Reflects deployed code at commit fa49e8a · 20 Nov 2026 · constants read from source, incident times from container logs
 </footer>
 
 </div>
