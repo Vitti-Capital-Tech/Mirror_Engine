@@ -17,8 +17,11 @@ alongside the copy ahead of it, and a copy takes longer than 5s.
 """
 import asyncio
 import inspect
+import os
 import sys
 import time
+
+os.environ["ORDER_CONFIRM_SETTLE_SEC"] = "0"   # no settle sleep in tests
 
 import test_end_to_end as e2e
 from test_end_to_end import Client, SYM
@@ -139,10 +142,172 @@ def test_a_failed_edit_does_not_rest_twice():
     check("and it carries the new price", resting and float(resting[0]["limit_price"]) == 47.0, True)
 
 
+def test_confirm_copy_waits_for_the_leg_and_rereads():
+    """confirm-copy places a market OPEN. It used to run with no leg lock, sizing
+    off a position read while another writer on the same leg (the reconciler's
+    OPEN/TOPUP, a live copy) was about to change it — and both bought."""
+    print("\n4. CONFIRM-COPY WAITS ITS TURN AND RE-READS")
+    from app.core import leg_locks
+    eng, ex, mc, fc = e2e.build()
+    share = e2e.share(800)
+
+    async def run():
+        ex.set_position("m-jd", SYM, 800)               # master's order filled 800
+
+        async def other_writer():
+            async with leg_locks.hold("m-jd", SYM, "topup", timeout=2.0):
+                await asyncio.sleep(0.3)                 # mid-correction ...
+                ex.set_position("f-algo3", SYM, share)   # ... it filled the follower
+
+        ev = {"master_order_id": "1710800001", "symbol": SYM, "side": "buy",
+              "size": 800.0, "unfilled_size": 0, "order_type": "limit_order",
+              "limit_price": 40, "state": "closed", "owner_id": "u1",
+              "master_account_id": "m-jd", "product_id": 1}
+
+        async def confirm():
+            await asyncio.sleep(0.05)
+            await eng._confirm_order_copied(ev, "1710800001", mapping={})
+
+        await asyncio.gather(other_writer(), confirm())
+        return ex.position("f-algo3", SYM), [o for o in fc.placed if not o.get("reduce_only")]
+
+    pos, opens = asyncio.run(run())
+    check("confirm-copy buys nothing on a leg that was just filled", len(opens), 0)
+    check("the follower holds its share, not double", pos, float(share))
+
+
+class LandsThenTimesOut(Client):
+    """The first place REACHES the exchange, then the response is lost."""
+
+    def __init__(self, ex, acct):
+        super().__init__(ex, acct)
+        self.calls = 0
+
+    async def place_order(self, **kw):
+        self.calls += 1
+        resp = await super().place_order(**kw)
+        o = self.ex.book.get(self.acct, {}).get(resp["id"])
+        if o is not None:
+            o["client_order_id"] = kw.get("client_order_id")
+        if self.calls == 1:
+            raise TimeoutError("read timed out")       # the order is on the book anyway
+        return resp
+
+    async def get_order_history(self, page_size=50):
+        return []
+
+
+def test_a_retry_after_a_lost_response_does_not_duplicate():
+    print("\n5. THE FIRST PLACE LANDED, ITS RESPONSE WAS LOST")
+    eng, ex, mc, fc = e2e.build()
+    flaky = LandsThenTimesOut(ex, "f-algo3")
+
+    async def run():
+        resp = await eng._place_order_with_retry(
+            flaky, delay=0.01, symbol=SYM, side="buy", size=10,
+            order_type="limit_order", limit_price=40)
+        return resp, ex.resting("f-algo3", SYM), flaky.calls
+
+    resp, resting, calls = asyncio.run(run())
+    check("ONE resting order, not two", len(resting), 1)
+    check("it was found by its client_order_id, not placed again", calls, 1)
+    check("and the caller gets that order back", bool((resp or {}).get("result", {}).get("id")), True)
+
+
+def test_settle_after_cancel_counts_other_resting_exits():
+    """The master's exit A filled (he is down to 500); the follower's copy of A is
+    still resting, inside its 5s window. He cancels exit B. The settle used to
+    market the whole gap (held - target) on top of A's resting copy — which then
+    filled too, closing the follower past its share."""
+    print("\n6. SETTLE AFTER A CANCEL, WITH ANOTHER EXIT STILL RESTING")
+    eng, ex, mc, fc = e2e.build()
+    held, after_a = e2e.share(800), e2e.share(500)
+
+    async def run():
+        ex.set_position("m-jd", SYM, 500)                 # exit A (300) filled
+        ex.set_position("f-algo3", SYM, held)
+        a = ex.place("f-algo3", symbol=SYM, side="sell", size=held - after_a,
+                     order_type="limit_order", limit_price=45, reduce_only=True)["id"]
+        b = ex.place("f-algo3", symbol=SYM, side="sell", size=100,
+                     order_type="limit_order", limit_price=50, reduce_only=True)["id"]
+        await eng.redis.hset("ordermap:1710900002", "f-algo3", b)
+        await eng.process_order_event({
+            "action": "cancel", "master_order_id": "1710900002", "symbol": SYM,
+            "side": "sell", "order_type": "limit_order", "state": "cancelled",
+            "owner_id": "u1", "master_account_id": "m-jd", "product_id": 1})
+        markets = [o for o in fc.placed if o.get("order_type") == "market_order"]
+        return markets, [o["id"] for o in ex.resting("f-algo3", SYM)], a
+
+    markets, resting, a = asyncio.run(run())
+    check("no market close on top of exit A's resting copy", len(markets), 0)
+    check("exit A's copy is still resting to do its job", a in resting, True)
+
+
+def _settled_engine():
+    eng, ex, mc, fc = e2e.build()
+
+    async def settled(*a, **k):
+        return True                       # both master orders filled as taker
+    eng._master_order_settled = settled
+    return eng, ex, mc, fc
+
+
+def test_two_master_entries_filling_seconds_apart():
+    """Master limits A and B (800 each) both fill as taker within seconds. Our
+    copy of A is placed but not yet filled when B is sized. B used to open
+    "share of 1600 minus what the follower HOLDS (0)" — A's part a second time."""
+    print("\n7. TWO MASTER ENTRIES FILLING SECONDS APART")
+    eng, ex, mc, fc = _settled_engine()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 1600)
+        ex.place("f-algo3", symbol=SYM, side="buy", size=e2e.share(800),
+                 order_type="limit_order", limit_price=40)            # our copy of A, resting
+        before = len(fc.placed)
+        await eng.process_order_event(e2e.place_event("1711000002", "buy", 800, 40))
+        return sum(int(o.get("size") or 0) for o in fc.placed[before:] if o.get("side") == "buy")
+
+    opened = asyncio.run(run())
+    owed = e2e.share(1600) - e2e.share(800)
+    check(f"B opens only its own part (~{owed}), not A's again", opened <= owed + 1, True)
+    check("and does open it", opened >= owed - 1, True)
+
+
+def test_two_master_exits_filling_seconds_apart():
+    """Master exits A and B (300 each, from 800) both fill within seconds. Our
+    copy of A is still resting when B is sized. B used to close "holds - share
+    of 200" — A's part included — and the room cap only stops at zero."""
+    print("\n8. TWO MASTER EXITS FILLING SECONDS APART")
+    eng, ex, mc, fc = _settled_engine()
+
+    async def run():
+        ex.set_position("m-jd", SYM, 200)
+        held = e2e.share(800)
+        ex.set_position("f-algo3", SYM, held)
+        a_part = held - e2e.share(500)
+        ex.place("f-algo3", symbol=SYM, side="sell", size=a_part,
+                 order_type="limit_order", limit_price=45, reduce_only=True)  # copy of A, resting
+        before = len(fc.placed)
+        await eng.process_order_event(e2e.place_event("1711000004", "sell", 300, 45, reduce_only=True))
+        sold = sum(int(o.get("size") or 0) for o in fc.placed[before:] if o.get("side") == "sell")
+        return sold, held, a_part
+
+    sold, held, a_part = asyncio.run(run())
+    owed = held - e2e.share(200) - a_part
+    check(f"B closes only its own part (~{owed}), not A's again", sold <= owed + 1, True)
+    check("so with A's copy the follower lands at its share, not below",
+          held - sold - a_part >= e2e.share(200) - 1, True)
+
+
 if __name__ == "__main__":
     for t in (test_live_events_wait_for_the_leg,
+              test_two_master_entries_filling_seconds_apart,
+              test_two_master_exits_filling_seconds_apart,
+              test_settle_after_cancel_counts_other_resting_exits,
+              test_a_retry_after_a_lost_response_does_not_duplicate,
               test_reconcile_open_takes_a_last_look,
-              test_a_failed_edit_does_not_rest_twice):
+              test_a_failed_edit_does_not_rest_twice,
+              test_confirm_copy_waits_for_the_leg_and_rereads):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)

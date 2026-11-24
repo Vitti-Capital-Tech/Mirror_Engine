@@ -1091,6 +1091,17 @@ class CopyEngine:
         rule. A 4xx validation error (e.g. reduce-only side mismatch, bad price)
         is deterministic, so we don't waste retries on it; it's raised at once
         for the caller to log. The 30s reconcile pass is the longer-term retry."""
+        # A TIMEOUT OR 5xx DOES NOT MEAN THE ORDER WAS NOT PLACED. The request
+        # may have reached Delta and only the response been lost; retrying then
+        # rests a SECOND copy (an entry, not reduce_only — nothing caps it).
+        # So every order here carries its own client_order_id, and before a
+        # retry the follower's book is checked for it: found means the first
+        # attempt landed, and that is the answer. If the retry still goes out
+        # while the first is resting, Delta rejects the duplicate id itself
+        # ("unique across all open orders of the user").
+        import uuid
+        kwargs.setdefault("client_order_id", "me" + uuid.uuid4().hex[:28])
+        cid = kwargs["client_order_id"]
         last = None
         for i in range(max(1, attempts)):
             try:
@@ -1102,11 +1113,38 @@ class CopyEngine:
                     raise  # permanent client error — retrying won't help
                 if i < attempts - 1:
                     logger.warning(
-                        f"place_order transient failure ({status or e}); retrying in {delay:.0f}s "
-                        f"[{kwargs.get('symbol')} {kwargs.get('side')} {kwargs.get('size')}]"
+                        f"place_order transient failure ({status or e}); checking whether it "
+                        f"landed, retrying in {delay:.0f}s "
+                        f"[{kwargs.get('symbol')} {kwargs.get('side')} {kwargs.get('size')} cid={cid}]"
                     )
                     await asyncio.sleep(delay)
+                    landed = await self._find_order_by_cid(client, cid)
+                    if landed:
+                        logger.warning(
+                            f"place_order: the 'failed' order {cid} reached the exchange after all "
+                            f"(order {landed.get('id')}) — not placing it again"
+                        )
+                        return {"result": landed}
         raise last
+
+    @staticmethod
+    async def _find_order_by_cid(client, cid):
+        """This follower's order carrying client_order_id `cid`, from its open
+        orders or recent history; None if not found or unreadable."""
+        try:
+            for st in ("open", "pending"):
+                for o in await client.get_open_orders(state=st) or []:
+                    if str(o.get("client_order_id") or "") == str(cid):
+                        return o
+        except Exception:
+            pass
+        try:
+            for o in await client.get_order_history(page_size=50) or []:
+                if str(o.get("client_order_id") or "") == str(cid):
+                    return o
+        except Exception:
+            pass
+        return None
 
     def _get_master_client(self, master_row: dict):
         """Reusable DeltaClient for the master, kept alive across calls.
@@ -1166,6 +1204,46 @@ class CopyEngine:
             # past Delta's signature window in July.
             self._open_orders_raw[account_id] = (raw, time.time())
         return ids
+
+    @staticmethod
+    async def _resting_same_side(client, symbol: str, side: str):
+        """Lots this follower already has RESTING on `symbol` on `side` (plain
+        orders only — stops/TPs are protection, not a trade in flight), read
+        FRESH from the exchange. None if the book cannot be read.
+
+        Sizing from the position alone ("share minus what it holds") cannot see
+        an order of ours that is placed but not yet filled — the copy of the
+        master's previous order, still in its 5s window — and sizes that part
+        again."""
+        try:
+            total = 0
+            for st in ("open", "pending"):
+                for o in await client.get_open_orders(state=st) or []:
+                    if (o.get("product_symbol") or o.get("symbol")) != symbol:
+                        continue
+                    if o.get("stop_order_type") or o.get("stop_price"):
+                        continue
+                    if (o.get("side") or "").lower() != (side or "").lower():
+                        continue
+                    unf = o.get("unfilled_size")
+                    total += int(abs(float(unf if unf is not None else (o.get("size") or 0))))
+            return total
+        except Exception:
+            return None
+
+    async def _held_plus_resting(self, client, symbol: str, side: str, cached_held: int) -> int:
+        """What the follower holds, read FRESH, plus what it already has resting
+        on `side` — for sizing a FILLED master entry.
+
+        A filled entry opens "share of the master's position minus what the
+        follower holds", which cannot see our copy of his PREVIOUS order, placed
+        but not yet filled (or filled inside the 3s holding cache). Two master
+        entries filling seconds apart then opened the first one's part twice:
+        A opens 17, B reads held 0 and opens 34 -> 51 against a share of 34.
+        Falls back to `cached_held` if the fresh read fails."""
+        fresh = await self._live_signed_fresh(client, symbol)
+        held = int(abs(fresh)) if fresh is not None else int(cached_held)
+        return held + int((await self._resting_same_side(client, symbol, side)) or 0)
 
     async def _follower_resting_cover(self, client, account_id, symbol: str,
                                       signed_pos: float) -> float:
@@ -1920,22 +1998,36 @@ class CopyEngine:
                     )
                     continue
                 client = _fclient
-                held = int(abs(float(await self._position_size_signed(client, symbol))))
-                msz = await self._master_position_size(master_row, symbol, fresh=True)
-                if msz is None:
-                    continue
-                pos_target = self.risk_engine.calculate_follower_quantity(
-                    abs(float(msz)), ref_price, follower, round_up=True, min_one=False)
-                # The gap this order left, never more than the gap the POSITION has.
-                short = min(int(target) - self._legs_filled(legs, fid),
-                            int(pos_target) - held)
-                if short < 1 or short < _size_deadband(target):
-                    continue
-                side = (event.get("side") or "").lower()
-                await client.place_order(
-                    symbol=symbol, side=side, size=int(short),
-                    order_type="market_order", reduce_only=False,
-                )
+                # ONE WRITER PER LEG. This top-up is an OPEN (not reduce_only),
+                # and it used to run with no leg lock — beside the reconciler's
+                # OPEN/TOPUP and any live copy on the same leg, each sizing off
+                # a position the other was about to change. Take the leg like
+                # every other writer, and read the position fresh inside it.
+                _lk = str((event or {}).get("master_account_id") or (event or {}).get("owner_id") or "")
+                held = msz = pos_target = short = 0
+                async with leg_locks.hold(_lk, symbol, "confirm",
+                                          timeout=leg_locks.LIVE_ACQUIRE_TIMEOUT) as _got:
+                    if not _got:
+                        continue          # someone is acting on this leg; the reconciler follows up
+                    _live = await self._live_signed_fresh(client, symbol)
+                    if _live is None:
+                        continue          # unreadable — never open on an unknown
+                    held = int(abs(float(_live)))
+                    msz = await self._master_position_size(master_row, symbol, fresh=True)
+                    if msz is None:
+                        continue
+                    pos_target = self.risk_engine.calculate_follower_quantity(
+                        abs(float(msz)), ref_price, follower, round_up=True, min_one=False)
+                    # The gap this order left, never more than the gap the POSITION has.
+                    short = min(int(target) - self._legs_filled(legs, fid),
+                                int(pos_target) - held)
+                    if short < 1 or short < _size_deadband(target):
+                        continue
+                    side = (event.get("side") or "").lower()
+                    await client.place_order(
+                        symbol=symbol, side=side, size=int(short),
+                        order_type="market_order", reduce_only=False,
+                    )
                 logger.info(
                     f"confirm-copy: {follower.get('name')} was short {short} on {symbol} "
                     f"for master order {master_order_id} (master filled {master_filled:.0f} "
@@ -3680,6 +3772,10 @@ class CopyEngine:
                         any(rid == str(master_order_id) for rid, _ in entry_rungs),
                     )
                     held_now = await self._follower_held(client, follower["id"], symbol)
+                    if filled_entry:
+                        # TWO MASTER ENTRIES FILLING SECONDS APART: count our copy
+                        # of his previous order too (see _held_plus_resting).
+                        held_now = await self._held_plus_resting(client, symbol, side, held_now)
                     laddered, target_total, to_open, entry_rungs = self._entry_open_qty(
                         filled_entry=filled_entry,
                         entry_rungs=entry_rungs,
@@ -4003,6 +4099,12 @@ class CopyEngine:
                         round_up=True, min_one=False,
                     )
                     qty = max(0, follower_held - int(target))
+                    # Our copies of his OTHER exits, still resting, will close
+                    # part of this too — counted, or two exits filling seconds
+                    # apart close the follower past its share (34 -> 23 -> 12
+                    # became 34 -> 1). The room cap below only stops it going
+                    # below ZERO, not below its share.
+                    qty = max(0, qty - int((await self._resting_same_side(client, symbol, side)) or 0))
                     logger.info(
                         f"Filled-exit close for {follower['name']} on {symbol}: master's exit "
                         f"already filled (master now {master_now:+.0f}), follower holds "
@@ -4936,11 +5038,30 @@ class CopyEngine:
                 return
             held = int(abs(signed))
             close_qty = held - int(target)
+            side = "buy" if signed < 0 else "sell"
+            # OTHER EXITS ALREADY RESTING on this leg will reduce the follower
+            # too. Marketing the whole gap on top of them over-closes when they
+            # fill: the master's exit A fills (target 23), he cancels exit B, this
+            # sells 34 - 23 = 11 at market — and A's own mirror, still in its 5s
+            # window, then fills 11 more, leaving 12. So the settle only sells
+            # what nothing resting will. Under-closing is the safe side: the
+            # reconciler trims what is left ten seconds later.
+            covered = await self._resting_same_side(client, symbol, side)
+            if covered is None:
+                # Same rule as _follower_resting_cover: an unreadable book means
+                # behave as before, not refuse to close on an unknown.
+                logger.warning(f"Exit settle for {name} on {symbol}: could not read resting orders — settling the full gap")
+                covered = 0
+            if covered:
+                logger.info(
+                    f"Exit settle for {name} on {symbol}: {covered} already resting to "
+                    f"close — settling {max(0, close_qty - covered)} of the {close_qty} gap"
+                )
+                close_qty -= covered
             # Same deadband as the reconciler, so the two can't disagree about what
             # counts as out of sync and undo each other.
             if close_qty < _size_deadband(target):
                 return  # already at (or near) target — nothing owed
-            side = "buy" if signed < 0 else "sell"
             await client.place_order(
                 symbol=symbol, side=side, size=int(close_qty),
                 order_type="market_order", reduce_only=True,

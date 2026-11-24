@@ -141,6 +141,8 @@ def engine(follower_held, master_pos, legs=None, live_ids=(), ordermap=None):
     async def _signed(_c, _s):
         return float(follower_held)
     eng._position_size_signed = _signed
+    # confirm-copy re-reads the position FRESH inside the leg lock (2026-11-24).
+    eng._live_signed_fresh = _signed
 
     async def _msize(_row, _sym, fresh=False):
         return abs(float(master_pos))

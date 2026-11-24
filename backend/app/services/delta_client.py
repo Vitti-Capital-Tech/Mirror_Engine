@@ -273,6 +273,7 @@ class DeltaClient:
         stop_order_type: Optional[str] = None,
         stop_trigger_method: Optional[str] = None,
         time_in_force: Optional[str] = None,
+        client_order_id: Optional[str] = None,
     ) -> dict:
         """Place a market/limit order, optionally a stop (triggered) order.
 
@@ -291,6 +292,10 @@ class DeltaClient:
         }
         if time_in_force:
             body_dict["time_in_force"] = time_in_force
+        if client_order_id:
+            # Delta: string, max 32 chars, unique across the user's open orders;
+            # echoed back on the order (incl. /v2/orders/history).
+            body_dict["client_order_id"] = str(client_order_id)[:32]
         if limit_price is not None and order_type == "limit_order":
             body_dict["limit_price"] = str(limit_price)
         if reduce_only:
