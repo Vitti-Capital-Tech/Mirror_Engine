@@ -60,8 +60,10 @@ BASELINE = {
     # after a successful place. Correlated, so unreachable in practice,
     # and not provable. Audited 2026-11-20.
     "_mirror_place": {
-        "_prev_v", "foid", "follower_order_id", "held", "leg", "leg_key",
-        "resp_obj", "result", "sl", "why_zero",
+        # "leg" and "sl" left on 2026-11-24 when the stop placement became one
+        # awaited call (_follower_trigger) — no longer possibly unbound.
+        "_prev_v", "foid", "follower_order_id", "held", "leg_key",
+        "resp_obj", "result", "why_zero",
     },
     # The escalation sweep's loop variables, plus two `except ... as`
     # names that Python deletes at the end of their handler. Same

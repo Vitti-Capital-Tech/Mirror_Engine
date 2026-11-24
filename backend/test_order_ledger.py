@@ -172,6 +172,9 @@ class FakeClient:
             raise RuntimeError("simulated exchange read failure")
         return self._orders if state == "open" else []
     async def place_order(self, **kw): self.placed.append(kw); return {"id": "new1"}
+    # The current price a follower's SL/TP is placed relative to (2026-11-24:
+    # follower stops sit BEYOND the master's, on the side away from it).
+    async def get_ticker(self, symbol): return {"spot_price": 65000, "mark_price": 1.2, "close": 1.2}
     async def cancel_order(self, oid, product_id=None):
         self.cancelled.append(str(oid))
     async def close(self): pass

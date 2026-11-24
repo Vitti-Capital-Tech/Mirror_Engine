@@ -879,6 +879,74 @@ class CopyEngine:
         sign = 1 if (h >> 7) & 1 else -1
         return round(base + sign * magnitude, 1)
 
+    # ------------------------------------------------------------------
+    # TEMPORARY (desk call, 2026-11-24): a follower's SL/TP always triggers
+    # AFTER the master's, never before.
+    #
+    # _jitter_trigger picks the side by follower slot, not by which way the
+    # stop triggers, so a follower's stop could sit IN FRONT of the master's.
+    # 2026-11-23, P-BTC-59000/60800: master's stops at spot 61050, the
+    # follower's at 61100; BTC fell to 61099.9 (low 61056.6), so only the
+    # follower was stopped out — and the master kept the pair.
+    #
+    # A trigger above the current price fires on a rise, so the follower's goes
+    # HIGHER; one below fires on a fall, so it goes LOWER. Same offset, always
+    # beyond the master's. (Prathav: "+50 upar, -50 neeche … exit always after
+    # master … this is a temp fix" — the proper handling of a stopped-out leg is
+    # still being designed.)
+    _TRIGGER_FIELD = {"spot_price": "spot_price", "mark_price": "mark_price",
+                      "last_traded_price": "close"}
+
+    async def _trigger_reference(self, client, symbol: str, trigger_method):
+        """The price a stop with this trigger method is compared against, now —
+        from the contract's public ticker. None if it cannot be read."""
+        field = self._TRIGGER_FIELD.get(trigger_method or "mark_price", "mark_price")
+        try:
+            t = await client.get_ticker(symbol)
+            v = (t or {}).get(field)
+            return float(v) if v not in (None, "") else None
+        except Exception as e:
+            logger.warning(f"stop placement: no {field} for {symbol} ({e})")
+            return None
+
+    @staticmethod
+    def _trigger_after_master(price, reference, offset=None):
+        """The follower's trigger: `offset` BEYOND the master's `price`, on the
+        side away from `reference` (the current price), so it fires after the
+        master's. Without a reference — or if going beyond would reach zero or
+        below — the master's own price: never in front of it, and never a stop
+        that cannot fire."""
+        if price is None:
+            return None
+        base = round(float(price), 1)
+        try:
+            mag = abs(float(offset if offset not in (None, "") else DEFAULT_TP_SL_OFFSET))
+        except (TypeError, ValueError):
+            mag = DEFAULT_TP_SL_OFFSET
+        if not mag or reference is None:
+            return base
+        ref = float(reference)
+        if base == ref:
+            return base
+        out = round(base + mag, 1) if base > ref else round(base - mag, 1)
+        return out if out > 0 else base
+
+    async def _follower_trigger(self, client, follower: dict, symbol: str, stop_price,
+                                trigger_method, owner_id=None, master_id=None):
+        """Where this follower's copy of the master's SL/TP triggers — always at
+        or beyond the master's (see _trigger_after_master)."""
+        if stop_price is None:
+            return None
+        off, _slot = await self._tp_sl_params(follower, owner_id, master_id)
+        ref = await self._trigger_reference(client, symbol, trigger_method)
+        out = self._trigger_after_master(stop_price, ref, offset=off)
+        if ref is None:
+            logger.warning(
+                f"stop placement: could not read the current price for {symbol} — "
+                f"{follower.get('name')}'s trigger placed AT the master's {out}, not beyond it"
+            )
+        return out
+
     @staticmethod
     async def _position_size(client, symbol: str) -> float:
         """Live absolute position size for a symbol on the given client (0 if none)."""
@@ -2964,8 +3032,9 @@ class CopyEngine:
                     if stop_price is None or not product_id:
                         continue
                     try:
-                        _off, _slot = await self._tp_sl_params(fol, owner_id, _mid)
-                        jittered = self._jitter_trigger(float(stop_price), seed=str(fol.get("id")), offset=_off, slot=_slot)
+                        jittered = await self._follower_trigger(
+                            client, fol, sym, float(stop_price), det.get("trigger") or "mark_price",
+                            owner_id, _mid)
                         otype = det.get("order_type") or "market_order"
                         leg = {"order_type": otype, "stop_price": str(jittered)}
                         if otype == "limit_order" and det.get("limit_price") is not None:
@@ -3650,8 +3719,9 @@ class CopyEngine:
                             await self.redis.hset(f"ordermap:{master_order_id}", follower["id"], existing_foid)
                     except Exception as e:
                         logger.warning(f"Bracket self-heal lookup failed for {follower['name']}: {e}")
-                _off, _slot = await self._tp_sl_params(follower, owner_id, (event or {}).get('master_account_id'))
-                jittered_stop = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
+                jittered_stop = await self._follower_trigger(
+                    client, follower, symbol, stop_price, trigger_method,
+                    owner_id, (event or {}).get('master_account_id'))
                 edited = False
                 if is_update and existing_foid:
                     # Master EDITED the SL/TP price -> edit the follower's existing
@@ -3740,8 +3810,10 @@ class CopyEngine:
                 # same instant on the same price. Per-follower local — mutating the
                 # shared stop_price would compound the jitter for the next follower.
                 if stop_price is not None:
-                    _off, _slot = await self._tp_sl_params(follower, owner_id, (event or {}).get('master_account_id'))
-                    place_stop_price = self._jitter_trigger(stop_price, seed=str(follower.get("id")), offset=_off, slot=_slot)
+                    place_stop_price = await self._follower_trigger(
+                        client, follower, symbol, stop_price,
+                        event.get("stop_trigger_method") or "mark_price",
+                        owner_id, (event or {}).get('master_account_id'))
 
             elif reduce_only and not is_update:
                 # A reduce-only order must be on the OPPOSITE side of the

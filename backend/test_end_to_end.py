@@ -179,6 +179,11 @@ class Client:
         self.placed.append(kw)
         return self.ex.place(self.acct, **kw)
 
+    async def get_ticker(self, symbol):
+        # The price a follower's SL/TP is placed relative to: since 2026-11-24
+        # it sits BEYOND the master's trigger, on the side away from this.
+        return {"spot_price": 65000, "mark_price": 40, "close": 40}
+
     async def cancel_order(self, oid, product_id=None):
         self.cancelled.append(str(oid))
         return self.ex.cancel(self.acct, oid)
