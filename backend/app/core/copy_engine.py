@@ -4194,14 +4194,22 @@ class CopyEngine:
             existing_foid = await self.redis.hget(f"ordermap:{master_order_id}", follower["id"])
             if is_update and existing_foid:
                 try:
-                    # SIZE as well as price. The master changing an order's
-                    # quantity is an edit like any other, but size was never
-                    # sent — so the price moved on the follower and the quantity
-                    # silently did not, leaving it resting the original amount.
+                    # SIZE as well as price — but only when the master CHANGED
+                    # the size. Size used to be missing entirely (a master
+                    # resize left the follower resting the old amount); then it
+                    # was re-sent on EVERY edit, recomputed as "master size x
+                    # the ratio right now", so a price-only edit quietly resized
+                    # the follower whenever the ratio had drifted. 2026-11-24
+                    # 08:18 IST, C-BTC-63800: JD algo4 moved the price of his
+                    # 3000-lot close; JD algo3's 2998 copy (its whole holding)
+                    # became 2997, and the leftover lot had to be closed by the
+                    # reconciler when the close filled at 11:35. `ordersize`
+                    # records the master size each mirror was placed for.
+                    _resized = await self._master_resized(master_order_id, follower["id"], master_qty)
                     resp = await client.edit_order(
                         existing_foid, product_id=product_id,
                         limit_price=limit_price,
-                        size=int(qty) if qty else None,
+                        size=(int(qty) if qty else None) if _resized else None,
                     )
                     # Delta edits can cancel-and-replace (new order id) — refresh the map.
                     new_id = (resp.get("result") or {}).get("id") if isinstance(resp, dict) else None
@@ -4212,7 +4220,8 @@ class CopyEngine:
                     await self.redis.hset(f"ordersize:{master_order_id}", follower["id"], str(master_qty))
                     logger.info(
                         f"Updated order {master_order_id} -> {follower['name']} order "
-                        f"{new_id or existing_foid} @ {limit_price} x {int(qty) if qty else '-'}"
+                        f"{new_id or existing_foid} @ {limit_price} x "
+                        f"{(int(qty) if qty else '-') if _resized else 'size kept (master size unchanged)'}"
                     )
                     continue
                 except Exception as e:
@@ -4970,6 +4979,16 @@ class CopyEngine:
                 ))
         except Exception as e:
             logger.error(f"Escalation error for {symbol}: {e}")
+
+    async def _master_resized(self, master_order_id, follower_id, master_qty) -> bool:
+        """Did the master change this order's SIZE since this follower's mirror
+        was placed or last edited? (`ordersize` records it.) Unknown → yes, so
+        a resize is never missed."""
+        try:
+            was = await self.redis.hget(f"ordersize:{master_order_id}", follower_id)
+            return was is None or abs(float(was) - float(master_qty)) > 1e-9
+        except Exception:
+            return True
 
     @staticmethod
     def _mirror_cid(master_order_id) -> str:
