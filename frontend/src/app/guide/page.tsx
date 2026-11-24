@@ -1,5 +1,5 @@
 'use client';
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   BookOpen, Users, Scale, Zap, ListOrdered, LogOut, ShieldCheck, RefreshCw,
   Wallet, Bell, LayoutDashboard, PauseCircle, CheckSquare, HelpCircle, Sparkles,
@@ -107,11 +107,66 @@ function Example({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** Right-hand index: stays in view while the guide scrolls, jumps to a
+ *  section on click, and highlights the one being read. Desktop only — on a
+ *  phone there is no room beside the text, so the contents list at the top
+ *  serves instead. */
+function StickyIndex() {
+  const [active, setActive] = useState<string>(SECTIONS[0].id);
+
+  useEffect(() => {
+    const els = SECTIONS.map((s) => document.getElementById(s.id)).filter(Boolean) as HTMLElement[];
+    // The section whose top has most recently passed the upper part of the
+    // screen is the one being read.
+    const obs = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.filter((e) => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible[0]) setActive(visible[0].target.id);
+      },
+      { rootMargin: '0px 0px -70% 0px', threshold: 0 },
+    );
+    els.forEach((el) => obs.observe(el));
+    return () => obs.disconnect();
+  }, []);
+
+  const go = (id: string) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    history.replaceState(null, '', `#${id}`);
+    setActive(id);
+  };
+
+  return (
+    <aside className="hidden xl:block w-60 shrink-0">
+      <div className="sticky top-0 rounded-2xl border border-bg-border bg-bg-panel p-3">
+        <div className="px-2 pb-2 text-[10.5px] font-semibold uppercase tracking-wider text-text-muted">On this page</div>
+        <nav className="space-y-0.5">
+          {SECTIONS.map((s, i) => {
+            const on = active === s.id;
+            return (
+              <a key={s.id} href={`#${s.id}`} onClick={go(s.id)}
+                className={`relative flex items-center gap-2 rounded-lg px-2 py-1.5 text-[12.5px] transition-colors ${
+                  on ? 'bg-bg-secondary text-text-primary font-semibold' : 'text-text-secondary hover:bg-bg-secondary/60 hover:text-text-primary'
+                }`}>
+                {on && <span className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-[3px] rounded-r bg-blue-500" />}
+                <span className={`font-mono text-[10px] w-5 ${on ? 'text-blue-400' : 'text-text-muted'}`}>{String(i + 1).padStart(2, '0')}</span>
+                <span className="truncate">{s.title}</span>
+              </a>
+            );
+          })}
+        </nav>
+      </div>
+    </aside>
+  );
+}
+
 export default function GuidePage() {
   let n = 0;
   const next = () => ++n;
   return (
-    <div className="max-w-4xl space-y-5">
+    <div className="flex items-start gap-6">
+    <div className="min-w-0 flex-1 max-w-4xl space-y-5">
       {/* Intro + contents */}
       <div className="rounded-2xl border border-bg-border bg-bg-panel px-5 py-4 space-y-3">
         <div className="flex items-center gap-2">
@@ -124,7 +179,7 @@ export default function GuidePage() {
           followers for every kind of trade you make, what the alerts mean, and what to keep in
           mind so nothing surprises you.
         </p>
-        <nav className="grid gap-1 sm:grid-cols-2 pt-1">
+        <nav className="grid gap-1 sm:grid-cols-2 pt-1 xl:hidden">
           {SECTIONS.map((s, i) => {
             const Icon = s.icon;
             return (
@@ -339,6 +394,8 @@ export default function GuidePage() {
           <P>Once that is in, the desk may change where follower stops sit. This guide will be updated when it does.</P>
         </Points>
       </Section>
+    </div>
+    <StickyIndex />
     </div>
   );
 }
