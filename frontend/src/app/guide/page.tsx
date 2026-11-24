@@ -138,8 +138,8 @@ function StickyIndex() {
   };
 
   return (
-    <aside className="hidden xl:block w-60 shrink-0">
-      <div className="sticky top-0 rounded-2xl border border-bg-border bg-bg-panel p-3">
+    <aside className="hidden xl:block w-64 shrink-0 self-start sticky top-0 max-h-[calc(100vh-7rem)] overflow-y-auto">
+      <div className="rounded-2xl border border-bg-border bg-bg-panel p-3">
         <div className="px-2 pb-2 text-[10.5px] font-semibold uppercase tracking-wider text-text-muted">On this page</div>
         <nav className="space-y-0.5">
           {SECTIONS.map((s, i) => {
@@ -166,7 +166,7 @@ export default function GuidePage() {
   const next = () => ++n;
   return (
     <div className="flex items-start gap-6">
-    <div className="min-w-0 flex-1 max-w-4xl space-y-5">
+    <div className="min-w-0 flex-1 space-y-5">
       {/* Intro + contents */}
       <div className="rounded-2xl border border-bg-border bg-bg-panel px-5 py-4 space-y-3">
         <div className="flex items-center gap-2">
