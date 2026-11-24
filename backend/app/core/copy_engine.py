@@ -186,6 +186,10 @@ class CopyEngine:
         # burst of protective cancels doesn't fire a get_positions REST call each.
         self._master_pos_cache: dict = {}
         self._master_signed_cache: dict = {}  # {(master_id, symbol): (signed, ts)}
+        # {master_order_id: unfilled lots} from the last time we asked the
+        # exchange about one order (_master_order_settled step 3) — so a part-
+        # filled order missing from a lagging book is sized by what still rests.
+        self._master_unfilled_hint: dict = {}
         self._MASTER_POS_TTL = 3.0  # seconds
         # {symbol: ([(order_id, size)], ts)} — the master's resting reduce-only
         # limits per symbol. A laddered exit arrives as a burst (the three rungs on
@@ -1621,7 +1625,11 @@ class CopyEngine:
                     continue
                 oid = o.get("id")
                 try:
-                    size = abs(float(o.get("size") or 0))
+                    # What is still RESTING. A part-filled order's filled lots
+                    # are already in the master's position; counting its full
+                    # size as well counts them twice.
+                    _unf = o.get("unfilled_size")
+                    size = abs(float(_unf if _unf is not None else (o.get("size") or 0)))
                 except (TypeError, ValueError):
                     continue
                 if oid is not None and size > 0:
@@ -3782,7 +3790,9 @@ class CopyEngine:
                         m_pos=float(m_pos),
                         held_now=held_now,
                         master_order_id=master_order_id,
-                        master_qty=float(master_qty),
+                        # What still RESTS of this order: a part-filled order's
+                        # filled lots are already in m_pos (see the hint).
+                        master_qty=float(self.__dict__.get("_master_unfilled_hint", {}).get(str(master_order_id), master_qty)),
                         target_fn=lambda lots: self.risk_engine.calculate_follower_quantity(
                             lots, ref_price, follower, round_up=True, min_one=False
                         ),
@@ -4257,6 +4267,7 @@ class CopyEngine:
                     stop_price=place_stop_price,
                     stop_order_type=event.get("stop_order_type"),
                     stop_trigger_method=event.get("stop_trigger_method"),
+                    client_order_id=self._mirror_cid(master_order_id),
                 )
                 result = resp.get("result", resp)
                 follower_order_id = result.get("id")
@@ -4512,7 +4523,25 @@ class CopyEngine:
         od = await self._safe_get_order(self._get_master_client(master_row), master_order_id)
         if not od:
             return False
-        return self._order_done(od) or self._filled_size(od) > 0
+        if self._order_done(od):
+            return True
+        try:
+            if od.get("unfilled_size") is not None:
+                _hint = self.__dict__.setdefault("_master_unfilled_hint", {})
+                if len(_hint) > 512:
+                    _hint.clear()
+                _hint[str(master_order_id)] = abs(float(od["unfilled_size"]))
+        except (TypeError, ValueError):
+            pass
+        if (od.get("state") or "").lower() in ("cancelled", "canceled"):
+            return self._filled_size(od) > 0      # as before: a part-filled cancel is settled
+        # OPEN WITH A PARTIAL FILL STILL RESTS. "filled_size > 0" used to count
+        # it as settled, so the follower was sized on the filled part alone and
+        # no resting copy was ever placed for the rest. 2026-11-24 07:41 IST,
+        # C-BTC-62000: JD algo4's 500 buy filled 15 on arrival; JD algo3 opened
+        # 15, nothing rested for the other 485, and confirm-copy bought 489 at
+        # market 30s later when the rest filled.
+        return False
 
     async def _master_order_filled(self, master_order_id) -> bool:
         """Have we SEEN this master order fill?
@@ -4942,30 +4971,55 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Escalation error for {symbol}: {e}")
 
+    @staticmethod
+    def _mirror_cid(master_order_id) -> str:
+        """client_order_id for a mirror: names the master order it copies, so a
+        cancel can find exactly this copy. Unique per placement (Delta requires
+        uniqueness across open orders, and a later re-place of the same master
+        order must not collide with an old one); max 32 chars."""
+        import uuid
+        return f"mo{master_order_id}-{uuid.uuid4().hex[:6]}"[:32]
+
     async def _find_follower_order(self, client, event: dict):
-        """Locate the follower's order matching a master order, for self-healing
-        cancels when the id map is missing/stale. Matches on product + leg, or
-        for plain orders on side + price."""
+        """Locate the follower's copy of a master order, for self-healing a
+        cancel when the id map is missing/stale.
+
+        A copy placed since 2026-11-24 carries its master order id in its
+        client_order_id, and that is matched EXACTLY. Otherwise: stops by
+        product + leg; a plain order only by side AND an exact price, and never
+        one that is tagged as the copy of a DIFFERENT master order. With no
+        price to match on, nothing — the old "any same-side order" match
+        cancelled the copy of another order: 2026-11-24 12:00:44 IST,
+        C-BTC-62800, JD algo4's 0.2s order was cancelled with no price and
+        JD algo3's copy of order 1710310326 was cancelled in its place."""
         product_id = event.get("product_id")
         stop_order_type = event.get("stop_order_type")
         side = (event.get("side") or "").lower()
         limit_price = event.get("limit_price")
+        tag = f"mo{event.get('master_order_id')}-" if event.get("master_order_id") else None
         orders = []
         for st in ("pending", "open"):
             try:
                 orders += await client.get_open_orders(state=st)
             except Exception:
                 pass
+        if tag:
+            for o in orders:
+                if str(o.get("client_order_id") or "").startswith(tag):
+                    return str(o.get("id"))
         for o in orders:
             if str(o.get("product_id")) != str(product_id):
                 continue
             if stop_order_type:
                 if o.get("stop_order_type") == stop_order_type:
                     return str(o.get("id"))
-            else:
-                if (o.get("side") or "").lower() == side and not o.get("stop_order_type"):
-                    if limit_price is None or str(o.get("limit_price")) == str(limit_price):
-                        return str(o.get("id"))
+                continue
+            if str(o.get("client_order_id") or "").startswith("mo"):
+                continue          # the tagged copy of some OTHER master order
+            if (o.get("side") or "").lower() != side or o.get("stop_order_type"):
+                continue
+            if limit_price is not None and str(o.get("limit_price")) == str(limit_price):
+                return str(o.get("id"))
         return None
 
     async def _settle_exit_after_cancel(self, follower: dict, client, symbol: str,

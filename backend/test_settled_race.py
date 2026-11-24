@@ -136,10 +136,21 @@ async def test_the_race_window_the_other_way():
 
 
 async def test_partially_filled_counts_as_settled():
-    print("\n5. a partly-filled order has lots in the position already")
+    # CHANGED 2026-11-24. This used to assert "settled": the filled 100 are in
+    # the position, so counting the order as resting at its full 300 would
+    # double them. But calling it settled meant the follower was sized on the
+    # filled part ALONE and no resting copy was placed for the other 200 — the
+    # JD algo3 short of 489 at 07:41 IST. Now the order still RESTS, and the
+    # double count is avoided by sizing it at what is left (unfilled 200).
+    print("\n5. a partly-filled OPEN order still rests — sized by what is left")
     part = {"id": OID, "state": "open", "size": 300, "unfilled_size": 200, "filled_size": 100}
     eng = engine(filled=False, order=part)
-    check("settled", await settled(eng, in_book=False), True)
+    check("not settled — 200 of it still rest", await settled(eng, in_book=False), False)
+    check("and what is left is remembered for sizing",
+          eng.__dict__.get("_master_unfilled_hint", {}).get(str(OID)), 200.0)
+    done = {"id": OID, "state": "cancelled", "size": 300, "unfilled_size": 200, "filled_size": 100}
+    eng2 = engine(filled=False, order=done)
+    check("a part-filled CANCELLED order is settled, as before", await settled(eng2, in_book=False), True)
 
 
 async def test_unreadable_falls_back_to_resting():

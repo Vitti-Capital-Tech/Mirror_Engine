@@ -335,7 +335,18 @@ class TradeListener:
                 # The existing staleness guard re-checks the exchange only above
                 # STALE_EVENT_RECHECK_SEC (10s); this event was under that bar. An
                 # id we have SEEN fill needs no exchange call to be trusted.
-                await self._mark_master_order_filled(order.get("id"))
+                # Only when it is COMPLETELY filled. A first partial fill used to
+                # mark it too, and the engine then treated an order still resting
+                # 485 of its 500 lots as finished (2026-11-24 07:41 IST,
+                # C-BTC-62000): the follower got the 15 that had filled and no
+                # resting copy for the rest.
+                _unf = order.get("unfilled_size")
+                try:
+                    _fully = state in ("closed", "filled") or (_unf is not None and float(_unf) <= 0)
+                except (TypeError, ValueError):
+                    _fully = state in ("closed", "filled")
+                if _fully:
+                    await self._mark_master_order_filled(order.get("id"))
                 if order_type == "market_order" and not is_stop:
                     # Plain market fill -> copy as a market order (entry/close).
                     await self._push_fill_event(order)
