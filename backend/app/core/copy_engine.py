@@ -5382,7 +5382,31 @@ class CopyEngine:
                             await client.cancel_order(foid, product_id=product_id)
                             logger.info(f"Self-healed cancel: cancelled {foid} for follower {follower_id}")
                         else:
-                            logger.warning(f"Cancel: no matching follower order found for {follower_id}")
+                            # NAME THE LEG, and pick the level by what it means.
+                            #
+                            # This used to print the follower's UUID and nothing
+                            # else, at WARNING. On 2026-11-23 12:00:02-05 the
+                            # master closed his whole book and nine of these
+                            # landed in four seconds, every one identical and
+                            # none of them attributable to a symbol.
+                            #
+                            # Two different situations reach here:
+                            #   * no mapping ever existed and nothing on the
+                            #     exchange matches -> the follower never had a
+                            #     mirror for this order. After a master closes
+                            #     out, that is the expected state, not a fault.
+                            #   * a mapping DID exist, its cancel failed, and
+                            #     the search found nothing -> the order we
+                            #     believed in is unaccounted for. Worth a look.
+                            _msg = (f"Cancel for master order {master_order_id} "
+                                    f"({symbol or 'unknown symbol'}): no matching order on "
+                                    f"{follower_row.get('name') or follower_id}")
+                            if follower_order_id:
+                                logger.warning(
+                                    f"{_msg} — its mapped mirror {follower_order_id} could not "
+                                    f"be cancelled either ({e})")
+                            else:
+                                logger.info(f"{_msg} — it never had one, nothing to cancel")
                     except Exception as e2:
                         logger.warning(f"Failed self-heal cancel for {follower_id}: {e2}")
                 else:
