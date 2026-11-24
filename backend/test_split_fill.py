@@ -97,7 +97,7 @@ class DB:
         return _Q(self.store, n)
 
 
-def build():
+def build(delay=0.0):
     from app.core import copy_engine as ce
     from app.services import telegram_client as tg
 
@@ -115,6 +115,10 @@ def build():
     # this test is about WHAT gets sent, not about limit-then-market escalation.
     async def execute(client, account, trade_id, symbol, side, quantity,
                       master_price, trade_type="entry"):
+        if delay:
+            # A real copy takes seconds (limit, wait, market fallback), and
+            # other events for the same order are processed meanwhile.
+            await asyncio.sleep(delay)
         await client.place_order(symbol=symbol, side=side, size=int(quantity),
                                  order_type="market_order",
                                  reduce_only=trade_type in ("exit", "sl"))
@@ -188,8 +192,139 @@ def test_pieces_arriving_out_of_order_are_not_double_counted():
     check("the stale piece sends nothing", orders, 1)
 
 
-def test_an_exit_filled_in_two_pieces_closes_the_follower():
-    print("\nEXIT filled 1000 + 2000")
+def test_overlapping_entry_pieces_add_up_once():
+    print("\nENTRY, ONE ORDER IN THREE OVERLAPPING PIECES")
+    eng, ex, fc, db = build(delay=0.05)
+
+    async def run():
+        ex.set_position(MASTER["id"], SYM, -3000)
+        await asyncio.gather(*(eng.process_fill(fill_event("1710300001", "sell", c))
+                               for c in (1, 1200, 3000)))
+        return ex.position(FOLLOWER["id"], SYM)
+
+    check("the follower ends at its share of 3000 — pieces add up, not repeat",
+          asyncio.run(run()), -float(share(3000)))
+
+
+# --- exits filling in pieces: each piece sells ITS share (2026-11-24) -------
+
+def _sells(fc):
+    return [o for o in fc.placed if o.get("side") == "sell"]
+
+
+def _sold(fc):
+    return sum(int(o.get("size") or 0) for o in _sells(fc))
+
+
+def test_overlapping_exit_pieces_sell_their_parts_not_the_whole():
+    """2026-11-24 11:09 IST, C-BTC-62600, Dhwani -> Dhwani1. The master sold 200
+    of 500 in ONE order that filled in three pieces (2, 111, 200). Each piece
+    used to size the WHOLE exit (held - target = 201); the pieces ran at the
+    same time (the first copy took ~9s; the leg lock gives up after 5s), each
+    read the follower at 503, and each sold 201 — the follower sold all 503 and
+    was bought back 301 at 11:09:57. Now each piece sells only its part."""
+    print("\nEXIT, ONE ORDER IN THREE OVERLAPPING PIECES (C-BTC-62600, 2026-11-24)")
+    eng, ex, fc, db = build(delay=0.05)
+
+    async def run():
+        ex.set_position(MASTER["id"], SYM, 300)              # after his sell of 200
+        ex.set_position(FOLLOWER["id"], SYM, share(500))      # before
+        await asyncio.gather(*(eng.process_fill(fill_event("1710277843", "sell", c, order_size=200))
+                               for c in (2, 111, 200)))
+        return ex.position(FOLLOWER["id"], SYM), _sold(fc)
+
+    pos, sold = asyncio.run(run())
+    check("the follower is NOT sold flat", pos > 0, True)
+    check("it ends at its share of the master's 300 (within the 1-lot rounding)",
+          share(300) <= pos <= share(300) + 1, True)
+    check("total sold is the share of 200, not 3 x the whole exit",
+          sold <= share(500) - share(300), True)
+
+
+def test_slow_exit_pieces_each_sell_their_part():
+    print("\nEXIT, PIECES ARRIVING SLOWLY (the master's book moves between them)")
+    eng, ex, fc, db = build()
+
+    async def run():
+        ex.set_position(FOLLOWER["id"], SYM, share(500))
+        ex.set_position(MASTER["id"], SYM, 400)               # first 100 filled
+        await eng.process_fill(fill_event("1710400001", "sell", 100, order_size=200))
+        after_first = ex.position(FOLLOWER["id"], SYM)
+        ex.set_position(MASTER["id"], SYM, 300)               # the rest filled
+        await eng.process_fill(fill_event("1710400001", "sell", 200, order_size=200))
+        return after_first, ex.position(FOLLOWER["id"], SYM), len(_sells(fc))
+
+    first, final, n = asyncio.run(run())
+    check("piece 1 sells its part (follower near its share of 400)",
+          share(400) <= first <= share(400) + 1, True)
+    check("piece 2 sells its part too — not left for the safety check",
+          share(300) <= final <= share(300) + 1, True)
+    check("two sells, one per piece", n, 2)
+
+
+def test_an_exit_piece_delivered_twice_sells_once():
+    print("\nEXIT, THE SAME PIECE TWICE")
+    eng, ex, fc, db = build()
+
+    async def run():
+        ex.set_position(FOLLOWER["id"], SYM, share(500))
+        ex.set_position(MASTER["id"], SYM, 400)
+        await eng.process_fill(fill_event("1710400002", "sell", 100, order_size=200))
+        await eng.process_fill(fill_event("1710400002", "sell", 100, order_size=200))
+        return len(_sells(fc))
+
+    check("one sell", asyncio.run(run()), 1)
+
+
+def test_exit_pieces_out_of_order_sell_once():
+    print("\nEXIT, THE LAST PIECE ARRIVES FIRST")
+    eng, ex, fc, db = build()
+
+    async def run():
+        ex.set_position(FOLLOWER["id"], SYM, share(500))
+        ex.set_position(MASTER["id"], SYM, 300)
+        await eng.process_fill(fill_event("1710400003", "sell", 200, order_size=200))
+        await eng.process_fill(fill_event("1710400003", "sell", 111, order_size=200))
+        return ex.position(FOLLOWER["id"], SYM), len(_sells(fc))
+
+    pos, n = asyncio.run(run())
+    check("the follower ends exactly at its share", pos, float(share(300)))
+    check("the stale piece sells nothing", n, 1)
+
+
+def test_an_exit_piece_never_goes_below_the_share():
+    print("\nEXIT PIECE AFTER THE FOLLOWER WAS ALREADY TRIMMED")
+    eng, ex, fc, db = build()
+
+    async def run():
+        ex.set_position(FOLLOWER["id"], SYM, share(500))
+        ex.set_position(MASTER["id"], SYM, 300)
+        await eng.process_fill(fill_event("1710400004", "sell", 50, order_size=200))
+        # The safety check trimmed the follower to its share meanwhile.
+        ex.set_position(FOLLOWER["id"], SYM, share(300))
+        await eng.process_fill(fill_event("1710400004", "sell", 200, order_size=200))
+        return ex.position(FOLLOWER["id"], SYM)
+
+    check("the follower stays at its share", asyncio.run(run()), float(share(300)))
+
+
+def test_an_exit_in_one_go_is_unchanged():
+    print("\nEXIT FILLED IN ONE GO (the normal case)")
+    eng, ex, fc, db = build()
+
+    async def run():
+        ex.set_position(FOLLOWER["id"], SYM, share(500))
+        ex.set_position(MASTER["id"], SYM, 300)
+        await eng.process_fill(fill_event("1710400005", "sell", 200, order_size=200))
+        return ex.position(FOLLOWER["id"], SYM), len(_sells(fc))
+
+    pos, n = asyncio.run(run())
+    check("closed to exactly its share of the master's remaining 300", pos, float(share(300)))
+    check("one sell", n, 1)
+
+
+def test_exit_pieces_to_flat_leave_nothing():
+    print("\nEXIT IN PIECES THAT TAKES THE MASTER FLAT")
     eng, ex, fc, db = build()
 
     async def run():
@@ -201,9 +336,9 @@ def test_an_exit_filled_in_two_pieces_closes_the_follower():
         await eng.process_fill(fill_event("1705000001", "buy", 3000, reduce_only=True))
         return after_first, ex.position(FOLLOWER["id"], SYM)
 
-    after_first, final = asyncio.run(run())
-    check("piece 1 trims to the share of what is left", after_first, -float(share(2000)))
-    check("piece 2 takes the follower flat with the master", final, 0.0)
+    first, final = asyncio.run(run())
+    check("piece 1 trims to the share of what is left", first, -float(share(2000)))
+    check("the last piece takes the follower flat — no stranded lot", final, 0.0)
 
 
 def test_a_late_piece_does_not_overshoot_a_follower_already_topped_up():
@@ -255,10 +390,17 @@ def test_the_listener_reports_how_much_has_filled_so_far():
 
 if __name__ == "__main__":
     for t in (test_an_entry_filled_in_two_pieces_is_copied_in_full,
+              test_overlapping_entry_pieces_add_up_once,
               test_the_same_piece_delivered_twice_is_copied_once,
               test_pieces_arriving_out_of_order_are_not_double_counted,
-              test_an_exit_filled_in_two_pieces_closes_the_follower,
               test_a_late_piece_does_not_overshoot_a_follower_already_topped_up,
+              test_overlapping_exit_pieces_sell_their_parts_not_the_whole,
+              test_slow_exit_pieces_each_sell_their_part,
+              test_an_exit_piece_delivered_twice_sells_once,
+              test_exit_pieces_out_of_order_sell_once,
+              test_an_exit_piece_never_goes_below_the_share,
+              test_an_exit_in_one_go_is_unchanged,
+              test_exit_pieces_to_flat_leave_nothing,
               test_the_listener_reports_how_much_has_filled_so_far):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))

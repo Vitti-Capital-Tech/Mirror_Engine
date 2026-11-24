@@ -557,13 +557,36 @@ class CopyEngine:
                     f"Reclassified {symbol} {side} as EXIT (master now {master_signed_now:+.0f}) — "
                     f"unflagged close, mirroring follower close immediately"
                 )
+        # AN EXIT FILLING IN PIECES IS SIZED BY THE PIECE, LIKE AN ENTRY.
+        #
+        # A whole exit closes each follower to its share of what the master
+        # still holds (held - target). Applied to every PIECE of an order, that
+        # repeats the whole exit once per piece. 2026-11-24 11:09 IST,
+        # C-BTC-62600: the master sold 200 of 500 in one order that filled in
+        # three pieces (2, 111, 200). The pieces ran at the same time — the
+        # first copy took ~9s and the leg lock gives up after 5s — so each read
+        # the follower at 503 and each sold 503 - 302 = 201: the follower sold
+        # everything, and the reconciler bought 301 back 30s later.
+        #
+        # So a piece sells only ITS share — share(filled so far) minus
+        # share(already copied), claimed exactly as entries are — and never
+        # takes the follower below its share of the master's remaining
+        # position. Pieces then add up to the whole exit whether they arrive
+        # together, slowly, twice or out of order. An exit that fills in one go
+        # keeps the old held - target sizing, which also corrects any drift.
+        exit_in_pieces = False
+        last_piece = True
         if is_exit:
-            # A further piece of a split order arrives within milliseconds of
-            # the last one, so the ~3s cached size is the size BEFORE this piece
-            # — the follower would be "already at target" and keep the lots the
-            # master just closed. Read it fresh for those.
+            try:
+                _unf = (raw_payload or {}).get("unfilled_size")
+                last_piece = not (_unf is not None and float(_unf) > 0)
+            except (TypeError, ValueError):
+                last_piece = True
+            exit_in_pieces = bool(copied_before) or not last_piece
+            # Fresh for pieces: they arrive milliseconds apart, and the ~3s
+            # cached size can predate the very fill being copied.
             master_remaining = await self._master_position_size(
-                master_row, symbol, fresh=bool(copied_before))
+                master_row, symbol, fresh=exit_in_pieces)
 
         # Order-ID ledger: record the MASTER order before dispatching anything, so
         # a crash mid-dispatch still leaves an entry with no follower legs (i.e.
@@ -606,6 +629,38 @@ class CopyEngine:
                     # Couldn't read the master's remaining size — fall back to a
                     # proportional close rather than skipping the exit entirely.
                     follower_qty = self.risk_engine.calculate_follower_quantity(fill_qty, entry_price, follower, round_up=True)
+                elif exit_in_pieces:
+                    # This piece's share (floor: pieces never add up to more
+                    # than the share of the whole), never past the follower's
+                    # share of what the master still holds.
+                    piece = (
+                        self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=False, min_one=False)
+                        - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=False, min_one=False)
+                    )
+                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
+                    current = await self._position_size(client, symbol)
+                    room = int(current) - int(target)
+                    # The master is flat and this is the order's last piece:
+                    # close what is left, so rounding cannot strand a lot.
+                    follower_qty = room if (int(target) == 0 and last_piece) else min(int(piece), room)
+                    if follower_qty < 1:
+                        logger.info(
+                            f"Exit piece {copied_before:g} -> {quantity:g} of {master_trade_id}: "
+                            f"nothing for {follower['name']} on {symbol} (holds {current:.0f}, "
+                            f"target {int(target)}, piece share {int(piece)})"
+                        )
+                        skip_reason = f"already at its share {int(target)} (holds {current:.0f})"
+                        await ledger.record_follower_leg(
+                            self.redis, master_trade_id, follower["id"], status="skipped",
+                            reason=skip_reason,
+                        )
+                        self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
+                        continue
+                    logger.info(
+                        f"Exit piece {copied_before:g} -> {quantity:g} of {master_trade_id}: "
+                        f"{follower['name']} sells {follower_qty} on {symbol} (piece share "
+                        f"{int(piece)}, holds {current:.0f}, target {int(target)})"
+                    )
                 else:
                     # round_up=True (min_one=False): one definition of the follower's
                     # target across every path — live close, mirrored close,
