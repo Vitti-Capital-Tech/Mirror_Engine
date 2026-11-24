@@ -336,6 +336,37 @@ class PositionMonitor:
                         "account_id", account_id).eq("symbol", symbol).execute()
                     return "synced"
 
+            # A HANDS-OFF leg is not a mismatch either, for the same reason the
+            # peak carve-out above exists: this is the copy engine's deliberate
+            # decision, not a fault, and alerting on it is alerting on our own
+            # correct behaviour.
+            #
+            # When the MASTER's SL/TP triggers, the engine does not force the
+            # follower out — the follower's own stop sits tp_sl_offset away and
+            # closes that leg itself. In the window between the two, the master
+            # is flat and the follower still holds, which this check reads as a
+            # mismatch against an expected size of 0.
+            #
+            # Since the follower's stops were deliberately placed BEYOND the
+            # master's (2026-11-24), the master's fires FIRST on every stop-out,
+            # so this window now opens on every single one. Live that day at
+            # 14:30:34 IST, Dhwani on P-BTC-58400 and P-BTC-59800: both of the
+            # master's stops triggered, the reconciler logged "leaving Dhwani1
+            # ... alone — hands-off" every ten seconds, and this check raised two
+            # Telegram alerts a minute later for the same state.
+            hoff = await ledger.is_hands_off(
+                self.redis, follower_account.get("owner_id"), account_id, symbol)
+            if hoff and diff > mismatch_limit:
+                logger.info(
+                    f"{account_name} holds {follower_qty} on {symbol} against an expected "
+                    f"{expected_qty}, but the leg is hands-off ({hoff.get('reason')}) — its "
+                    f"own stop closes it; not alerting"
+                )
+                await self._resolve_mismatch_alert(account_id, symbol, owner_id)
+                self.db.table("positions").update({"sync_status": "synced"}).eq(
+                    "account_id", account_id).eq("symbol", symbol).execute()
+                return "synced"
+
             if diff > mismatch_limit:
                 status = "out_of_sync"
                 msg = f"Position mismatch for {account_name} on {symbol}: actual size={follower_qty}, expected size={expected_qty} (diff={diff})"
