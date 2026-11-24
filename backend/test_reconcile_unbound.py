@@ -73,6 +73,10 @@ BASELINE = {
         "_age", "_e", "_held", "_kind", "_leg_err", "_live",
         "_msz", "_name", "_nm", "_now", "_qty", "_sk",
         "_target", "key", "why",
+        # 2026-11-24: assigned before its `async with` and used after it — CPython
+        # 3.12 only flow-tracks a function's first 64 locals, and this one has
+        # more, so it is flagged though it is always bound. Not a real risk.
+        "open_qty",
     },
 }
 

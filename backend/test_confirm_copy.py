@@ -65,6 +65,7 @@ MASTER = {"id": "m1", "is_master": True, "owner_id": "u1", "status": "active",
 # completion). A fixture kinder than production tests nothing; same mistake as
 # supplying filled_size in test_manual_exit.
 FOLLOWER = {"id": FID, "name": "Mini Prathav", "is_master": False, "owner_id": "u1",
+            "master_id": "m1",   # a follower names its master (all live ones do)
             "status": "active", "allocation_mode": "auto_ratio",
             "allocation_value": None, "balance": 79.21331535,
             "available_margin": 79.21331535}

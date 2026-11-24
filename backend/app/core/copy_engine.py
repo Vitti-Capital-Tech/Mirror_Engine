@@ -1792,8 +1792,9 @@ class CopyEngine:
         accounts = await self._read_accounts()
         by_id = {a.get("id"): a for a in (accounts or []) if a.get("id")}
         _oid = event.get("owner_id")
-        master_row = next((a for a in (accounts or []) if a.get("is_master")
-                           and (not _oid or a.get("owner_id") == _oid)), None)
+        # The master the event names (see _event_master); None if it has been
+        # demoted since — then nothing is sized against anyone.
+        master_row = self._event_master(accounts, event)
         if master_row is None:
             return
         if not mapping:
@@ -1814,10 +1815,13 @@ class CopyEngine:
             # been written — 0 of the last 1,000 trade_copies rows cross owners,
             # because this fallback only fires when nothing was mirrored at all —
             # but that is luck rather than a guard.
+            # And THIS MASTER's followers, not every follower of the owner: one
+            # owner can run several groups (see the cancel fallback, which sold
+            # another group's follower 2602 lots on 2026-11-24).
             mapping = {a["id"]: None for a in (accounts or [])
                        if a.get("id") and not a.get("is_master")
                        and a.get("status") == "active"
-                       and (not _oid or a.get("owner_id") == _oid)}
+                       and self._follows(a, master_row)}
             if not mapping:
                 return
             logger.info(
@@ -2048,12 +2052,11 @@ class CopyEngine:
         # id with no scope at all. Reading everything reproduces both exactly.
         accounts = await self._read_accounts()
         by_id = {a.get("id"): a for a in (accounts or []) if a.get("id")}
-        _oid = event.get("owner_id")
-        master_row = next(
-            (a for a in (accounts or [])
-             if a.get("is_master") and (not _oid or a.get("owner_id") == _oid)),
-            None,
-        )
+        # The master that filled — not the owner's first master (see _event_master).
+        master_row = self._event_master(accounts, event)
+        if master_row is None:
+            logger.info(f"escalation: master for {master_order_id} is no longer a master — not acting")
+            return
         # The follower rows below are read FRESH from the DB, so they carry no
         # master_balance — and auto_ratio divides by it. Without this the ratio was
         # unreadable in the escalation path, _follower_close_qty returned None, and
@@ -2805,16 +2808,39 @@ class CopyEngine:
                             # correction most likely to collide: it fires when the
                             # follower is FLAT, which is exactly what a live mirror
                             # mid-place looks like.
+                            open_qty = 0
                             async with leg_locks.hold(_mkey, sym, "open") as _got:
                                 if not _got:
                                     continue
+                                # LAST LOOK, as TOPUP/TRIM/CLOSE already do. The
+                                # follower was read flat at the top of the pass,
+                                # and waiting for this lock means a live copy was
+                                # acting on this very leg — it may have opened it
+                                # meanwhile. Opening the full target on top would
+                                # double the position (an open is not reduce_only,
+                                # so nothing caps it).
+                                _fresh = await self._live_signed_fresh(client, sym)
+                                if _fresh is None:
+                                    continue          # unreadable — never open on an unknown
+                                if _fresh == 0:
+                                    open_qty = int(target)
+                                elif (_fresh > 0) == (msz > 0):
+                                    open_qty = int(target) - int(abs(_fresh))
+                                else:
+                                    open_qty = 0      # follower on the other side; not this correction
+                                if open_qty < 1:
+                                    logger.info(
+                                        f"reconcile: not opening {fol.get('name')} {sym} after all "
+                                        f"— the leg is there now ({_fresh:+.0f})"
+                                    )
+                                    continue
                                 await client.place_order(
-                                    symbol=sym, side=side, size=int(target),
+                                    symbol=sym, side=side, size=int(open_qty),
                                     order_type="market_order", reduce_only=False,
                                 )
-                            logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(target)} (master {msz:+.0f}) — recovered missing leg")
+                            logger.info(f"reconcile: opened {fol.get('name')} {sym} {side} {int(open_qty)} (master {msz:+.0f}) — recovered missing leg")
                             asyncio.create_task(tg.notify_correction(
-                                fol.get("name"), sym, "OPENED", int(target),
+                                fol.get("name"), sym, "OPENED", int(open_qty),
                                 held=0, target=int(target), master=int(msz),
                                 why="the follower had no leg at all — the live copy "
                                     "never reached the exchange"))
@@ -4101,8 +4127,21 @@ class CopyEngine:
                                 "1", ex=7 * 24 * 3600,
                             )
                         continue
-                    logger.warning(f"Order edit failed for {follower['name']} ({e} {body}); re-placing so the update reflects on the first try.")
-                    # fall through to place a fresh order (the mapped one really was gone)
+                    # The old mirror is still RESTING and unfilled — the edit
+                    # failed for a passing reason (429, 5xx, timeout, price band).
+                    # Placing a fresh order now would leave TWO resting copies,
+                    # and the overwritten ordermap means no later cancel clears
+                    # the first: the follower can end at double. Take the old
+                    # one out first, and re-place only if that worked.
+                    if not await self._safe_cancel(client, existing_foid, product_id):
+                        logger.warning(
+                            f"Order edit failed for {follower['name']} ({e} {body}) and the old "
+                            f"mirror {existing_foid} could not be cancelled — NOT re-placing "
+                            f"(it would rest twice); the order sweep retries"
+                        )
+                        continue
+                    logger.warning(f"Order edit failed for {follower['name']} ({e} {body}); old mirror {existing_foid} cancelled, re-placing so the update reflects.")
+                    # fall through to place a fresh order
 
             try:
                 resp = await self._place_order_with_retry(
@@ -4431,6 +4470,33 @@ class CopyEngine:
         except Exception as e:
             logger.error(f"Failed to read accounts (owner {owner_id or '<all>'}): {e}")
             return None
+
+    @staticmethod
+    def _event_master(accounts, event):
+        """The master an event came from — the one it NAMES.
+
+        Several paths used to pick "the owner's first master", which with more
+        than one group under an owner is the other group's master half the
+        time, so a follower got sized against someone else's position.
+        If the named account is no longer a master (demoted between the event
+        and now), None: do nothing rather than borrow another group's master.
+        Only an event with no master id (queued before groups existed) falls
+        back to the owner's master."""
+        rows = accounts or []
+        mid = (event or {}).get("master_account_id")
+        if mid:
+            row = next((a for a in rows if str(a.get("id")) == str(mid)), None)
+            return row if row and row.get("is_master") else None
+        oid = (event or {}).get("owner_id")
+        return next((a for a in rows if a.get("is_master")
+                     and (not oid or a.get("owner_id") == oid)), None)
+
+    @staticmethod
+    def _follows(follower, master_row) -> bool:
+        """True only if this follower's master IS master_row. A follower with no
+        master (its master was deleted: master_id is ON DELETE SET NULL) follows
+        nobody and is never traded on another master's behalf."""
+        return bool(master_row) and str((follower or {}).get("master_id") or "") == str(master_row.get("id"))
 
     @staticmethod
     def _split_accounts(accounts, owner_id=None, master_id=None):
@@ -4956,13 +5022,11 @@ class CopyEngine:
         _accounts = await self._read_accounts() or []
         _by_id = {a.get("id"): a for a in _accounts if a.get("id")}
         master_row = None
+        # WHICH master cancelled: the event names it. Picking "the owner's
+        # master" took the FIRST master an owner has, so with two groups a
+        # cancel could be sized against the other group's master.
         if symbol and event:
-            _oid = event.get("owner_id")
-            master_row = next(
-                (a for a in _accounts
-                 if a.get("is_master") and (not _oid or a.get("owner_id") == _oid)),
-                None,
-            )
+            master_row = self._event_master(_accounts, event)
         if is_protective and symbol and event:
             # Did the master CANCEL this stop, or did it FIRE?
             #
@@ -5065,9 +5129,17 @@ class CopyEngine:
         # self-heal) all active followers if we have no mapping.
         targets = dict(mapping) if mapping else {}
         if not targets and event:
-            # Deliberately NOT owner-scoped, matching the query this replaces.
+            # THIS MASTER'S followers only. This used to be every active
+            # follower in the system ("deliberately NOT owner-scoped"), and the
+            # exit settle below then sized each one against THIS master's
+            # position. 2026-11-24 12:00:42 IST, C-BTC-62800: JD algo4 placed a
+            # limit and cancelled it ~0.2s later, before any copy existed, so
+            # there was no mapping — and Dhwani1, in another group entirely, was
+            # "settled" to its share of JD algo4's +500: 2602 lots closed,
+            # 3011 -> 409, and not recovered because Dhwani's entry was stale.
             targets = {a["id"]: None for a in _accounts
-                       if not a.get("is_master") and a.get("status") == "active"}
+                       if not a.get("is_master") and a.get("status") == "active"
+                       and self._follows(a, master_row)}
 
         # auto_ratio divides by the master's balance, and these follower rows come
         # straight from the DB without it — so the settle below saw an unreadable
@@ -5083,6 +5155,15 @@ class CopyEngine:
         for follower_id, follower_order_id in targets.items():
             follower_row = _by_id.get(follower_id)
             if not follower_row:
+                continue
+            # Belt and braces: never act on a follower of a DIFFERENT master,
+            # whatever list it arrived in. Its position must only ever be sized
+            # against its own master.
+            if master_row and not self._follows(follower_row, master_row):
+                logger.info(
+                    f"Cancel of {master_order_id} on {symbol}: skipping "
+                    f"{follower_row.get('name')} — it follows a different master"
+                )
                 continue
             follower_row = dict(follower_row)  # per-follower, not shared state
             follower_row["master_balance"] = cancel_master_balance

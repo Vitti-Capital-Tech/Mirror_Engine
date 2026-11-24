@@ -214,6 +214,20 @@ async def update_account(id: str, account_data: AccountUpdate, user: CurrentUser
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update.")
 
+        # The same check the create path makes. Without it an edit could point a
+        # follower at ANY account — another owner's master included — and the
+        # engine, which trusts master_id, would then mirror that master's stops,
+        # protection and exits onto this follower.
+        if update_data.get("master_id") is not None:
+            new_mid = str(update_data["master_id"])
+            target = (db.table("accounts").select("id, is_master, owner_id")
+                      .eq("id", new_mid).execute().data or [None])[0]
+            if (new_mid == str(id) or not target or not target.get("is_master")
+                    or target.get("owner_id") != existing.get("owner_id")):
+                raise HTTPException(
+                    status_code=400,
+                    detail="That master does not exist, or belongs to someone else.")
+
         # Encrypt any secret fields being changed
         from app.core.crypto import encrypt
         if update_data.get("api_key"):

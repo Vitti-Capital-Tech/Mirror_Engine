@@ -155,7 +155,10 @@ def test_it_never_returns_a_negative():
 def test_all_three_corrections_take_the_last_look():
     print("\n13. trim, close and top-up all re-read before acting")
     src = inspect.getsource(CopyEngine._reconcile_positions)
-    check("three fresh reads", src.count("self._live_signed_fresh(client, sym)"), 3)
+    # Four since 2026-11-24: OPEN gained a last look (it could double a leg a
+    # live copy had just opened). It sizes inline, not via _still_worth_acting.
+    check("four fresh reads (open re-reads too)", src.count("self._live_signed_fresh(client, sym)"), 4)
+    check("open stands down when the leg is there", "not opening" in src, True)
     check("three re-sizes", src.count("self._still_worth_acting("), 3)
     check("trim stands down", "not trimming" in src, True)
     check("close stands down", "not closing" in src, True)

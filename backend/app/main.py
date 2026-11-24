@@ -190,7 +190,11 @@ async def _run_fill(event_dict: dict):
     if not sym:
         await _fill(event_dict)
         return
-    async with leg_locks.hold(_event_master(event_dict), sym, "fill") as got:
+    # Live events wait long enough for the copy ahead of them to finish (see
+    # leg_locks.LIVE_ACQUIRE_TIMEOUT) — running unlocked alongside it is how
+    # one master sell was copied three times on 2026-11-24.
+    async with leg_locks.hold(_event_master(event_dict), sym, "fill",
+                              timeout=leg_locks.LIVE_ACQUIRE_TIMEOUT) as got:
         if not got:
             logger.warning("fill for %s waited too long for its leg — processing anyway", sym)
         await _fill(event_dict)
@@ -210,7 +214,8 @@ async def _run_order(event: dict):
         # locks each correction itself.
         await _order(event)
         return
-    async with leg_locks.hold(_event_master(event), sym, "mirror") as got:
+    async with leg_locks.hold(_event_master(event), sym, "mirror",
+                              timeout=leg_locks.LIVE_ACQUIRE_TIMEOUT) as got:
         if not got:
             logger.warning("mirror for %s waited too long for its leg — processing anyway", sym)
         await _order(event)

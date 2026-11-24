@@ -254,9 +254,11 @@ def test_the_dispatcher_keys_on_the_master_too():
     main = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "app", "main.py"), encoding="utf-8").read()
     check("mirror events lock per leg",
-          'leg_locks.hold(_event_master(event), sym, "mirror")' in main, True)
+          'leg_locks.hold(_event_master(event), sym, "mirror"' in main, True)
     check("fills too",
-          'leg_locks.hold(_event_master(event_dict), sym, "fill")' in main, True)
+          'leg_locks.hold(_event_master(event_dict), sym, "fill"' in main, True)
+    check("live events wait long enough for the copy ahead to finish",
+          main.count("timeout=leg_locks.LIVE_ACQUIRE_TIMEOUT"), 2)
     check("the master comes off the event",
           '"master_account_id"' in main, True)
     check("an event with no symbol is not locked on a shared fallback key",

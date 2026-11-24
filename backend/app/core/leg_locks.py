@@ -47,6 +47,17 @@ logger = logging.getLogger(__name__)
 # its guards measured ~1s), short enough that a hung call costs one sweep.
 ACQUIRE_TIMEOUT = 5.0
 
+# How long a LIVE master event (a fill, a resting order, a cancel) waits for the
+# leg. It cannot skip — a master trade must be copied — so after this it runs
+# anyway. 5s was shorter than one copy takes (limit, a 5s fill wait, market
+# fallback, confirm: ~5-10s), so the next event on the same leg routinely ran
+# UNLOCKED alongside it, both sizing off the same not-yet-updated position.
+# 2026-11-24 11:09 IST, C-BTC-62600: three pieces of one master sell ran at
+# once that way and the follower sold 503 instead of 201. 30s outlasts a copy,
+# so events on one leg now run one after another; a genuinely hung call still
+# only holds the leg for 30s. Other legs are never affected.
+LIVE_ACQUIRE_TIMEOUT = 30.0
+
 # A lock is dropped once it has been idle this long. Delta's BTC options expire
 # daily, so every trading day mints a fresh set of strikes that will never be
 # seen again; without this the registry grows for the life of the process.
@@ -81,7 +92,7 @@ def get(master_id, symbol) -> asyncio.Lock:
 
 
 @asynccontextmanager
-async def hold(master_id, symbol, what: str = ""):
+async def hold(master_id, symbol, what: str = "", timeout: float = None):
     """Hold this leg for the duration of ONE action.
 
     Yields True when the lock was taken, False when it could not be had within
@@ -91,11 +102,11 @@ async def hold(master_id, symbol, what: str = ""):
     """
     lock = get(master_id, symbol)
     try:
-        await asyncio.wait_for(lock.acquire(), timeout=ACQUIRE_TIMEOUT)
+        await asyncio.wait_for(lock.acquire(), timeout=timeout or ACQUIRE_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning(
             "leg busy: %s on %s held longer than %.0fs%s — skipping this pass",
-            master_id, symbol, ACQUIRE_TIMEOUT, f" ({what})" if what else "")
+            master_id, symbol, timeout or ACQUIRE_TIMEOUT, f" ({what})" if what else "")
         yield False
         return
     except Exception as e:

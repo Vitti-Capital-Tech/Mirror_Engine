@@ -134,7 +134,8 @@ MASTER = {"id": "m1", "name": "Master", "is_master": True, "api_key": "k",
 FOLLOWER = {"id": "f1", "name": "Prathav-Follower", "is_master": False,
             "status": "active", "api_key": "k", "api_secret": "s",
             "environment": "demo", "allocation_mode": "multiplier",
-            "allocation_value": 0.01, "owner_id": "u1"}
+            "allocation_value": 0.01, "owner_id": "u1",
+            "master_id": "m1"}   # a follower names its master (all live ones do)
 
 
 class Res:
