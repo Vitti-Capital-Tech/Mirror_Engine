@@ -1104,7 +1104,7 @@ class CopyEngine:
         # while the first is resting, Delta rejects the duplicate id itself
         # ("unique across all open orders of the user").
         import uuid
-        kwargs.setdefault("client_order_id", "me" + uuid.uuid4().hex[:28])
+        kwargs.setdefault("client_order_id", "me" + uuid.uuid4().hex[:28])   # alphanumeric
         cid = kwargs["client_order_id"]
         last = None
         for i in range(max(1, attempts)):
@@ -4976,9 +4976,11 @@ class CopyEngine:
         """client_order_id for a mirror: names the master order it copies, so a
         cancel can find exactly this copy. Unique per placement (Delta requires
         uniqueness across open orders, and a later re-place of the same master
-        order must not collide with an old one); max 32 chars."""
+        order must not collide with an old one); max 32 chars. Letters, digits
+        and an underscore only — the characters Delta's own documented example
+        uses ("my_signal_345212"); others are not documented."""
         import uuid
-        return f"mo{master_order_id}-{uuid.uuid4().hex[:6]}"[:32]
+        return f"mo{master_order_id}_{uuid.uuid4().hex[:6]}"[:32]
 
     async def _find_follower_order(self, client, event: dict):
         """Locate the follower's copy of a master order, for self-healing a
@@ -4996,7 +4998,7 @@ class CopyEngine:
         stop_order_type = event.get("stop_order_type")
         side = (event.get("side") or "").lower()
         limit_price = event.get("limit_price")
-        tag = f"mo{event.get('master_order_id')}-" if event.get("master_order_id") else None
+        tag = f"mo{event.get('master_order_id')}_" if event.get("master_order_id") else None
         orders = []
         for st in ("pending", "open"):
             try:

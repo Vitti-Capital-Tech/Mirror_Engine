@@ -123,7 +123,7 @@ def test_a_self_healed_cancel_never_takes_another_orders_copy():
         ex.set_position("f-algo3", SYM, e2e.share(500))
         other = ex.place("f-algo3", symbol=SYM, side="sell", size=200,
                          order_type="limit_order", limit_price=45, reduce_only=True)["id"]
-        ex.book["f-algo3"][other]["client_order_id"] = "mo1710310326-a1b2c3"   # copy of ANOTHER order
+        ex.book["f-algo3"][other]["client_order_id"] = "mo1710310326_a1b2c3"   # copy of ANOTHER order
         ev = {"action": "cancel", "master_order_id": "1710403452", "symbol": SYM,
               "side": "sell", "order_type": "limit_order", "state": "cancelled",
               "owner_id": "u1", "master_account_id": "m-jd", "product_id": None}
@@ -133,7 +133,7 @@ def test_a_self_healed_cancel_never_takes_another_orders_copy():
 
         mine = ex.place("f-algo3", symbol=SYM, side="sell", size=100,
                         order_type="limit_order", limit_price=50, reduce_only=True)["id"]
-        ex.book["f-algo3"][mine]["client_order_id"] = "mo1710403452-d4e5f6"   # ITS copy
+        ex.book["f-algo3"][mine]["client_order_id"] = "mo1710403452_d4e5f6"   # ITS copy
         await eng.process_order_event(ev)
         ids = [o["id"] for o in ex.resting("f-algo3", SYM)]
         return still_there, mine not in ids, other in ids
@@ -157,7 +157,7 @@ def test_mirrors_carry_their_master_order_id():
         return moid, [o.get("client_order_id") for o in fc.placed]
 
     moid, cids = asyncio.run(run())
-    check("tagged mo<master order id>-...", any(str(c or "").startswith(f"mo{moid}-") for c in cids), True)
+    check("tagged mo<master order id>_...", any(str(c or "").startswith(f"mo{moid}_") for c in cids), True)
     check("within Delta's 32-character limit", all(len(str(c or "")) <= 32 for c in cids), True)
 
 
