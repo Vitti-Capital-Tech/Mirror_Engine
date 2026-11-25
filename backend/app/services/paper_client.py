@@ -84,6 +84,35 @@ _marks: dict = {}                    # symbol -> (price, fetched_at)
 _MARK_TTL = 2.0
 
 
+PAPER_ENV = "paper"
+
+
+def is_paper(account: dict | None) -> bool:
+    """Is this account a paper account? ONE definition, deliberately.
+
+    The account's `environment` is the single source of truth -- the same field
+    that already says demo or live, and the same dropdown the person picks it
+    from. A separate boolean would have been a second source of truth for one
+    fact, which is how the two disagree later.
+
+    EXACT MATCH, never truthiness, because the two ways of getting this wrong
+    are not remotely symmetrical:
+
+      * a PAPER account handed a real DeltaClient -> it has no keys, so every
+        call fails loudly and nobody is hurt.
+      * a REAL account handed a PaperClient -> its orders are never placed, the
+        engine believes they were, and NOTHING SAYS SO. A desk would sit flat
+        while its dashboard showed it in the market.
+
+    So only the exact word qualifies. A missing column reads None, "live" and
+    "demo" read as themselves, and every one of them leaves a real account on
+    the real path. Case and surrounding spaces are forgiven because they come
+    from a form, not from a decision.
+    """
+    env = (account or {}).get("environment")
+    return isinstance(env, str) and env.strip().lower() == PAPER_ENV
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -132,7 +161,7 @@ class PaperClient:
         self.account_id = str(account["id"])
         self.name = account.get("name") or "paper"
         self.db = db
-        self.environment = "paper"
+        self.environment = PAPER_ENV
         self._on_fill: Optional[OnFillCallback] = None
         self._on_position: Optional[OnPositionCallback] = None
         self._tick_task: Optional[asyncio.Task] = None
@@ -159,9 +188,13 @@ class PaperClient:
         """Rule 3 — whatever the account row says, re-read so an edit takes
         effect without a restart."""
         try:
-            row = (self.db.table("accounts").select("balance, allocated_balance")
+            # `balance` only, deliberately. For a real account that is the
+            # WALLET and allocated_balance is a separate allocation override the
+            # sizing code applies on top; returning the override from get_wallet
+            # would make paper mean something different by the same name.
+            row = (self.db.table("accounts").select("balance")
                    .eq("id", self.account_id).execute().data or [{}])[0]
-            return float(row.get("allocated_balance") or row.get("balance") or 0.0)
+            return float(row.get("balance") or 0.0)
         except Exception:
             return float(self.account.get("balance") or 0.0)
 

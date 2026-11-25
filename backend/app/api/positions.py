@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.database import db
 from app.models.position import PositionResponse
-from app.services.delta_client import DeltaClient
+from app.services.client_factory import ExchangeClient, client_for
 from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_account_or_404
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _REALIZED_PNL_TYPES = {"cashflow", "settlement", "commission", "funding", "pnl"}
 
 
-async def _realized_pnl_today(client: DeltaClient) -> float:
+async def _realized_pnl_today(client: ExchangeClient) -> float:
     """Sum realized PnL (and fees) booked since IST midnight from the wallet ledger."""
     now_ist = datetime.now(IST)
     start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -78,7 +78,7 @@ def _prod(o: dict) -> dict:
     }
 
 
-async def _spot_map(client: DeltaClient) -> dict:
+async def _spot_map(client: ExchangeClient) -> dict:
     """Underlying index/spot per asset (BTC, ETH) for computing option notional.
 
     Fetched from Delta's public perpetual tickers. Best-effort — on any failure
@@ -167,11 +167,7 @@ def _format_live_position(account_id: str, account_name: str, pos: dict) -> dict
 
 async def _fetch_account_positions(acc: dict) -> List[dict]:
     """Fetch live positions for a single account directly from Delta Exchange."""
-    client = DeltaClient(
-        api_key=acc["api_key"],
-        api_secret=acc["api_secret"],
-        environment=acc.get("environment", "demo"),
-    )
+    client = client_for(acc)
     try:
         live = await client.get_positions()
         out = []
@@ -326,11 +322,7 @@ async def _sync_accounts(accounts: list) -> list:
     sync_results = []
     if True:
         for acc in accounts:
-            client = DeltaClient(
-                api_key=acc["api_key"],
-                api_secret=acc["api_secret"],
-                environment=acc.get("environment", "demo")
-            )
+            client = client_for(acc)
             try:
                 # 1. Fetch and update live wallet balance for the account
                 try:
@@ -589,11 +581,7 @@ async def _fetch_account_live_view(acc: dict) -> dict:
     per-position risk — enriched with the exact raw fields the Delta-style
     tables render. Each section is best-effort so one failure doesn't blank the
     rest. One Delta client + one spot lookup shared across all sections."""
-    client = DeltaClient(
-        api_key=acc["api_key"],
-        api_secret=acc["api_secret"],
-        environment=acc.get("environment", "demo"),
-    )
+    client = client_for(acc)
     orders: list = []
     history: list = []
     fills: list = []
@@ -690,11 +678,7 @@ async def close_position(account_id: str, body: ClosePositionIn,
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required.")
 
-    client = DeltaClient(
-        api_key=acc["api_key"],
-        api_secret=acc["api_secret"],
-        environment=acc.get("environment", "demo"),
-    )
+    client = client_for(acc)
     try:
         positions = await client.get_positions()
     except Exception as e:

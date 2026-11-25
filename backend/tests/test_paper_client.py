@@ -34,7 +34,7 @@ FAILURES = []
 SYM = "C-BTC-63000-261126"
 ACC = {"id": "p-1", "name": "Paper1", "is_master": False, "status": "active",
        "owner_id": "u1", "master_id": "m-dh", "allocation_mode": "auto_ratio",
-       "balance": 5000.0, "is_paper": True}
+       "balance": 5000.0, "environment": "paper"}
 
 
 def check(name, got, want):

@@ -9,6 +9,7 @@ from app.core.trade_listener import listener_manager
 from app.core.position_monitor import position_monitor
 from app.core.auth import get_current_user, CurrentUser, scope_owned, owned_account_or_404
 from app.services.delta_client import DeltaClient
+from app.services.client_factory import client_for
 from app.core.account_cache import account_cache
 
 logger = logging.getLogger(__name__)
@@ -472,15 +473,15 @@ async def verify_credentials(body: VerifyCredentialsIn,
 
 @router.post("/{id}/test", response_model=AccountTestResult)
 async def test_account(id: str, user: CurrentUser = Depends(get_current_user)):
-    """Instantiate DeltaClient, fetch wallet balances, and update account balance in DB."""
+    """Read the account's wallet and write the balance back.
+
+    Goes through client_for, so pressing "test" on a PAPER account reports
+    its fixed balance rather than failing on credentials it does not have.
+    """
     try:
         account = owned_account_or_404(id, user)
         
-        client = DeltaClient(
-            api_key=account["api_key"],
-            api_secret=account["api_secret"],
-            environment=account.get("environment", "demo")
-        )
+        client = client_for(account)
         
         try:
             wallet_data = await client.get_wallet()

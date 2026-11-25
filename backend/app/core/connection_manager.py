@@ -1,9 +1,11 @@
 """
-ConnectionManager — manages the pool of DeltaClient instances (one per account).
+ConnectionManager — manages the pool of exchange clients (one per account).
+A client is a DeltaClient, or a PaperClient for a paper account; see
+app/services/client_factory.py.
 
 Responsible for:
 - Connecting / disconnecting accounts' WebSocket channels
-- Providing live DeltaClient handles to the rest of the system
+- Providing live client handles to the rest of the system
 - Coordinating callbacks from TradeListener and PositionMonitor
 """
 
@@ -13,7 +15,8 @@ from typing import Callable, Awaitable, Dict, Optional
 
 from app.database import db
 from app.core import order_history as oh
-from app.services.delta_client import DeltaClient
+from app.services.client_factory import ExchangeClient, client_for
+from app.services.paper_client import is_paper
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +25,10 @@ OnPositionCallback = Callable[[dict], Awaitable[None]]
 
 
 class ConnectionManager:
-    """Maintains a dict of account_id → DeltaClient."""
+    """Maintains a dict of account_id → exchange client."""
 
     def __init__(self) -> None:
-        self._clients: Dict[str, DeltaClient] = {}
+        self._clients: Dict[str, ExchangeClient] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -37,9 +40,9 @@ class ConnectionManager:
         account: dict,
         on_fill: Optional[OnFillCallback] = None,
         on_position: Optional[OnPositionCallback] = None,
-    ) -> DeltaClient:
+    ) -> ExchangeClient:
         """
-        Create a DeltaClient for *account* and start its WebSocket loop.
+        Create the client for *account* and start its WebSocket loop.
 
         *account* is a raw dict from Supabase with keys:
             id, api_key, api_secret, environment, name, ...
@@ -65,11 +68,25 @@ class ConnectionManager:
                 )
                 return self._clients[account_id]
 
-            client = DeltaClient(
-                api_key=account["api_key"],
-                api_secret=account["api_secret"],
-                environment=account.get("environment", "demo"),
-            )
+            # THE ONE BRANCH. A paper account is a follower with a name and a
+            # balance and no keys; everything downstream of this line -- the
+            # engine, the reconciler, the position monitor, the report, the
+            # alerting -- goes on talking to "a client" and cannot tell the
+            # difference. Keeping the choice here, and in exactly one other
+            # place (CopyEngine._get_master_client, which refuses outright),
+            # is what keeps paper out of the live path.
+            #
+            # `is True` on purpose, not a truthiness test. Getting this wrong
+            # in the other direction -- a REAL account handed a PaperClient --
+            # means its trades are never placed and nothing says so, which is
+            # the worst outcome this file can produce. Only the boolean true
+            # qualifies.
+            client = client_for(account, db)
+            if is_paper(account):
+                logger.warning(
+                    "Account %s (%s) is a PAPER account — no orders will reach "
+                    "any exchange.", account.get("name"), account_id,
+                )
 
             if on_fill is not None or on_position is not None:
                 try:
@@ -94,7 +111,7 @@ class ConnectionManager:
             return client
 
     async def disconnect_account(self, account_id: str) -> None:
-        """Disconnect and remove the DeltaClient for *account_id*."""
+        """Disconnect and remove the client for *account_id*."""
         async with self._lock:
             client = self._clients.pop(account_id, None)
             if client is None:
@@ -120,8 +137,8 @@ class ConnectionManager:
         )
         logger.info("All %d client(s) disconnected.", len(account_ids))
 
-    def get_client(self, account_id: str) -> Optional[DeltaClient]:
-        """Return the DeltaClient for *account_id* or None if not connected."""
+    def get_client(self, account_id: str) -> Optional[ExchangeClient]:
+        """Return the client for *account_id* or None if not connected."""
         return self._clients.get(account_id)
 
     def is_connected(self, account_id: str) -> bool:

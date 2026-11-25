@@ -6,6 +6,7 @@ import asyncio
 from typing import Dict, Any, Optional
 from app.database import db
 from app.services.delta_client import DeltaClient
+from app.services.client_factory import ExchangeClient
 from app.core.risk_engine import RiskEngine
 from app.core.slippage_tracker import slippage_tracker
 from app.websocket.socket_manager import socket_manager
@@ -84,7 +85,7 @@ class OrderExecutor:
 
     async def execute(
         self,
-        client: DeltaClient,
+        client: ExchangeClient,
         account: dict,
         trade_id: str,
         symbol: str,
