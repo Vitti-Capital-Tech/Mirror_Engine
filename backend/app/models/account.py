@@ -55,7 +55,19 @@ class AccountCreate(BaseModel):
     # Its followers straddle that price — the first at +offset, the second at
     # -offset — so they do not all trigger in the same instant. Left unset, the
     # engine keeps its built-in deterministic +/-(0..20) hash jitter.
-    tp_sl_offset: Optional[float] = Field(default=None, gt=0)
+    #
+    # NOT constrained here, on purpose. This field and master_id were each
+    # DECLARED TWICE in this class; pydantic keeps the LATER declaration, so the
+    # `gt=0` that sat on this line has never actually applied -- the field has
+    # carried no constraints at all, and a 0 or a negative was accepted. Nothing
+    # depended on it: _jitter_trigger normalises the value where it is USED
+    # (`mag = abs(float(offset))`, then `if mag > 0`), so a negative reads as its
+    # magnitude and a zero falls back to the hash jitter -- deliberately, "so a
+    # bad value can never stack a follower on the master's exact price".
+    # Deduplicated 2026-11-26 keeping the PERMISSIVE declaration: re-imposing
+    # the constraint would start rejecting a 0 that callers have been allowed to
+    # send for months, in order to guard something already guarded.
+    tp_sl_offset: Optional[float] = None
     # FOLLOWERS only: which master this one mirrors. One owner may run several
     # independent master/follower groups, so the group cannot be inferred from
     # owner_id any more — it has to be stated. Required when creating a follower
@@ -66,13 +78,6 @@ class AccountCreate(BaseModel):
     # always stamped with the ADMIN's own id, which quietly put it in a group of
     # its own with no master to mirror — a follower that could never copy
     # anything. Omitted means "mine", which is what a normal user always gets.
-    #
-    # `tp_sl_offset` and `master_id` were each DECLARED TWICE here, the second
-    # time without validation. The later declaration wins in pydantic, so the
-    # `gt=0` the comment above promises for tp_sl_offset has never actually
-    # applied and a zero or negative offset was accepted silently. Deduplicated
-    # 2026-11-26; the validated declarations above are the ones kept, which is
-    # what every comment in this class already claimed was happening.
     owner_id: Optional[str] = None
 
     @model_validator(mode="after")

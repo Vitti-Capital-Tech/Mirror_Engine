@@ -502,11 +502,13 @@ async def notify_correction(
     cause = await _recent_failure(account, symbol)
     if cause:
         lines.append(f"↳ earlier failure: <code>{cause}</code>")
-    # `account=` was missing here and nowhere else in this module, so every
-    # "Reconciler corrected" went to the MAIN chat rather than the owner's --
-    # the one alert that reports the engine having got something WRONG, routed
-    # away from the desk it happened on. It would also have slipped past the
-    # paper gate in send_message. Fixed 2026-11-26.
+    # ROUTING. `account=` was missing here and NOWHERE ELSE in this module, so
+    # every "Reconciler corrected" went to the main chat instead of the owner's
+    # -- the one alert that reports the engine having got something WRONG,
+    # routed away from the desk it happened on. Every other notify_* in this
+    # file passes it. Found 2026-11-26 while auditing the send paths. It would
+    # also have slipped past the paper gate in send_message, which keys off the
+    # same argument.
     await send_message("\n".join(lines), account=account)
 
 
