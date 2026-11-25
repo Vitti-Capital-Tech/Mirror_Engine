@@ -279,6 +279,17 @@ FOLLOWER2 = {"id": "f-dh1", "name": "Dhwani1", "is_master": False,
 RATIO2 = 5235.97 / 5243.16
 
 
+# A second follower under the SAME master — the shape Pratik's desk takes from
+# 2026-11-26. Everything else in this file has one follower per master, so this
+# was the one group arrangement nothing exercised end to end.
+SIBLING = {"id": "f-algo3b", "name": "JD algo3b", "is_master": False,
+           "status": "active", "api_key": "k5", "api_secret": "s5",
+           "environment": "demo", "owner_id": "u1", "master_id": "m-jd",
+           "allocation_mode": "auto_ratio", "balance": 3000.00,
+           "tp_sl_offset": 50}
+SIB_RATIO = 3000.00 / MASTER_BAL
+
+
 class Res:
     def __init__(self, d): self.data = d
 
@@ -299,8 +310,10 @@ class Q:
 
 
 class DB:
-    """One group by default; `two_groups` adds Dhwani's under the same owner."""
+    """One group by default; `two_groups` adds Dhwani's under the same owner,
+    `sibling` adds a SECOND follower under the first master."""
     two_groups = False
+    sibling = False
 
     def table(self, n):
         if n != "accounts":
@@ -308,6 +321,8 @@ class DB:
         rows = [MASTER, FOLLOWER]
         if DB.two_groups:
             rows = rows + [MASTER2, FOLLOWER2]
+        if DB.sibling:
+            rows = rows + [SIBLING]
         return Q(rows)
 
 
@@ -805,6 +820,156 @@ def test_the_strict_flag_is_used_where_it_matters():
           "get_positions(strict=True)" in rec, True)
 
 
+
+
+def test_one_master_two_followers():
+    """Two followers under ONE master — every path, not just sizing.
+
+    Every other scenario in this file has one follower per master. Pratik's desk
+    has two from 2026-11-26, and a one-follower assumption would hide in exactly
+    the places that key work off a follower id: the order map, the reconciler's
+    per-leg state, the cancel lookup, the edit path.
+
+    So this walks the same session as the single-follower one, with two, and
+    checks each follower against ITS OWN balance at every step. The balances are
+    deliberately far apart (7595 and 3000 against a master's 8509) so a crossed
+    number is obvious rather than a rounding argument.
+    """
+    print("\n20. one master, two followers — the whole path")
+    DB.sibling = True
+    try:
+        import math
+        from app.core.copy_engine import CopyEngine
+        from app.services import telegram_client as tg
+
+        async def quiet(*a, **k): return False
+        tg.send_message = quiet
+
+        def build2():
+            ex = Exchange()
+            cl = {a: Client(ex, a) for a in ("m-jd", "f-algo3", "f-algo3b")}
+            eng = CopyEngine(DB(), Redis(), Sock(), ConnMgr(cl))
+            eng._get_master_client = lambda row: cl["m-jd"]
+
+            async def fresh(_r):
+                return {SYM: time.time() - 30}
+            eng._master_recent_fill_ts = fresh
+
+            async def classify(_a, _b):
+                return "unknown"
+            eng._classify_master_exit = classify
+            return eng, ex, cl
+
+        def recon2(ex):
+            return {"owner_id": "u1", "master_account_id": "m-jd",
+                    "positions": [{"symbol": s_, "size": v, "mark": 40, "entry": 40}
+                                  for s_, v in ex.pos.get("m-jd", {}).items() if v]}
+
+        held_a, held_b = 715, 282          # each follower's own share of 800
+
+        # ---- a resting close, mirrored to both, each covering its own holding
+        async def mirror():
+            eng, ex, cl = build2()
+            ex.set_position("m-jd", SYM, 800)
+            ex.set_position("f-algo3", SYM, held_a)
+            ex.set_position("f-algo3b", SYM, held_b)
+            moid = ex.place("m-jd", symbol=SYM, side="sell", size=400,
+                            order_type="limit_order", limit_price=45,
+                            reduce_only=True)["id"]
+            await eng.process_order_event(
+                place_event(moid, "sell", 400, 45, reduce_only=True))
+            a = ex.resting("f-algo3", SYM)
+            b = ex.resting("f-algo3b", SYM)
+            return eng, ex, moid, a, b
+
+        eng, ex, moid, a, b = asyncio.run(mirror())
+        check("each follower got an order", (len(a), len(b)), (1, 1))
+        check("and they are different orders",
+              a and b and a[0]["id"] != b[0]["id"], True)
+        if a and b:
+            # The master is closing half his position, so each follower covers
+            # half of ITS OWN holding — not half of the other's. Ceil, matching
+            # the sizing path: 715 halved is 357.5 and a half lot still gets
+            # covered rather than dropped.
+            check("the first covers its own half",
+                  int(a[0]["size"]), math.ceil(held_a / 2))
+            check("the second covers its own half",
+                  int(b[0]["size"]), math.ceil(held_b / 2))
+            check("the two sizes differ", a[0]["size"] != b[0]["size"], True)
+
+        # ---- the master cancels: BOTH copies go
+        async def cancel():
+            ex.cancel("m-jd", moid)
+            await eng.process_order_event(
+                {"action": "cancel", "master_order_id": str(moid), "symbol": SYM,
+                 "owner_id": "u1", "master_account_id": "m-jd", "product_id": 1})
+            return len(ex.resting("f-algo3", SYM)), len(ex.resting("f-algo3b", SYM))
+
+        check("a cancel reaches both", asyncio.run(cancel()), (0, 0))
+
+        # ---- the master edits the PRICE only: both move, neither resizes
+        async def edit():
+            eng, ex, cl = build2()
+            ex.set_position("m-jd", SYM, 800)
+            ex.set_position("f-algo3", SYM, held_a)
+            ex.set_position("f-algo3b", SYM, held_b)
+            mid = ex.place("m-jd", symbol=SYM, side="sell", size=400,
+                           order_type="limit_order", limit_price=45,
+                           reduce_only=True)["id"]
+            await eng.process_order_event(
+                place_event(mid, "sell", 400, 45, reduce_only=True))
+            before = sorted(int(o["size"]) for acct in ("f-algo3", "f-algo3b")
+                            for o in ex.resting(acct, SYM))
+            await eng.process_order_event(
+                place_event(mid, "sell", 400, 47, reduce_only=True, is_update=True))
+            after = sorted(int(o["size"]) for acct in ("f-algo3", "f-algo3b")
+                           for o in ex.resting(acct, SYM))
+            prices = sorted(float(o["limit_price"]) for acct in ("f-algo3", "f-algo3b")
+                            for o in ex.resting(acct, SYM))
+            return before, after, prices
+
+        before, after, prices = asyncio.run(edit())
+        check("neither size changed on a price-only edit", after, before)
+        check("and both prices moved", prices, [47.0, 47.0])
+
+        # ---- the reconciler: one over, one under, SAME pass
+        async def sweep():
+            eng, ex, cl = build2()
+            ex.set_position("m-jd", SYM, 800)
+            ex.set_position("f-algo3", SYM, 800)     # over its target of 715
+            ex.set_position("f-algo3b", SYM, 100)    # under its target of 283
+            for _ in range(3):
+                await eng._reconcile_positions(recon2(ex))
+            return ex.position("f-algo3", SYM), ex.position("f-algo3b", SYM)
+
+        over, under = asyncio.run(sweep())
+        check("the over-exposed one was trimmed to its share", over, 715.0)
+        check("the under-exposed one was topped up to ITS share", under, 283.0)
+
+        # ---- protection: each gets a stop for its own position
+        async def protect():
+            eng, ex, cl = build2()
+            ex.set_position("m-jd", SYM, 800)
+            ex.set_position("f-algo3", SYM, held_a)
+            ex.set_position("f-algo3b", SYM, held_b)
+            await eng.process_order_event({
+                "action": "place", "master_order_id": "9300", "symbol": SYM,
+                "side": "sell", "size": 800.0, "state": "pending",
+                "order_type": "market_order", "stop_price": "64000",
+                "stop_order_type": "stop_loss_order", "product_id": 1,
+                "owner_id": "u1", "master_account_id": "m-jd"})
+            return tuple(
+                [int(o["size"]) for o in ex.resting(acct, SYM)
+                 if o.get("stop_order_type")]
+                for acct in ("f-algo3", "f-algo3b"))
+
+        sa, sb = asyncio.run(protect())
+        check("each follower got one stop", (len(sa), len(sb)), (1, 1))
+        check("sized to its own position", (sa, sb), ([held_a], [held_b]))
+    finally:
+        DB.sibling = False
+
+
 if __name__ == "__main__":
     for t in (test_the_session,
               test_the_master_unwinding_is_left_alone,
@@ -817,7 +982,8 @@ if __name__ == "__main__":
               test_the_mirror_and_the_sweep_cannot_both_act,
               test_a_leg_that_moves_mid_decision_is_resized,
               test_a_failed_position_read_is_not_an_empty_book,
-              test_the_strict_flag_is_used_where_it_matters):
+              test_the_strict_flag_is_used_where_it_matters,
+              test_one_master_two_followers):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)

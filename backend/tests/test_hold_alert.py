@@ -100,6 +100,15 @@ def install(dedupe=True):
     # it replaced made the throttle test pass twelve messages and look like a
     # missing throttle -- a test that lies about the thing it is testing.
     tg._should_send = _always_send if not dedupe else _REAL_SHOULD_SEND
+    # No Redis in tests. _should_send tries Redis first and falls back to
+    # the in-process _dedupe on any error -- but the fallback only happens
+    # after the client's connect timeout, about four seconds a call. Ten
+    # calls is forty seconds, which is most of why this file took 82s and
+    # why it blew the runner's 300s timeout on a loaded machine.
+    #
+    # Pointing _r at None skips straight to _dedupe. Same dedupe logic,
+    # same assertions, without waiting on a socket that is not there.
+    tg._r = lambda: None
 
 
 def plain(text):

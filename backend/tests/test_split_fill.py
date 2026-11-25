@@ -391,6 +391,59 @@ def test_the_listener_reports_how_much_has_filled_so_far():
     check("1, then 3000, then 3000", asyncio.run(run()), [1.0, 3000.0, 3000.0])
 
 
+
+
+# ---------------------------------------------------------------------------
+# The same scenarios, with a SECOND follower under the same master
+# ---------------------------------------------------------------------------
+
+SIBLING = dict(FOLLOWER, id="f-dh2", name="Dhwani2", balance=2000.00)
+
+
+def test_every_split_scenario_with_two_followers():
+    """Re-run the split-fill scenarios with two followers on one master.
+
+    Pratik's desk has two from 2026-11-26. Splitting is the path most likely to
+    hold a one-follower assumption, because the duplicate guard is claimed once
+    per master PIECE and the followers are served inside that claim — if the
+    claim or the per-piece bookkeeping were keyed without the follower, the
+    second one would silently miss pieces the first had already claimed.
+
+    Rather than restate the scenarios, this runs the real ones against a store
+    that has a sibling follower. Each already asserts the follower lands on its
+    own share, so a crossed or skipped piece fails them where they stand. The
+    sibling's balance is deliberately far from the first's so a crossed number
+    cannot pass as rounding.
+    """
+    print("\n20. every split scenario, with a second follower")
+    _orig_init = DB.__init__
+
+    def _with_sibling(self, *a, **k):
+        _orig_init(self, *a, **k)
+        self.store["accounts"] = [MASTER, FOLLOWER, SIBLING]
+
+    DB.__init__ = _with_sibling
+    before = len(FAILURES)
+    try:
+        for t in (test_an_entry_filled_in_two_pieces_is_copied_in_full,
+                  test_the_same_piece_delivered_twice_is_copied_once,
+                  test_pieces_arriving_out_of_order_are_not_double_counted,
+                  test_overlapping_entry_pieces_add_up_once,
+                  test_overlapping_exit_pieces_sell_their_parts_not_the_whole,
+                  test_slow_exit_pieces_each_sell_their_part,
+                  test_an_exit_piece_delivered_twice_sells_once,
+                  test_exit_pieces_out_of_order_sell_once,
+                  test_an_exit_piece_never_goes_below_the_share,
+                  test_an_exit_in_one_go_is_unchanged,
+                  test_exit_pieces_to_flat_leave_nothing,
+                  test_a_late_piece_does_not_overshoot_a_follower_already_topped_up):
+            t()
+    finally:
+        DB.__init__ = _orig_init
+    print("  " + ("PASS" if len(FAILURES) == before else "FAIL")
+          + "  every scenario holds with two followers")
+
+
 if __name__ == "__main__":
     for t in (test_an_entry_filled_in_two_pieces_is_copied_in_full,
               test_overlapping_entry_pieces_add_up_once,
@@ -404,7 +457,8 @@ if __name__ == "__main__":
               test_an_exit_piece_never_goes_below_the_share,
               test_an_exit_in_one_go_is_unchanged,
               test_exit_pieces_to_flat_leave_nothing,
-              test_the_listener_reports_how_much_has_filled_so_far):
+              test_the_listener_reports_how_much_has_filled_so_far,
+              test_every_split_scenario_with_two_followers):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)
