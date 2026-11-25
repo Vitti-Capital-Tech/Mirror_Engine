@@ -80,6 +80,15 @@ BASELINE = {
         # 3.12 only flow-tracks a function's first 64 locals, and this one has
         # more, so it is flagged though it is always bound. Not a real risk.
         "open_qty",
+        # 2026-11-26, the alert path's last look. Same 64-local cause, and every
+        # read is dominated by an unconditional assignment in the same block:
+        #   _fol_by_id  built before the escalate loop opens
+        #   _fid        the inner `for _fid, _sym in _cands:` target
+        #   _fol        assigned on the line directly above its only read
+        # `_fid` was unflagged until the new `_fol_by_id.get(_fid)` read pushed
+        # the function past the tracking limit for it; nothing about its binding
+        # changed. Audited 2026-11-26.
+        "_fid", "_fol", "_fol_by_id",
     },
 }
 
