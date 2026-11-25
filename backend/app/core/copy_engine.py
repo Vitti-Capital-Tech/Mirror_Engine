@@ -1053,6 +1053,66 @@ class CopyEngine:
             logger.warning(f"fresh position read failed for {symbol}: {e}")
             return None
 
+    async def _discrepancy_still_true(self, mkey, kind: str, fol: dict,
+                                      sym: str, target) -> bool:
+        """Is this discrepancy still true at the moment we SPEAK about it?
+
+        The correction paths all take a last look before they act: `fsz` is the
+        pass's opening read and several exchange round trips have gone by since.
+        The ALERT path did not. It spoke from the opening read, so it could
+        announce a gap that had already closed while the pass was deciding.
+
+        2026-11-25 22:55:51 IST, Dhwani1 on C-BTC-63200-261126. The master
+        bought his -3000 short back by hand in two pieces. The follower's limit
+        did not fill, so the copy fell back to market and that fill took 7.2s;
+        for those seconds the master was flat and the follower still held 473
+        lots. The sweep saw it on two passes, raised "LEG THE MASTER DOES NOT
+        HOLD -- follower 473, target 0", and the message went out at 22:55:51,
+        four seconds AFTER the fallback filled at 22:55:47.4 and the leg was
+        flat. Nothing was wrong by the time anyone read it. (The force-close in
+        the same pass was correctly blocked by the leg lock, so no double order
+        -- the only thing that escaped was the alert.)
+
+        Two questions, in order:
+
+        1. Is the live mirror holding this leg right now? That is POSITIVE
+           evidence of a copy in flight, not of a fault.
+        2. Does the exchange still show the gap? Re-read, uncached.
+
+        An unreadable book is never permission to stay quiet -- same rule the
+        correction paths use. On a failed read this returns True and the alert
+        goes out.
+        """
+        if leg_locks.is_busy(mkey, sym):
+            logger.info(
+                f"reconcile: not alerting on {fol.get('name')} {sym} ({kind}) "
+                f"— the live mirror is working this leg right now; a copy in "
+                f"flight is not a mismatch"
+            )
+            return False
+        client = await self._get_follower_client(fol)
+        if client is None:
+            return True
+        live = await self._live_signed_fresh(client, sym)
+        if live is None:
+            return True          # unreadable: say it, do not swallow it
+        now = abs(float(live))
+        tgt = abs(float(target or 0))
+        if kind == "close":
+            still = now >= 1
+        elif kind == "open":
+            still = now < 1
+        else:                    # trim / topup / hold — a size gap
+            room = max(1.0, tgt * (RECON_SIZE_TOLERANCE_PCT / 100.0))
+            still = abs(now - tgt) > room
+        if not still:
+            logger.info(
+                f"reconcile: not alerting on {fol.get('name')} {sym} ({kind}) "
+                f"— it settled while the pass was deciding (now {live:+.0f}, "
+                f"target {tgt:.0f})"
+            )
+        return still
+
     @staticmethod
     def _still_worth_acting(planned: int, live_signed, want_signed, target=None,
                             adding: bool = False):
@@ -2993,6 +3053,11 @@ class CopyEngine:
         # precisely when a human should look.
         _now = time.time()
         _live = set()
+        # Needed to RE-READ a leg before speaking about it (see
+        # _discrepancy_still_true). The follower rows are already in hand; the
+        # client behind them is cached, so this costs one position read per leg
+        # that is actually about to be announced.
+        _fol_by_id = {f.get("id"): f for f in followers}
         for _kind, _cands in (("open", current_open), ("close", current_close),
                               ("trim", {(k[0], k[1]) for k in current_trim}),
                               ("topup", set(current_topup)),
@@ -3008,6 +3073,13 @@ class CopyEngine:
                     continue
                 if _age < MISMATCH_ALERT_AFTER_SEC:
                     continue        # first sighting — may be a book mid-flight
+                # LAST LOOK BEFORE SPEAKING. Everything above is this pass's
+                # opening read; the pass has since made several exchange calls
+                # per leg. Do not announce a gap that closed while we decided.
+                _fol = _fol_by_id.get(_fid)
+                if _fol is not None and not await self._discrepancy_still_true(
+                        _mkey, _kind, _fol, _sym, _target):
+                    continue
                 self._recon_alert_names[_sk] = _name
                 try:
                     # STAGE ONE, at the second sighting: it does not match, and

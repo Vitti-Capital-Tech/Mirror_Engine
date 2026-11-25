@@ -127,3 +127,25 @@ async def hold(master_id, symbol, what: str = "", timeout: float = None):
 
 def stats() -> dict:
     return {"locks": len(_locks), "held": sum(1 for v in _locks.values() if v[0].locked())}
+
+
+def is_busy(master_id, symbol) -> bool:
+    """Is another path mid-action on this leg RIGHT NOW?
+
+    Positive evidence that a copy is IN FLIGHT, which is a different thing from
+    a discrepancy that is merely unresolved. The reconciler's alert path uses it
+    to tell the two apart: a follower that still holds a leg while the live
+    mirror is working that same leg is a book caught mid-flight, not a fault.
+
+    2026-11-25 22:55:51 IST, Dhwani1 on C-BTC-63200-261126: the master closed
+    his -3000 manually, the follower's limit did not fill and its market
+    fallback took 7.2s. For those seconds the master was flat and the follower
+    still showed 473 lots, so the sweep raised "LEG THE MASTER DOES NOT HOLD" —
+    and the message landed four seconds AFTER the fallback had filled and the
+    leg was flat.
+
+    Does not create a lock: asking must never mint registry entries for every
+    symbol anyone ever alerts about.
+    """
+    entry = _locks.get(_key(master_id, symbol))
+    return bool(entry and entry[0].locked())
