@@ -245,7 +245,21 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
     rows = []
     for m in master_orders:
         mid = m["order_id"]
-        mid_legs = {str(l.get("account_id")): l for l in legs["by_master"].get(mid, [])}
+        # ALL the legs per follower, not the last one. A master market order
+        # that fills in pieces is copied piece by piece (since 2026-11-22), so
+        # ONE master order legitimately produces SEVERAL follower orders. A dict
+        # keyed on account_id kept whichever leg came last and silently dropped
+        # the rest, which is how a correct copy came out as a 6.3x over-punch:
+        #
+        #   2026-11-25 08:30:57, C-BTC-62800-251126 — the master's 3000-lot buy
+        #   filled as 2588 + 410. The engine copied both: 2540 and 402. The
+        #   report kept one follower order (2540) and one target (402) from
+        #   DIFFERENT pieces and compared them. 2540+402 = 2942 against a target
+        #   of 2944, which is the copy that actually happened.
+        mid_pieces: dict = {}
+        for _l in legs["by_master"].get(mid, []):
+            mid_pieces.setdefault(str(_l.get("account_id")), []).append(_l)
+        mid_legs = {k: v[0] for k, v in mid_pieces.items()}
         row_legs = []
         for st in f_state:
             acc = st["account"]
@@ -280,6 +294,18 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
             # placement and is already loaded for display; only the comparison
             # was still guessing. Falls back to deriving when there is no leg on
             # record, which is itself reported as a finding.
+            # Sum the pieces when there are several: comparing one piece's
+            # order against another piece's target is the mistake above.
+            _pieces = mid_pieces.get(str(acc["id"]), [])
+            if len(_pieces) > 1:
+                _req = sum(_num(pc.get("requested_quantity")) or 0 for pc in _pieces)
+                _placed = sum(
+                    (st["by_order"].get(str(pc.get("follower_order_id"))) or {}).get("size") or 0
+                    for pc in _pieces)
+                if _req and _placed:
+                    requested = _req
+                    f = dict(f or {}, size=_placed)
+                    link = f"{link or 'linked'} ({len(_pieces)} pieces)"
             if requested:
                 target, basis = requested, "recorded at placement"
             else:
