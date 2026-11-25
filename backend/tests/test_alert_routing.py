@@ -154,13 +154,85 @@ def test_a_supergroup_migration_still_applies():
     check("Pratik's is untouched by it", chat_for(account="Dhwani"), PRATIK_CHAT)
 
 
+def test_every_notification_says_which_account_it_is_about():
+    """ROUTING IS NOT OPTIONAL, and one notification was not asking for it.
+
+    _chat_for can only find the owner's chat if it is TOLD the account, so a
+    notify_* that calls send_message without `account=` or `account_id=` lands
+    in the main chat whatever the routes say. Every one of them passed it except
+    notify_correction, which called send_message with the text alone -- so every
+    "Reconciler corrected" went to the main chat rather than to the desk it
+    happened on. That is the one alert whose whole purpose is to report the
+    engine having got something WRONG, which makes it the worst to misroute.
+
+    Checked by reading the module rather than by exercising seven functions: the
+    failure is a missing argument, so the argument is what to look for, and a
+    notify_* added later is covered without anyone remembering a new case.
+    """
+    print("\n7. every notify_* tells send_message which account it is about")
+    import inspect
+    import re
+    src = inspect.getsource(tg)
+    bare = []
+    for m in re.finditer(r"await send_message" + re.escape("("), src):
+        i, depth = m.end() - 1, 0          # walk to this call's closing paren
+        while i < len(src):
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        call = src[m.end():i]
+        if "account=" not in call and "account_id=" not in call:
+            bare.append("line %d: %s" % (src[:m.start()].count(chr(10)) + 1,
+                                         " ".join(call.split())[:60]))
+    check("no notification is sent without its account", bare, [])
+
+
+def test_the_reconciler_correction_reaches_its_owner():
+    """The specific case, end to end: the message notify_correction builds must
+    be addressed to the account it is about."""
+    print("\n8. a reconciler correction is addressed, not broadcast")
+    configure(ROUTES)
+    seen = {}
+
+    async def capture(text, account=None, account_id=None):
+        seen["account"], seen["account_id"] = account, account_id
+        return True
+
+    async def no_cause(*a, **k):
+        return None
+
+    async def always(*a, **k):
+        return True
+
+    real = (tg.send_message, tg._recent_failure, tg._should_send,
+            tg.telegram_enabled)
+    try:
+        tg.send_message, tg._recent_failure = capture, no_cause
+        tg._should_send, tg.telegram_enabled = always, (lambda: True)
+        asyncio.run(tg.notify_correction(
+            "Dhwani1", "C-BTC-63000-261126", "TRIMMED", 31,
+            held=62, target=31, master=2750, why="over-exposed"))
+    finally:
+        (tg.send_message, tg._recent_failure, tg._should_send,
+         tg.telegram_enabled) = real
+    check("it names the account", seen.get("account"), "Dhwani1")
+    check("so it routes to that owner's chat",
+          chat_for(account=seen.get("account")), PRATIK_CHAT)
+
+
 if __name__ == "__main__":
     for t in (test_each_holder_gets_their_own_chat,
               test_alerts_that_only_know_the_account_id,
               test_an_unlisted_holder_is_unaffected,
               test_nothing_is_ever_dropped,
               test_a_renamed_account_still_reaches_its_owner,
-              test_a_supergroup_migration_still_applies):
+              test_a_supergroup_migration_still_applies,
+              test_every_notification_says_which_account_it_is_about,
+              test_the_reconciler_correction_reaches_its_owner):
         t()
     print("\n" + ("ALL PASS" if not FAILURES else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
     sys.exit(1 if FAILURES else 0)

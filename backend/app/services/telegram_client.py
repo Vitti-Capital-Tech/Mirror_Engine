@@ -455,7 +455,12 @@ async def notify_correction(
     cause = await _recent_failure(account, symbol)
     if cause:
         lines.append(f"↳ earlier failure: <code>{cause}</code>")
-    await send_message("\n".join(lines))
+    # ROUTING. `account=` was missing here and NOWHERE ELSE in this module, so
+    # every "Reconciler corrected" went to the main chat instead of the owner's
+    # -- the one alert that reports the engine having got something WRONG,
+    # routed away from the desk it happened on. Every other notify_* in this
+    # file passes it. Found 2026-11-26 while auditing the send paths.
+    await send_message("\n".join(lines), account=account)
 
 
 async def notify_stuck(account: str, symbol: str, kind: str, held, target,
