@@ -264,8 +264,27 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
                 st["taken"].add(f["order_id"])
 
             requested = _num((leg or {}).get("requested_quantity"))
-            target, basis = expected_lots(m["size"], acc, st["master"])
-            basis = f"derived — {basis}"
+            # WHAT THE ENGINE ASKED FOR, when we recorded it. Deriving the
+            # target from today's balance ratio and comparing it against an
+            # order placed hours ago measures the ratio's drift, not the copy.
+            #
+            # 2026-11-25: Dhwani1 "under-punched 2942 against a target of 2944"
+            # and JD algo3 "over-punched 2998 against a target of 2996" — both
+            # off by two, in OPPOSITE directions, on the same day. Neither copy
+            # was wrong; the balances had moved since. Thirteen of fifteen
+            # findings that day were this, and the report went out with a 🚨 on
+            # two of three desks. A report that cries wolf stops being read,
+            # which costs more than the report is worth.
+            #
+            # trade_copies.requested_quantity is the engine's own number at
+            # placement and is already loaded for display; only the comparison
+            # was still guessing. Falls back to deriving when there is no leg on
+            # record, which is itself reported as a finding.
+            if requested:
+                target, basis = requested, "recorded at placement"
+            else:
+                target, basis = expected_lots(m["size"], acc, st["master"])
+                basis = f"derived — {basis}"
 
             verdict, note = _grade(m, f, target, leg, bool(st["error"]))
             ratio_actual = (f["size"] / m["size"]) if (f and m["size"]) else None
