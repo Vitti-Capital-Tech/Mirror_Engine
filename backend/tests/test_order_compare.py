@@ -163,7 +163,10 @@ def test_undersized_is_caught():
     })
     l = leg_for(out["rows"][0], "f1")
     check("verdict", l["verdict"], "undersized")
-    check("quantified", l["note"], "punched 12 against a target of 31")
+    # No engine leg on record here, so the target is DERIVED from the ratio and
+    # the note says so rather than asserting a number the engine never stated.
+    check("quantified", l["note"],
+          "punched 12 against an estimated target of ~31 (none on record)")
 
 
 def test_missing_order():
@@ -224,7 +227,11 @@ def test_master_cancelled_follower_filled():
 def test_ladder_is_not_graded_rung_by_rung():
     print("\na laddered exit: total right, so rungs are neutral not 'missing'")
     f = follower(allocation_mode="multiplier", allocation_value=0.1)
-    m = [order(str(900 + i), "C-BTC-79800", "sell", 100, T0 + timedelta(minutes=i * 30), filled=100)
+    # Rungs of one action go out in a burst — measured across a week of live
+    # data, genuine ladder rungs sit 4-10s apart. They used to be spaced 30
+    # minutes here, which no real ladder is and which a single follower order
+    # placed at T0+3s could not possibly have covered.
+    m = [order(str(900 + i), "C-BTC-79800", "sell", 100, T0 + timedelta(seconds=i * 5), filled=100)
          for i in range(3)]
     # One follower cover order for the whole 300-lot ladder: 30 = 300 x 0.1.
     fo = [order("555", "C-BTC-79800", "sell", 30, T0 + timedelta(seconds=3), filled=30)]
@@ -241,7 +248,11 @@ def test_ladder_is_not_graded_rung_by_rung():
 def test_ladder_that_is_genuinely_oversized():
     print("\na ladder punched at double still gets caught on its total")
     f = follower(allocation_mode="multiplier", allocation_value=0.1)
-    m = [order(str(900 + i), "C-BTC-79800", "sell", 100, T0 + timedelta(minutes=i * 30), filled=100)
+    # Rungs of one action go out in a burst — measured across a week of live
+    # data, genuine ladder rungs sit 4-10s apart. They used to be spaced 30
+    # minutes here, which no real ladder is and which a single follower order
+    # placed at T0+3s could not possibly have covered.
+    m = [order(str(900 + i), "C-BTC-79800", "sell", 100, T0 + timedelta(seconds=i * 5), filled=100)
          for i in range(3)]
     fo = [order("555", "C-BTC-79800", "sell", 60, T0 + timedelta(seconds=3), filled=60)]
     out = run([MASTER, f], {"m1": m, "f1": fo})

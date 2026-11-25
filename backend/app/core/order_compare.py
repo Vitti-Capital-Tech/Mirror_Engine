@@ -76,6 +76,39 @@ INFER_WINDOW_SEC = 120.0
 # sizing path ceils, so a sub-lot share rounds up by design.
 SIZE_TOLERANCE = 1.0
 
+# How far apart two master orders on the same contract and side may be and still
+# be rungs of ONE laddered action.
+#
+# A ladder is placed as a burst: the master splits one exit across rungs and they
+# go out within seconds of each other. apply_ladder_context had no window at all
+# -- it grouped by (symbol, side) across the ENTIRE DAY -- so unrelated trades
+# hours apart were treated as rungs of one action and graded as a group.
+#
+# 2026-11-25, Dhwani1: three separate C-BTC-61400 sells (10:21, 11:52 and 16:03)
+# became a "3-rung ladder ... punched 355 against a target of 490". Each one on
+# its own had punched EXACTLY what the engine asked for -- 98 of 98, 98 of 98,
+# 159 of 159 -- and the per-order verdict for all three was `matched` until this
+# pass overwrote it. Three of the seven findings on that desk were this, and
+# they are the reason the report went out with a 🚨.
+LADDER_WINDOW_SEC = 60.0
+
+# Extra slack, as a percentage of the target, when the target was DERIVED from
+# the balance ratio rather than read off the engine's own record.
+#
+# A derived target cannot be more precise than the ratio it came from, and the
+# ratio moves all day: on 2026-11-25 Dhwani1's auto_ratio ran from 0.9797 to
+# 0.9814 between the morning and the evening, which is five lots on a 3000-lot
+# master order. Comparing an order placed at 10:00 against the ratio as it stood
+# at 23:45 measures that drift and calls it a copy error -- "punched 2942 against
+# a target of 2939", three lots, reported as a fault.
+#
+# 1% is comfortably wider than a day of drift and far narrower than anything that
+# is actually wrong: the double-punch this report exists to catch (62 against a
+# target of 31, 2026-08-27) is 100% out, and a missing or doubled leg more still.
+# Legs WITH a recorded target keep the one-lot tolerance -- there is nothing to
+# estimate, so there is nothing to forgive.
+DERIVED_TOLERANCE_PCT = 1.0
+
 MISMATCH_VERDICTS = {"missing", "oversized", "undersized", "cancel_missed", "extra"}
 
 # Outcomes that are CORRECT — the engine did what it was supposed to. All three
@@ -199,13 +232,30 @@ def _infer(m: dict, candidates: list, taken: set) -> Optional[dict]:
 
 
 def _grade(m: dict, f: Optional[dict], target: Optional[float], leg: Optional[dict],
-           unreadable: bool) -> tuple:
-    """(verdict, note) for one follower against one master order."""
+           unreadable: bool, tol: float = SIZE_TOLERANCE, approx: bool = False,
+           link: str = "") -> tuple:
+    """(verdict, note) for one follower against one master order.
+
+    `tol` is how far the size may be out before it counts; `approx` says the
+    target was estimated rather than recorded, which the note must admit to.
+    """
     leg_status = (leg or {}).get("status") or ""
     reason = (leg or {}).get("failure_reason") or ""
 
     if unreadable and f is None:
         return "unreadable", "follower orders could not be read"
+
+    # The engine recorded this copy as SKIPPED, so it placed no mirror. Anything
+    # found near it in time is therefore not one, and grading the follower's size
+    # against a master order it was never meant to copy invents a finding.
+    #
+    # 2026-11-25, Dhwani1 on C-BTC-61000-261126: the master's sell was skipped
+    # (requested 0) and, separately, the manual-exit closer flattened the
+    # follower's leg. The report inferred that close as the mirror and reported
+    # "punched 298 against a target of 294". A LINKED order on a skipped leg is a
+    # different matter and is still graded — that one really would be unexplained.
+    if leg_status == "skipped" and str(link or "").startswith("inferred"):
+        f = None
 
     if f is None:
         if leg_status == "skipped":
@@ -231,12 +281,16 @@ def _grade(m: dict, f: Optional[dict], target: Optional[float], leg: Optional[di
         return "unsized", "no proportional target could be derived for this follower"
 
     placed = f["size"]
-    if placed > target + SIZE_TOLERANCE:
+    # Say "an estimated target of ~N" when that is what it is. A reader who sees
+    # a bare "target of 2939" reasonably assumes the engine asked for 2939.
+    _t = (f"an estimated target of ~{target:g} (none on record)" if approx
+          else f"a target of {target:g}")
+    if placed > target + tol:
         mult = placed / target if target else 0
-        return "oversized", (f"punched {placed:g} against a target of {target:g}"
+        return "oversized", (f"punched {placed:g} against {_t}"
                              + (f" ({mult:.1f}x)" if mult >= 1.5 else ""))
-    if placed + SIZE_TOLERANCE < target:
-        return "undersized", f"punched {placed:g} against a target of {target:g}"
+    if placed + tol < target:
+        return "undersized", f"punched {placed:g} against {_t}"
     return "matched", ""
 
 
@@ -308,11 +362,21 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
                     link = f"{link or 'linked'} ({len(_pieces)} pieces)"
             if requested:
                 target, basis = requested, "recorded at placement"
+                _tol, _approx = SIZE_TOLERANCE, False
             else:
                 target, basis = expected_lots(m["size"], acc, st["master"])
                 basis = f"derived — {basis}"
+                _approx = True
+                _tol = max(SIZE_TOLERANCE,
+                           abs(target or 0.0) * DERIVED_TOLERANCE_PCT / 100.0)
 
-            verdict, note = _grade(m, f, target, leg, bool(st["error"]))
+            verdict, note = _grade(m, f, target, leg, bool(st["error"]),
+                                   tol=_tol, approx=_approx, link=link or "")
+            if verdict == "skipped":
+                # _grade disowned the inferred order (see the skipped-leg note
+                # there). Drop it from the row too, so the report does not print
+                # an order and a link for a copy it has just said did not happen.
+                f, link = None, None
             ratio_actual = (f["size"] / m["size"]) if (f and m["size"]) else None
 
             row_legs.append({
@@ -351,6 +415,10 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
             "limit_price": m["limit_price"],
             "cancel_reason": m["cancel_reason"],
             "placed_at": _iso(m.get("created_ts")),
+            # Epoch seconds, for apply_ladder_context. `placed_at` is a display
+            # string; this is the same instant as a number, and JSON-safe.
+            "placed_ts": (m["created_ts"].timestamp()
+                          if m.get("created_ts") else None),
             "status": worst,
             "legs": row_legs,
         })
@@ -372,11 +440,29 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
     action is untouched: there the per-order verdict is the whole truth, which is
     exactly what catches a 62-against-31 double-punch.
     """
-    groups: dict = {}
+    buckets: dict = {}
     for r in rows:
-        groups.setdefault((r["symbol"], r["side"]), []).append(r)
+        buckets.setdefault((r["symbol"], r["side"]), []).append(r)
 
-    for (symbol, side), grp in groups.items():
+    # ONE ACTION, not one symbol-and-side for the whole day. Rungs of a ladder go
+    # out together; orders separated by more than LADDER_WINDOW_SEC are separate
+    # trades and must be graded separately. A row with no timestamp cannot be
+    # placed in time, so it stays with the run it arrived in rather than silently
+    # starting a new one.
+    groups: list = []
+    for (symbol, side), bucket in buckets.items():
+        bucket = sorted(bucket, key=lambda r: (r.get("placed_ts") or 0.0))
+        run = [bucket[0]]
+        for r in bucket[1:]:
+            prev, here = run[-1].get("placed_ts"), r.get("placed_ts")
+            if prev is not None and here is not None and (here - prev) > LADDER_WINDOW_SEC:
+                groups.append((symbol, side, run))
+                run = [r]
+            else:
+                run.append(r)
+        groups.append((symbol, side, run))
+
+    for symbol, side, grp in groups:
         if len(grp) < 2:
             continue                      # not a ladder — leave it alone
         master_total = sum(r["master_lots"] for r in grp)
@@ -386,7 +472,28 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
             if not legs:
                 continue
             placed_total = sum(l["placed_lots"] or 0 for l in legs)
-            target_total, _ = expected_lots(master_total, st["account"], st["master"])
+            # WHAT THE ENGINE ASKED FOR, rung by rung, when every rung has it on
+            # record. Deriving the group's target from today's balance ratio
+            # measures the ratio's drift since, exactly as the per-order
+            # comparison used to (see the note on `requested` in compare_orders)
+            # -- this pass was the last place still guessing.
+            #
+            # 2026-11-25, Dhwani1 on C-BTC-66000: "punched 5887 against a target
+            # of 5878". The two rungs recorded 2943 and 2944, which is 5887 --
+            # the engine placed precisely what it asked for, and the 9-lot
+            # "excess" was the ratio having moved during the day.
+            #
+            # Falls back to deriving when any rung lacks a recorded target, which
+            # is the genuine single-order-covers-N-rungs ladder this function was
+            # written for.
+            _recorded = [l.get("target_lots") for l in legs
+                         if str(l.get("target_basis") or "").startswith("recorded")
+                         and l.get("target_lots") is not None
+                         and l.get("placed_lots") is not None]
+            if len(_recorded) == len(legs):
+                target_total = float(sum(_recorded))
+            else:
+                target_total, _ = expected_lots(master_total, st["account"], st["master"])
             if target_total is None:
                 continue
             # Each rung may round up by just under a lot, so N rungs can carry
