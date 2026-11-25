@@ -5402,9 +5402,20 @@ class CopyEngine:
                                     f"({symbol or 'unknown symbol'}): no matching order on "
                                     f"{follower_row.get('name') or follower_id}")
                             if follower_order_id:
+                                # DELTA'S REASON, not just the status line. Every
+                                # other failure path in this engine captures
+                                # e.response.text and this one did not, so on
+                                # 2026-11-25 at 12:00 five of these could be read
+                                # down to the leg and still not explained — "400
+                                # Bad Request" and nothing more. Whether the order
+                                # was already gone or the cancel genuinely failed
+                                # are opposite answers and the body is what tells
+                                # them apart.
+                                _body = getattr(getattr(e, "response", None), "text", "") or ""
                                 logger.warning(
                                     f"{_msg} — its mapped mirror {follower_order_id} could not "
-                                    f"be cancelled either ({e})")
+                                    f"be cancelled either: {_short_reason(e, _body)}"
+                                    f"{' | ' + _body[:300] if _body else ''}")
                             else:
                                 logger.info(f"{_msg} — it never had one, nothing to cancel")
                     except Exception as e2:
