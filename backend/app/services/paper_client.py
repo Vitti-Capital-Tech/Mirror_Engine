@@ -1,0 +1,600 @@
+"""PaperClient — a stand-in for DeltaClient that trades nothing.
+
+WHAT IT IS FOR. A paper FOLLOWER mirrors a real master with no money at risk,
+so the copy path can be exercised end to end against live master flow. It is a
+testing instrument, not a simulator of the exchange's microstructure.
+
+WHY IT LOOKS LIKE THIS. The engine, the reconciler, the position monitor, the
+daily report and the alerting all talk to an account through exactly one object:
+a DeltaClient. Two places construct one (ConnectionManager.connect_account and
+CopyEngine._get_master_client). So a class with the same method surface, chosen
+at those two points, makes a paper account indistinguishable from a real one to
+everything downstream — no branches anywhere else, and nothing in the live path
+to get wrong.
+
+THE RULES IT HOLDS ITSELF TO, in order of importance:
+
+1. NEVER BLOCK. A paper follower sits in the same follower loop as the real
+   ones and under the SAME leg lock, so a slow answer here delays a real
+   follower's copy on that leg. Every call is local except the mark price, and
+   that has a hard timeout and three fallbacks. It is fake; it answers at once
+   or it answers approximately, but it never makes anyone wait.
+
+2. NEVER BE A MASTER. A fake master driving real followers would move real
+   money off invented trades. Refused here as well as in the API, because one
+   of those is a guard and two is a rule.
+
+3. BALANCE IS WHATEVER THE ROW SAYS. Fixed on purpose (desk call): a moving
+   paper balance makes the ratio drift exactly as a real account's does, and
+   then a copy bug and ratio drift look the same. Edit the number to test a
+   different ratio.
+
+WHAT IT SIMULATES, honestly stated:
+  * market orders fill in full, at once, at the mark.
+  * limit orders rest and fill when the mark reaches them — checked on a 2s
+    tick, so a fill is up to 2s late. No partial fills, no queue position, no
+    liquidity: a resting limit at a reachable price always fills in full.
+  * stop / take-profit orders rest as `pending` and become market orders when
+    the mark crosses the trigger.
+  * reduce_only is clamped to the position held and can never flip it.
+  * fees, funding and liquidation do not exist.
+
+So it answers "did the engine ask for the right thing, at the right moment, for
+the right size" — which is the whole question — and not "what would this have
+cost". Read a paper account's P&L as fiction.
+
+STATE lives in Supabase (`paper_orders`, `paper_positions`) rather than in
+memory, because the backend reloads on every deploy and a paper book that
+vanished on reload would be useless for watching a day's copying. The daily
+report reads order history over a time range, which is what `paper_orders` is
+shaped for.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Awaitable, Callable, Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+OnFillCallback = Callable[[dict], Awaitable[None]]
+OnPositionCallback = Callable[[dict], Awaitable[None]]
+
+# How often a resting limit / stop is re-checked against the mark.
+TICK_SEC = 2.0
+
+# Hard ceiling on the one remote call this class makes. Chosen well under
+# leg_locks.LIVE_ACQUIRE_TIMEOUT (30s): a paper follower must never be the
+# reason a real follower's copy is late.
+MARK_TIMEOUT_SEC = 2.0
+
+# Public, unauthenticated — a paper account has no keys, and does not need any
+# to read a price.
+_TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
+
+# One shared mark cache across every paper client: the price of a contract does
+# not depend on who is asking, and two paper followers on one master would
+# otherwise each pay their own round trip inside the same leg lock.
+_marks: dict = {}                    # symbol -> (price, fetched_at)
+_MARK_TTL = 2.0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _now_us() -> int:
+    return int(time.time() * 1_000_000)
+
+
+async def _mark(symbol: str) -> Optional[float]:
+    """The contract's mark price, or None.
+
+    None is a real answer and callers must handle it: an unreadable price is
+    never treated as a price. Cached briefly and shared across paper clients.
+    """
+    hit = _marks.get(symbol)
+    if hit and (time.time() - hit[1]) < _MARK_TTL:
+        return hit[0]
+    try:
+        async with httpx.AsyncClient(timeout=MARK_TIMEOUT_SEC) as c:
+            r = await c.get(_TICKER_URL.format(symbol=symbol))
+        if r.status_code != 200:
+            return hit[0] if hit else None
+        res = (r.json() or {}).get("result") or {}
+        px = res.get("mark_price") or res.get("close") or res.get("spot_price")
+        px = float(px) if px is not None else None
+        if px:
+            _marks[symbol] = (px, time.time())
+            return px
+    except Exception as e:
+        logger.debug("paper: mark read failed for %s: %s", symbol, e)
+    # Stale is better than nothing, and nothing is better than a guess.
+    return hit[0] if hit else None
+
+
+class PaperClient:
+    """A DeltaClient-shaped object backed by two Supabase tables."""
+
+    def __init__(self, account: dict, db) -> None:
+        if account.get("is_master"):
+            # Rule 2. Belt and braces with the API's own refusal.
+            raise ValueError(
+                f"{account.get('name')} is a paper account and cannot be a master — "
+                f"a fake master would drive real followers off invented trades"
+            )
+        self.account = dict(account)
+        self.account_id = str(account["id"])
+        self.name = account.get("name") or "paper"
+        self.db = db
+        self.environment = "paper"
+        self._on_fill: Optional[OnFillCallback] = None
+        self._on_position: Optional[OnPositionCallback] = None
+        self._tick_task: Optional[asyncio.Task] = None
+        self._running = False
+        # Paper order ids must not collide with Delta's global order-id sequence,
+        # or the ledger and the report would pair a paper order with a real one.
+        # Delta's are ~1.7e9 and climbing; these start far above and are only ever
+        # compared with each other.
+        self._next_id = 9_000_000_000 + (uuid.uuid4().int % 1_000_000) * 1000
+
+    # ------------------------------------------------------------------ util
+
+    def _oid(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    def _orders(self):
+        return self.db.table("paper_orders")
+
+    def _positions(self):
+        return self.db.table("paper_positions")
+
+    def _balance(self) -> float:
+        """Rule 3 — whatever the account row says, re-read so an edit takes
+        effect without a restart."""
+        try:
+            row = (self.db.table("accounts").select("balance, allocated_balance")
+                   .eq("id", self.account_id).execute().data or [{}])[0]
+            return float(row.get("allocated_balance") or row.get("balance") or 0.0)
+        except Exception:
+            return float(self.account.get("balance") or 0.0)
+
+    async def _emit_order(self, order: dict) -> None:
+        if self._on_fill:
+            try:
+                await self._on_fill(dict(order))
+            except Exception as e:
+                logger.warning("paper: on_fill raised for %s: %s", self.name, e)
+
+    async def _emit_position(self, symbol: str, size: float, entry: float) -> None:
+        if self._on_position:
+            try:
+                await self._on_position({
+                    "type": "positions",
+                    "action": "delete" if size == 0 else "update",
+                    "symbol": symbol,
+                    "product_symbol": symbol,
+                    "size": size,
+                    "entry_price": str(entry),
+                    "realized_pnl": "0",
+                    "margin": "0",
+                    "timestamp": _now_us(),
+                    "reason": None,
+                })
+            except Exception as e:
+                logger.warning("paper: on_position raised for %s: %s", self.name, e)
+
+    # ------------------------------------------------------------- positions
+
+    def _held(self, symbol: str) -> tuple:
+        """(signed size, entry price) for one symbol."""
+        try:
+            rows = (self._positions().select("*")
+                    .eq("account_id", self.account_id)
+                    .eq("symbol", symbol).execute().data) or []
+        except Exception as e:
+            logger.warning("paper: position read failed for %s %s: %s",
+                           self.name, symbol, e)
+            return 0.0, 0.0
+        if not rows:
+            return 0.0, 0.0
+        r = rows[0]
+        return float(r.get("size") or 0.0), float(r.get("entry_price") or 0.0)
+
+    def _apply_fill(self, symbol: str, signed_qty: float, price: float) -> tuple:
+        """Move the position by signed_qty and return the new (size, entry).
+
+        Weighted-average entry while adding; entry untouched while reducing;
+        a flip takes the new price. Same arithmetic a venue uses, and the only
+        arithmetic the sizing code reads back."""
+        held, entry = self._held(symbol)
+        new = held + signed_qty
+        opening = held == 0
+        opposite = (held > 0) != (signed_qty > 0)
+        if opening or (opposite and abs(signed_qty) > abs(held)):
+            new_entry = price                       # opened, or flipped through zero
+        elif not opposite:
+            total = abs(held) + abs(signed_qty)
+            new_entry = ((abs(held) * entry + abs(signed_qty) * price) / total) if total else price
+        else:
+            new_entry = entry                       # reducing: entry does not move
+        if abs(new) < 1e-9:
+            new, new_entry = 0.0, 0.0
+        try:
+            self._positions().upsert({
+                "account_id": self.account_id,
+                "symbol": symbol,
+                "size": new,
+                "entry_price": new_entry,
+                "updated_at": _now_iso(),
+            }, on_conflict="account_id,symbol").execute()
+        except Exception as e:
+            logger.error("paper: could not write position for %s %s: %s",
+                         self.name, symbol, e)
+        return new, new_entry
+
+    async def get_positions(self, strict: bool = False) -> list:
+        try:
+            rows = (self._positions().select("*")
+                    .eq("account_id", self.account_id).execute().data) or []
+        except Exception as e:
+            logger.warning("paper: positions read failed for %s: %s", self.name, e)
+            if strict:
+                raise
+            return []
+        return [{
+            "product_symbol": r.get("symbol"),
+            "symbol": r.get("symbol"),
+            "size": float(r.get("size") or 0.0),
+            "entry_price": str(r.get("entry_price") or 0),
+            "realized_pnl": "0",
+            "margin": "0",
+        } for r in rows if float(r.get("size") or 0.0) != 0.0]
+
+    # ---------------------------------------------------------------- orders
+
+    def _row(self, o: dict) -> dict:
+        """A stored paper order in the shape Delta returns one."""
+        return {
+            "id": int(o["order_id"]),
+            "product_symbol": o.get("symbol"),
+            "product_id": 0,
+            "side": o.get("side"),
+            "size": float(o.get("size") or 0),
+            "unfilled_size": float(o.get("unfilled_size") or 0),
+            "state": o.get("state"),
+            "reason": o.get("reason"),
+            "order_type": o.get("order_type"),
+            "limit_price": o.get("limit_price"),
+            "stop_price": o.get("stop_price"),
+            "stop_order_type": o.get("stop_order_type"),
+            "stop_trigger_method": o.get("stop_trigger_method"),
+            "reduce_only": bool(o.get("reduce_only")),
+            "average_fill_price": o.get("average_fill_price"),
+            "client_order_id": o.get("client_order_id"),
+            "cancellation_reason": o.get("cancellation_reason"),
+            "created_at": o.get("created_at"),
+            "updated_at": o.get("updated_at"),
+        }
+
+    def _fetch(self, order_id) -> Optional[dict]:
+        try:
+            rows = (self._orders().select("*")
+                    .eq("account_id", self.account_id)
+                    .eq("order_id", str(order_id)).execute().data) or []
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.warning("paper: order read failed for %s: %s", order_id, e)
+            return None
+
+    def _save(self, o: dict) -> None:
+        try:
+            self._orders().upsert(o, on_conflict="account_id,order_id").execute()
+        except Exception as e:
+            logger.error("paper: could not write order %s for %s: %s",
+                         o.get("order_id"), self.name, e)
+
+    async def _fill(self, o: dict, price: float) -> dict:
+        """Fill the whole of a resting or market order at `price`."""
+        qty = float(o.get("unfilled_size") or o.get("size") or 0)
+        if qty <= 0:
+            return o
+        signed = qty if o.get("side") == "buy" else -qty
+        o = dict(o, unfilled_size=0.0, state="closed", reason="fill",
+                 average_fill_price=str(price), updated_at=_now_iso())
+        self._save(o)
+        size, entry = self._apply_fill(o["symbol"], signed, price)
+        logger.info("paper: %s %s %s %g on %s filled at %g (now %+g)",
+                    self.name, o.get("order_type"), o.get("side"), qty,
+                    o.get("symbol"), price, size)
+        await self._emit_order(self._row(o))
+        await self._emit_position(o["symbol"], size, entry)
+        return o
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        size: int,
+        order_type: str = "market_order",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = False,
+        stop_price: Optional[float] = None,
+        stop_order_type: Optional[str] = None,
+        stop_trigger_method: Optional[str] = None,
+        time_in_force: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
+        qty = abs(float(size or 0))
+        held, _ = self._held(symbol)
+        if reduce_only:
+            # Clamp, never flip — the same contract Delta's reduce_only gives.
+            room = abs(held) if ((held > 0) == (side == "sell")) else 0.0
+            qty = min(qty, room)
+        oid = self._oid()
+        o = {
+            "account_id": self.account_id,
+            "order_id": str(oid),
+            "symbol": symbol,
+            "side": side,
+            "size": qty,
+            "unfilled_size": qty,
+            "order_type": order_type,
+            "limit_price": str(limit_price) if limit_price is not None else None,
+            "stop_price": str(stop_price) if stop_price is not None else None,
+            "stop_order_type": stop_order_type,
+            "stop_trigger_method": stop_trigger_method,
+            "reduce_only": bool(reduce_only),
+            "client_order_id": (str(client_order_id)[:32] if client_order_id else None),
+            "state": "open",
+            "reason": None,
+            "average_fill_price": None,
+            "cancellation_reason": None,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        if qty <= 0:
+            # A reduce_only with nothing to reduce. Recorded and reported as a
+            # no-op rather than raised: the caller asked for something harmless
+            # and an exception here would read as a copy failure.
+            o.update(state="cancelled", reason="noop",
+                     cancellation_reason="reduce_only: nothing to reduce")
+            self._save(o)
+            return {"result": self._row(o), **self._row(o)}
+
+        if stop_price is not None:
+            o["state"] = "pending"                  # waits for its trigger
+            self._save(o)
+            return {"result": self._row(o), **self._row(o)}
+
+        px = await _mark(symbol)
+        if order_type == "market_order":
+            if px is None:
+                px = float(limit_price) if limit_price else None
+            if px is None:
+                # No price anywhere. Refuse rather than invent one — a fill at a
+                # made-up price would corrupt every number downstream.
+                o.update(state="cancelled", reason="no_price",
+                         cancellation_reason="paper: no mark price available")
+                self._save(o)
+                logger.warning("paper: %s could not price %s — order not filled",
+                               self.name, symbol)
+                return {"result": self._row(o), **self._row(o)}
+            self._save(o)
+            o = await self._fill(o, px)
+            return {"result": self._row(o), **self._row(o)}
+
+        # A limit order rests, and the tick fills it when the mark reaches it.
+        self._save(o)
+        if px is not None and limit_price is not None and self._crossed(side, px, float(limit_price)):
+            o = await self._fill(o, float(limit_price))
+        return {"result": self._row(o), **self._row(o)}
+
+    @staticmethod
+    def _crossed(side: str, mark: float, level: float) -> bool:
+        """Has the mark reached a buy-below / sell-above level?"""
+        return mark <= level if side == "buy" else mark >= level
+
+    async def cancel_order(self, order_id: str, product_id: Optional[int] = None) -> dict:
+        o = self._fetch(order_id)
+        if not o:
+            raise RuntimeError(f"paper: no such order {order_id}")
+        if o.get("state") in ("closed", "cancelled"):
+            return {"result": self._row(o), **self._row(o)}
+        o = dict(o, state="cancelled", reason="cancel",
+                 cancellation_reason="cancelled_by_user", updated_at=_now_iso())
+        self._save(o)
+        await self._emit_order(self._row(o))
+        return {"result": self._row(o), **self._row(o)}
+
+    async def edit_order(self, order_id: str, product_id: Optional[int] = None,
+                         limit_price: Optional[float] = None,
+                         size: Optional[int] = None, **_kw) -> dict:
+        o = self._fetch(order_id)
+        if not o:
+            raise RuntimeError(f"paper: no such order {order_id}")
+        if o.get("state") not in ("open", "pending"):
+            raise RuntimeError(f"paper: order {order_id} is {o.get('state')}, not editable")
+        upd = dict(o, updated_at=_now_iso())
+        if limit_price is not None:
+            upd["limit_price"] = str(limit_price)
+        if size is not None:
+            # Match the venue: resizing resets what is left to fill.
+            upd["size"] = abs(float(size))
+            upd["unfilled_size"] = abs(float(size))
+        self._save(upd)
+        await self._emit_order(self._row(upd))
+        return {"result": self._row(upd), **self._row(upd)}
+
+    async def place_bracket(self, symbol: str, product_id: Optional[int] = None,
+                            stop_loss_price: Optional[float] = None,
+                            take_profit_price: Optional[float] = None,
+                            size: Optional[int] = None,
+                            stop_trigger_method: Optional[str] = None,
+                            **_kw) -> dict:
+        """Attach SL/TP to the held position, as two pending reduce-only stops."""
+        held, _ = self._held(symbol)
+        qty = abs(float(size if size is not None else held))
+        if qty <= 0:
+            return {"result": [], "success": True}
+        side = "sell" if held > 0 else "buy"
+        out = []
+        for px, kind in ((stop_loss_price, "stop_loss_order"),
+                         (take_profit_price, "take_profit_order")):
+            if px is None:
+                continue
+            r = await self.place_order(
+                symbol=symbol, side=side, size=int(qty), order_type="market_order",
+                reduce_only=True, stop_price=float(px), stop_order_type=kind,
+                stop_trigger_method=stop_trigger_method)
+            out.append(r.get("result") or r)
+        return {"result": out, "success": True}
+
+    async def edit_bracket_order(self, *a, **k) -> dict:
+        return {"result": [], "success": True}
+
+    async def get_order(self, order_id: str) -> dict:
+        o = self._fetch(order_id)
+        if not o:
+            raise RuntimeError(f"paper: no such order {order_id}")
+        return {"result": self._row(o), **self._row(o)}
+
+    async def get_open_orders(self, state: str = "open") -> list:
+        try:
+            rows = (self._orders().select("*")
+                    .eq("account_id", self.account_id)
+                    .eq("state", state).execute().data) or []
+        except Exception as e:
+            logger.warning("paper: open-order read failed for %s: %s", self.name, e)
+            return []
+        return [self._row(r) for r in rows]
+
+    def _history(self, limit: int = 50) -> list:
+        try:
+            rows = (self._orders().select("*")
+                    .eq("account_id", self.account_id)
+                    .order("created_at", desc=True)
+                    .limit(limit).execute().data) or []
+        except Exception as e:
+            logger.warning("paper: history read failed for %s: %s", self.name, e)
+            return []
+        return [self._row(r) for r in rows]
+
+    async def get_order_history(self, page_size: int = 50) -> list:
+        return self._history(page_size)
+
+    async def get_order_history_range(self, start_time_us: int, end_time_us: int,
+                                      page_size: int = 200, **_kw) -> list:
+        lo = datetime.fromtimestamp(start_time_us / 1_000_000, timezone.utc).isoformat()
+        hi = datetime.fromtimestamp(end_time_us / 1_000_000, timezone.utc).isoformat()
+        try:
+            rows = (self._orders().select("*")
+                    .eq("account_id", self.account_id)
+                    .gte("created_at", lo).lte("created_at", hi)
+                    .order("created_at").limit(page_size).execute().data) or []
+        except Exception as e:
+            logger.warning("paper: history range read failed for %s: %s", self.name, e)
+            return []
+        return [self._row(r) for r in rows]
+
+    async def get_fills(self, page_size: int = 50) -> list:
+        return [o for o in self._history(page_size) if o.get("reason") == "fill"]
+
+    async def get_fills_range(self, start_time_us: int, end_time_us: int,
+                              page_size: int = 200, **_kw) -> list:
+        rows = await self.get_order_history_range(start_time_us, end_time_us, page_size)
+        return [o for o in rows if o.get("reason") == "fill"]
+
+    # ----------------------------------------------------------------- money
+
+    async def get_wallet(self) -> dict:
+        bal = self._balance()
+        return {"result": [{
+            "asset_symbol": "USD",
+            "balance": str(bal),
+            "available_balance": str(bal),
+        }]}
+
+    async def get_wallet_transactions(self, start_time_us: Optional[int] = None,
+                                      page_size: int = 200) -> list:
+        return []
+
+    async def get_ticker(self, symbol: str) -> dict:
+        px = await _mark(symbol)
+        return {"result": {"mark_price": px, "close": px, "symbol": symbol}}
+
+    # -------------------------------------------------------- "websocket"
+
+    async def connect_websocket(self, on_fill_callback: OnFillCallback,
+                                on_position_callback: OnPositionCallback) -> None:
+        """No socket. Register the callbacks and start the fill tick.
+
+        The engine is event driven — it waits for a fill callback — so a paper
+        account that only answered REST reads would leave every copy hanging.
+        This is the piece that makes it behave like an account rather than a
+        record."""
+        self._on_fill = on_fill_callback
+        self._on_position = on_position_callback
+        if self._tick_task is None or self._tick_task.done():
+            self._running = True
+            self._tick_task = asyncio.create_task(self._tick_loop())
+        logger.info("paper: %s is live (no socket; %.0fs fill tick)", self.name, TICK_SEC)
+
+    async def _tick_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(TICK_SEC)
+                await self._sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # A paper tick must never take the process down.
+                logger.warning("paper: tick failed for %s: %s", self.name, e)
+
+    async def _sweep(self) -> None:
+        """Fill any resting limit the mark has reached, and trigger any stop."""
+        resting = []
+        for st in ("open", "pending"):
+            resting.extend(await self.get_open_orders(st))
+        for o in resting:
+            row = self._fetch(o["id"])
+            if not row or row.get("state") not in ("open", "pending"):
+                continue
+            px = await _mark(row["symbol"])
+            if px is None:
+                continue
+            if row.get("stop_price") is not None:
+                # A stop triggers when price moves THROUGH it, which is the
+                # opposite sense to a limit: a sell stop fires below, a buy stop
+                # above. Then it becomes a market order.
+                level = float(row["stop_price"])
+                fired = px <= level if row["side"] == "sell" else px >= level
+                if fired:
+                    await self._fill(row, px)
+                continue
+            if row.get("limit_price") is not None and self._crossed(
+                    row["side"], px, float(row["limit_price"])):
+                await self._fill(row, float(row["limit_price"]))
+
+    async def disconnect_websocket(self) -> None:
+        self._running = False
+        if self._tick_task is not None:
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._tick_task = None
+
+    async def close(self) -> None:
+        await self.disconnect_websocket()
+
+    @property
+    def ws_connected(self) -> bool:
+        return bool(self._running)
