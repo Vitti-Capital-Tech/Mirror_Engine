@@ -602,157 +602,240 @@ class CopyEngine:
         )
 
         tasks = []
+        # Which follower each task belongs to, so a task that raises can
+        # still be reported against the right account below.
+        task_for: list = []
         for follower in followers:
-            # Inject master balance context
-            follower["master_balance"] = master_balance
+            # ONE FOLLOWER, ONE FATE. This loop sizes and decides for each
+            # follower in turn and had no guard of its own: a single follower
+            # raising anywhere in these ~145 lines abandoned the loop, so every
+            # follower AFTER it was never even considered for this master fill.
+            # Not a crash -- main.py logs it -- but that trade reaches some
+            # followers and not others, nothing alerts, and the only trace is a
+            # "missing" leg in the next day's report.
+            #
+            # It never showed while a master had one follower. Pratik's desk has
+            # had two since 2026-11-26, and DB row order is not guaranteed, so
+            # either one can be the one that is skipped.
+            #
+            # This is the same isolation the reconcile sweep was given on
+            # 2026-11-20 after its close/trim pass aborted a whole master's
+            # pass; the live mirror never got it.
+            try:
+                # Inject master balance context
+                follower["master_balance"] = master_balance
 
-            client = self.connection_manager.get_client(follower["id"])
-            if not client:
-                try:
-                    client = await self.connection_manager.connect_account(follower)
-                except Exception as e:
-                    logger.error(f"Failed to connect client for follower {follower['name']}: {e}")
-                    self.db.table("trade_copies").insert({
-                        "trade_id": trade_uuid,
-                        "account_id": follower["id"],
-                        "status": "failed",
-                        "quantity": 0,
-                        "failure_reason": f"Connection error: {e}",
-                        "owner_id": follower.get("owner_id"),
-                    }).execute()
-                    await ledger.record_follower_leg(
-                        self.redis, master_trade_id, follower["id"],
-                        status="failed", reason=f"connection error: {e}",
-                    )
+                client = self.connection_manager.get_client(follower["id"])
+                if not client:
+                    try:
+                        client = await self.connection_manager.connect_account(follower)
+                    except Exception as e:
+                        logger.error(f"Failed to connect client for follower {follower['name']}: {e}")
+                        self.db.table("trade_copies").insert({
+                            "trade_id": trade_uuid,
+                            "account_id": follower["id"],
+                            "status": "failed",
+                            "quantity": 0,
+                            "failure_reason": f"Connection error: {e}",
+                            "owner_id": follower.get("owner_id"),
+                        }).execute()
+                        await ledger.record_follower_leg(
+                            self.redis, master_trade_id, follower["id"],
+                            status="failed", reason=f"connection error: {e}",
+                        )
+                        continue
+                if not client:
                     continue
-            if not client:
-                continue
 
-            if is_exit:
-                if master_remaining is None:
-                    # Couldn't read the master's remaining size — fall back to a
-                    # proportional close rather than skipping the exit entirely.
-                    follower_qty = self.risk_engine.calculate_follower_quantity(fill_qty, entry_price, follower, round_up=True)
-                elif exit_in_pieces:
-                    # This piece's share (floor: pieces never add up to more
-                    # than the share of the whole), never past the follower's
-                    # share of what the master still holds.
-                    piece = (
-                        self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=False, min_one=False)
-                        - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=False, min_one=False)
-                    )
-                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
-                    current = await self._position_size(client, symbol)
-                    room = int(current) - int(target)
-                    # The master is flat and this is the order's last piece:
-                    # close what is left, so rounding cannot strand a lot.
-                    follower_qty = room if (int(target) == 0 and last_piece) else min(int(piece), room)
-                    if follower_qty < 1:
+                if is_exit:
+                    if master_remaining is None:
+                        # Couldn't read the master's remaining size — fall back to a
+                        # proportional close rather than skipping the exit entirely.
+                        follower_qty = self.risk_engine.calculate_follower_quantity(fill_qty, entry_price, follower, round_up=True)
+                    elif exit_in_pieces:
+                        # This piece's share (floor: pieces never add up to more
+                        # than the share of the whole), never past the follower's
+                        # share of what the master still holds.
+                        piece = (
+                            self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=False, min_one=False)
+                            - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=False, min_one=False)
+                        )
+                        target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
+                        current = await self._position_size(client, symbol)
+                        room = int(current) - int(target)
+                        # The master is flat and this is the order's last piece:
+                        # close what is left, so rounding cannot strand a lot.
+                        follower_qty = room if (int(target) == 0 and last_piece) else min(int(piece), room)
+                        if follower_qty < 1:
+                            logger.info(
+                                f"Exit piece {copied_before:g} -> {quantity:g} of {master_trade_id}: "
+                                f"nothing for {follower['name']} on {symbol} (holds {current:.0f}, "
+                                f"target {int(target)}, piece share {int(piece)})"
+                            )
+                            skip_reason = f"already at its share {int(target)} (holds {current:.0f})"
+                            await ledger.record_follower_leg(
+                                self.redis, master_trade_id, follower["id"], status="skipped",
+                                reason=skip_reason,
+                            )
+                            self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
+                            continue
                         logger.info(
                             f"Exit piece {copied_before:g} -> {quantity:g} of {master_trade_id}: "
-                            f"nothing for {follower['name']} on {symbol} (holds {current:.0f}, "
-                            f"target {int(target)}, piece share {int(piece)})"
+                            f"{follower['name']} sells {follower_qty} on {symbol} (piece share "
+                            f"{int(piece)}, holds {current:.0f}, target {int(target)})"
                         )
-                        skip_reason = f"already at its share {int(target)} (holds {current:.0f})"
-                        await ledger.record_follower_leg(
-                            self.redis, master_trade_id, follower["id"], status="skipped",
-                            reason=skip_reason,
-                        )
-                        self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
-                        continue
-                    logger.info(
-                        f"Exit piece {copied_before:g} -> {quantity:g} of {master_trade_id}: "
-                        f"{follower['name']} sells {follower_qty} on {symbol} (piece share "
-                        f"{int(piece)}, holds {current:.0f}, target {int(target)})"
-                    )
+                    else:
+                        # round_up=True (min_one=False): one definition of the follower's
+                        # target across every path — live close, mirrored close,
+                        # escalation, reconciler trim/top-up and the post-cancel settle.
+                        # Mixing ceil and floor made two of them close a lot each off the
+                        # same 1-lot difference.
+                        target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
+                        current = await self._position_size(client, symbol)
+                        follower_qty = int(current) - int(target)
+                        if follower_qty < _size_deadband(target):
+                            logger.info(
+                                f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
+                                f"target {int(target)} (master left {master_remaining:.0f})"
+                            )
+                            skip_reason = f"already at target {int(target)} (holds {current:.0f})"
+                            await ledger.record_follower_leg(
+                                self.redis, master_trade_id, follower["id"], status="skipped",
+                                reason=skip_reason,
+                            )
+                            self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
+                            continue
                 else:
-                    # round_up=True (min_one=False): one definition of the follower's
-                    # target across every path — live close, mirrored close,
-                    # escalation, reconciler trim/top-up and the post-cancel settle.
-                    # Mixing ceil and floor made two of them close a lot each off the
-                    # same 1-lot difference.
-                    target = self.risk_engine.calculate_follower_quantity(master_remaining, entry_price, follower, round_up=True, min_one=False)
-                    current = await self._position_size(client, symbol)
-                    follower_qty = int(current) - int(target)
-                    if follower_qty < _size_deadband(target):
+                    # Only open if the master genuinely holds a same-side position.
+                    # If the master is flat/opposite, this "entry" was really a close
+                    # that wasn't flagged reduce_only — don't open on the follower.
+                    same_side = master_signed_now is not None and (
+                        (side.lower() == "buy" and master_signed_now > 0)
+                        or (side.lower() == "sell" and master_signed_now < 0)
+                    )
+                    if master_signed_now is not None and not same_side:
                         logger.info(
-                            f"No close needed for {follower['name']} on {symbol}: holds {current:.0f}, "
-                            f"target {int(target)} (master left {master_remaining:.0f})"
+                            f"Skipping follower OPEN for {follower['name']} {symbol} {side}: "
+                            f"master holds {master_signed_now:+.0f} — not a genuine open (likely an unflagged close)."
                         )
-                        skip_reason = f"already at target {int(target)} (holds {current:.0f})"
-                        await ledger.record_follower_leg(
-                            self.redis, master_trade_id, follower["id"], status="skipped",
-                            reason=skip_reason,
-                        )
-                        self._record_skipped_copy(trade_uuid, follower, skip_reason, requested=int(target))
-                        continue
-            else:
-                # Only open if the master genuinely holds a same-side position.
-                # If the master is flat/opposite, this "entry" was really a close
-                # that wasn't flagged reduce_only — don't open on the follower.
-                same_side = master_signed_now is not None and (
-                    (side.lower() == "buy" and master_signed_now > 0)
-                    or (side.lower() == "sell" and master_signed_now < 0)
-                )
-                if master_signed_now is not None and not same_side:
-                    logger.info(
-                        f"Skipping follower OPEN for {follower['name']} {symbol} {side}: "
-                        f"master holds {master_signed_now:+.0f} — not a genuine open (likely an unflagged close)."
-                    )
-                    skip_reason = f"not a genuine open (master holds {master_signed_now:+.0f})"
-                    await ledger.record_follower_leg(
-                        self.redis, master_trade_id, follower["id"], status="skipped",
-                        reason=skip_reason,
-                    )
-                    self._record_skipped_copy(trade_uuid, follower, skip_reason)
-                    continue
-                if not copied_before:
-                    follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
-                else:
-                    # A further piece of an order already partly copied. Copy
-                    # the growth in the follower's share of the ORDER (so 1 +
-                    # 2999 lands on exactly the share of 3000, not one lot over
-                    # from rounding each piece up), and never past its share of
-                    # the master's live POSITION — if the reconciler topped the
-                    # follower up before this piece was processed, sending the
-                    # piece as well would double it.
-                    follower_qty = (
-                        self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
-                        - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=True)
-                    )
-                    if master_signed_now is not None:
-                        target = self.risk_engine.calculate_follower_quantity(
-                            abs(master_signed_now), entry_price, follower, round_up=True, min_one=False)
-                        held = await self._position_size(client, symbol)
-                        follower_qty = min(follower_qty, int(target) - int(held))
-                    if follower_qty <= 0:
-                        logger.info(
-                            f"Further fill of {master_trade_id} on {symbol}: {follower['name']} "
-                            f"already holds its share — nothing to add"
-                        )
-                        skip_reason = "already at its share of the master's position"
+                        skip_reason = f"not a genuine open (master holds {master_signed_now:+.0f})"
                         await ledger.record_follower_leg(
                             self.redis, master_trade_id, follower["id"], status="skipped",
                             reason=skip_reason,
                         )
                         self._record_skipped_copy(trade_uuid, follower, skip_reason)
                         continue
+                    if not copied_before:
+                        follower_qty = self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                    else:
+                        # A further piece of an order already partly copied. Copy
+                        # the growth in the follower's share of the ORDER (so 1 +
+                        # 2999 lands on exactly the share of 3000, not one lot over
+                        # from rounding each piece up), and never past its share of
+                        # the master's live POSITION — if the reconciler topped the
+                        # follower up before this piece was processed, sending the
+                        # piece as well would double it.
+                        follower_qty = (
+                            self.risk_engine.calculate_follower_quantity(quantity, entry_price, follower, round_up=True)
+                            - self.risk_engine.calculate_follower_quantity(copied_before, entry_price, follower, round_up=True)
+                        )
+                        if master_signed_now is not None:
+                            target = self.risk_engine.calculate_follower_quantity(
+                                abs(master_signed_now), entry_price, follower, round_up=True, min_one=False)
+                            held = await self._position_size(client, symbol)
+                            follower_qty = min(follower_qty, int(target) - int(held))
+                        if follower_qty <= 0:
+                            logger.info(
+                                f"Further fill of {master_trade_id} on {symbol}: {follower['name']} "
+                                f"already holds its share — nothing to add"
+                            )
+                            skip_reason = "already at its share of the master's position"
+                            await ledger.record_follower_leg(
+                                self.redis, master_trade_id, follower["id"], status="skipped",
+                                reason=skip_reason,
+                            )
+                            self._record_skipped_copy(trade_uuid, follower, skip_reason)
+                            continue
 
-            tasks.append(order_executor.execute(
-                client=client,
-                account=follower,
-                trade_id=trade_uuid,
-                symbol=symbol,
-                side=side,
-                quantity=follower_qty,
-                master_price=entry_price,
-                trade_type=trade_type
-            ))
+                tasks.append(order_executor.execute(
+                    client=client,
+                    account=follower,
+                    trade_id=trade_uuid,
+                    symbol=symbol,
+                    side=side,
+                    quantity=follower_qty,
+                    master_price=entry_price,
+                    trade_type=trade_type
+                ))
+                task_for.append(follower)
+            except Exception as _copy_err:
+                # Say so, and record the leg as failed, so the reconciler picks
+                # it up as a missing leg rather than the copy vanishing silently.
+                logger.exception(
+                    f"copy: sizing/dispatch failed for {follower.get('name')} on "
+                    f"{symbol}: {_copy_err}"
+                )
+                try:
+                    self.db.table("trade_copies").insert({
+                        "trade_id": trade_uuid,
+                        "account_id": follower.get("id"),
+                        "status": "failed",
+                        "quantity": 0,
+                        "failure_reason": f"copy crashed: {type(_copy_err).__name__}: {_copy_err}",
+                        "owner_id": follower.get("owner_id"),
+                    }).execute()
+                except Exception:
+                    pass
+                try:
+                    await ledger.record_follower_leg(
+                        self.redis, master_trade_id, follower.get("id"),
+                        status="failed",
+                        reason=f"copy crashed: {type(_copy_err).__name__}: {_copy_err}",
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(tg.notify_fail(
+                    follower.get("name"), symbol, side, None,
+                    f"the copy itself crashed ({type(_copy_err).__name__}: "
+                    f"{_copy_err}) — this follower did NOT get this trade",
+                    key=f"copyerr:{follower.get('id')}:{symbol}",
+                    window=tg.ONCE_WINDOW,
+                ))
+                continue
 
         # 4. Gather results in parallel
         results = []
         if tasks:
-            results = await asyncio.gather(*tasks)
+            # return_exceptions, for the same reason the loop above now has a
+            # guard. order_executor.execute returns a result dict on the failures
+            # it KNOWS about, but it is ~310 lines and an unexpected raise escapes
+            # it — and a bare gather() re-raises the first of those, throwing away
+            # every other follower's result. The orders themselves had already
+            # been placed; what was lost was their ledger entries, their
+            # trade_copies rows and their Telegram notifications. One follower's
+            # crash made its siblings' copies INVISIBLE rather than wrong, which
+            # is harder to notice and sends the reconciler chasing legs that
+            # already exist.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            _clean = []
+            for _fol, _res in zip(task_for, results):
+                if isinstance(_res, Exception):
+                    logger.exception(
+                        f"copy: executor raised for {_fol.get('name')} on {symbol}: {_res}",
+                        exc_info=_res,
+                    )
+                    _clean.append({
+                        "account_id": _fol.get("id"),
+                        "account_name": _fol.get("name"),
+                        "status": "failed",
+                        "failure_reason": (f"the copy itself crashed "
+                                           f"({type(_res).__name__}: {_res})"),
+                    })
+                elif isinstance(_res, BaseException):
+                    raise _res          # CancelledError and friends: never swallow
+                else:
+                    _clean.append(_res)
+            results = _clean
         if ts_detected:
             logger.info(f"[LATENCY] {symbol}: {(time.time() - ts_detected):.2f}s end-to-end (detection → followers executed)")
 
