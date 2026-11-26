@@ -147,31 +147,48 @@ comment on table public.paper_positions is
 
 
 -- 5. Same per-tenant isolation as every other table (see 002). The backend uses
---    the service role and bypasses this; it matters for anything reaching the
---    database with a user's own JWT. Neither table carries owner_id, so
---    ownership is followed through the account.
-do $$
-declare
-  t text;
-  tables text[] := array['paper_orders', 'paper_positions'];
-begin
-  foreach t in array tables loop
-    execute format('alter table public.%I enable row level security;', t);
+--    the SERVICE ROLE and bypasses all of this; it matters for anything that
+--    reaches the database with a user's own JWT, such as the frontend's
+--    Supabase client. Neither table carries owner_id, so ownership is followed
+--    through the account the row belongs to.
+--
+--    WRITTEN OUT IN FULL, not generated in a `do $$` loop like 002 does. 002
+--    loops because it covers five tables; this covers two, so the loop bought
+--    nothing -- and it hid the statements from Supabase's SQL checker, which
+--    reads queries statically and cannot see inside `execute format(...)`. It
+--    therefore warned that these tables were being created WITHOUT RLS, which
+--    was untrue but unverifiable by reading. Plain statements say what they do.
+--
+--    public.is_admin() comes from 002_row_level_security.sql; run that first if
+--    this errors on it.
 
-    execute format('drop policy if exists %I_owner_select on public.%I;', t, t);
-    execute format(
-      'create policy %I_owner_select on public.%I for select using ('
-      '  exists (select 1 from public.accounts a'
-      '          where a.id = %I.account_id'
-      '            and (a.owner_id = auth.uid() or public.is_admin())));',
-      t, t, t);
+alter table public.paper_orders    enable row level security;
+alter table public.paper_positions enable row level security;
 
-    execute format('drop policy if exists %I_owner_write on public.%I;', t, t);
-    execute format(
-      'create policy %I_owner_write on public.%I for all using ('
-      '  exists (select 1 from public.accounts a'
-      '          where a.id = %I.account_id'
-      '            and (a.owner_id = auth.uid() or public.is_admin())));',
-      t, t, t);
-  end loop;
-end $$;
+drop policy if exists paper_orders_owner_select on public.paper_orders;
+create policy paper_orders_owner_select on public.paper_orders
+  for select using (
+    exists (select 1 from public.accounts a
+            where a.id = paper_orders.account_id
+              and (a.owner_id = auth.uid() or public.is_admin())));
+
+drop policy if exists paper_orders_owner_write on public.paper_orders;
+create policy paper_orders_owner_write on public.paper_orders
+  for all using (
+    exists (select 1 from public.accounts a
+            where a.id = paper_orders.account_id
+              and (a.owner_id = auth.uid() or public.is_admin())));
+
+drop policy if exists paper_positions_owner_select on public.paper_positions;
+create policy paper_positions_owner_select on public.paper_positions
+  for select using (
+    exists (select 1 from public.accounts a
+            where a.id = paper_positions.account_id
+              and (a.owner_id = auth.uid() or public.is_admin())));
+
+drop policy if exists paper_positions_owner_write on public.paper_positions;
+create policy paper_positions_owner_write on public.paper_positions
+  for all using (
+    exists (select 1 from public.accounts a
+            where a.id = paper_positions.account_id
+              and (a.owner_id = auth.uid() or public.is_admin())));
