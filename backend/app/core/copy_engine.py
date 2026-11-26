@@ -935,9 +935,19 @@ class CopyEngine:
     async def _tp_sl_params(self, follower: dict, owner_id=None, master_id=None):
         """(offset, slot) for this follower's SL/TP trigger.
 
-        offset is the MASTER's configured tp_sl_offset, or None to keep the
-        built-in hash jitter. slot is the follower's index among its owner's
-        active followers, which decides whether it sits above or below.
+        offset is the MASTER's configured tp_sl_offset, or None to fall back to
+        DEFAULT_TP_SL_OFFSET. slot is the follower's index among THIS master's
+        active followers, oldest first, and it is the LADDER RUNG: follower 1
+        sits one offset beyond the master, follower 2 two offsets beyond, so
+        they stop out in order behind him rather than together.
+
+        THE SLOT IS RETURNED EVEN WITH NO OFFSET SET. It used to return (None,
+        0) in that case -- the offset and the slot are two different facts, and
+        collapsing them meant a master who had configured nothing gave EVERY
+        follower rung 0. The default offset then put all of them on the same
+        price, which is the one thing the rung exists to prevent, and it
+        happened precisely to the desks that had not been tuned. JD algo4 has
+        no offset set to this day.
         """
         owner_id = owner_id or follower.get("owner_id")
         master_id = master_id or follower.get("master_id")
@@ -967,12 +977,20 @@ class CopyEngine:
                 cached = (time.time(), offset, ids)
                 self._slot_cache[cache_key] = cached
             _, offset, ids = cached
-            if offset in (None, ""):
-                return None, 0
-            return offset, (ids.index(fid) if fid in ids else 0)
+            # None stays None -- the CALLER decides what no configured offset
+            # means (today: DEFAULT_TP_SL_OFFSET). The slot is answered either
+            # way, because where a follower sits in the queue has nothing to do
+            # with whether its master set a number.
+            return (None if offset in (None, "") else offset), (
+                ids.index(fid) if fid in ids else 0)
         except Exception as e:
-            # Never let this stop an order going out. No offset means the hash
-            # jitter, which is what every account had before this existed.
+            # Never let this stop an order going out. (None, 0) means the
+            # caller uses DEFAULT_TP_SL_OFFSET at the first rung, which is one
+            # offset beyond the master -- correct for a single follower, and for
+            # several it only risks them sharing a price for as long as the
+            # account table is unreadable. The older comment here said this fell
+            # back to "the hash jitter"; _jitter_trigger has not been called by
+            # anything since the 2026-11-24 desk call.
             logger.warning("tp_sl offset lookup failed for %s: %s", fid, e)
             return None, 0
 
@@ -1052,12 +1070,27 @@ class CopyEngine:
             return None
 
     @staticmethod
-    def _trigger_after_master(price, reference, offset=None):
-        """The follower's trigger: `offset` BEYOND the master's `price`, on the
-        side away from `reference` (the current price), so it fires after the
-        master's. Without a reference — or if going beyond would reach zero or
-        below — the master's own price: never in front of it, and never a stop
-        that cannot fire."""
+    def _trigger_after_master(price, reference, offset=None, rung: int = 0):
+        """The follower's trigger: `(rung + 1) x offset` BEYOND the master's
+        `price`, on the side away from `reference` (the current price), so it
+        fires after the master's.
+
+        THE RUNG IS WHAT KEEPS TWO FOLLOWERS APART. Every follower of a master
+        used to be placed at exactly one offset beyond him, so a master with two
+        copies had both of their stops on the SAME price -- which is the pack of
+        identical stops the offset was introduced to break up. 2026-11-26,
+        Dhwani's desk: master's SL at 64,000 and BOTH Dhwani1 and Dhwani2 at
+        64,050. They would have been stopped out in the same instant, at the
+        same price, each making the other's fill worse.
+
+        So the rung multiplies: follower 1 at +offset, follower 2 at +2x, and so
+        on, all on the far side of the master. The exit order becomes master,
+        then follower 1, then follower 2 -- which is the desk's rule (a
+        follower never exits before its master) extended to each other.
+
+        Without a reference -- or if going beyond would reach zero or below --
+        the master's own price: never in front of it, and never a stop that
+        cannot fire."""
         if price is None:
             return None
         base = round(float(price), 1)
@@ -1065,23 +1098,36 @@ class CopyEngine:
             mag = abs(float(offset if offset not in (None, "") else DEFAULT_TP_SL_OFFSET))
         except (TypeError, ValueError):
             mag = DEFAULT_TP_SL_OFFSET
+        try:
+            step = max(1, int(rung) + 1)
+        except (TypeError, ValueError):
+            step = 1
+        mag *= step
         if not mag or reference is None:
             return base
         ref = float(reference)
         if base == ref:
             return base
         out = round(base + mag, 1) if base > ref else round(base - mag, 1)
+        # A deeper rung can push the trigger through zero on a cheap contract.
+        # Falling back to the master's own price keeps the stop live; silently
+        # returning a negative would place a trigger that can never fire.
         return out if out > 0 else base
 
     async def _follower_trigger(self, client, follower: dict, symbol: str, stop_price,
                                 trigger_method, owner_id=None, master_id=None):
         """Where this follower's copy of the master's SL/TP triggers — always at
-        or beyond the master's (see _trigger_after_master)."""
+        or beyond the master's, one ladder rung per follower (see
+        _trigger_after_master).
+
+        The slot was fetched here and THROWN AWAY, so every follower of a master
+        landed on the identical trigger. Seen on 2026-11-26 with Dhwani1 and
+        Dhwani2 both at 64,050 behind a master at 64,000."""
         if stop_price is None:
             return None
-        off, _slot = await self._tp_sl_params(follower, owner_id, master_id)
+        off, slot = await self._tp_sl_params(follower, owner_id, master_id)
         ref = await self._trigger_reference(client, symbol, trigger_method)
-        out = self._trigger_after_master(stop_price, ref, offset=off)
+        out = self._trigger_after_master(stop_price, ref, offset=off, rung=slot)
         if ref is None:
             logger.warning(
                 f"stop placement: could not read the current price for {symbol} — "
