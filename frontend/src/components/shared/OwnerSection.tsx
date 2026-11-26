@@ -70,10 +70,22 @@ export function OwnerSection({
           <div className="text-[11px] text-text-muted mt-0.5 truncate">{subtitle}</div>
         </div>
 
-        <div className="basis-full sm:basis-auto shrink-0 flex items-center justify-end gap-3 sm:gap-6 pl-8 sm:pl-0">
+        {/* ON A PHONE THE FIGURES SHARE WHATEVER ROOM THERE IS, because there
+            can be four of them. Fixed widths did not fit: four columns at
+            4.75rem, three 12px gaps and a 32px indent come to ~372px of content
+            inside a 375px screen that has already spent 32px on its own
+            padding, and `shrink-0` left the row no way to respond — so "Total
+            today" sat off the right edge. basis-0 + flex-1 + min-w-0 divides
+            the real width instead, and the max-w keeps the two-stat case (the
+            accounts page) from stretching a pair of numbers across the screen.
+            From sm: up the fixed width returns, so the columns line up down the
+            page however long each number happens to be. Same reasoning, and
+            the same fix, as PCOL in positions/PositionGroup. */}
+        <div className="basis-full sm:basis-auto w-full sm:w-auto sm:shrink-0 flex items-center justify-end gap-2 sm:gap-6 pl-0 sm:pl-0">
           {stats.map((s) => (
-            <div key={s.label} className="w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right">
-              <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">
+            <div key={s.label}
+                 className="basis-0 flex-1 min-w-0 max-w-[7rem] sm:basis-auto sm:flex-none sm:max-w-none sm:w-[6.75rem] text-right">
+              <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-tight sm:leading-none mb-0.5 sm:whitespace-nowrap">
                 {s.label}
               </div>
               <div className={`text-[13px] font-mono font-bold ${tone(s.tone)}`}>{s.value}</div>
