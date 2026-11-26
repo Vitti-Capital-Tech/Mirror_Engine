@@ -44,7 +44,7 @@ mistaken for the verdict.
 import asyncio
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.fill_compare import (  # shared primitives — same window, same maths
@@ -127,14 +127,59 @@ PASS_VERDICTS = {"matched", "ladder", "cancelled_ok"}
 
 # Genuinely ungradable — we cannot say whether these were right or wrong, so they
 # are left out of the rate in either direction rather than scored as a guess.
-NEUTRAL_VERDICTS = {"skipped", "unsized", "unreadable", "not_yet"}
+NEUTRAL_VERDICTS = {"skipped", "unsized", "unreadable", "not_yet", "settled"}
 
 # Worst-first, so a master order's row takes its worst leg.
 _SEVERITY = {
-    "matched": 0, "cancelled_ok": 1, "ladder": 2, "not_yet": 3, "skipped": 4,
-    "unsized": 5, "extra": 6, "cancel_missed": 7, "undersized": 8,
-    "oversized": 9, "missing": 10,
+    "matched": 0, "cancelled_ok": 1, "ladder": 2, "settled": 3, "not_yet": 4,
+    "skipped": 5,
+    "unsized": 6, "extra": 7, "cancel_missed": 8, "undersized": 9,
+    "oversized": 10, "missing": 11,
 }
+
+
+# Delta's BTC options expire at 12:00 UTC on the date carried in the symbol,
+# e.g. C-BTC-63000-261126 expires 26 Nov 2026. A little slack after it, because
+# settlement is written in a burst a second or two wide.
+_EXPIRY_UTC_HOUR = 12
+_SETTLEMENT_GRACE_SEC = 300.0
+
+
+def _settlement(m: dict) -> bool:
+    """Is this the exchange SETTLING an expired contract, rather than a trade?
+
+    At expiry Delta closes every open position on the series itself. Those
+    closes arrive as ordinary-looking orders on both the master's book and the
+    follower's -- so the report paired them up and graded the sizes, when
+    neither account placed either one and the engine was never involved.
+
+    2026-11-26: seven of them at 12:00:00.18 to 12:00:02.47, all on the
+    -261126 series that expired at that instant. Each read "punched 2939
+    against an estimated target of ~2652" and they were most of what dragged
+    that desk to 75%. The sizes were in fact the positions the two accounts
+    held, which had been opened in proportion hours earlier.
+
+    Told apart by the contract, not by a guess: an order stamped AT OR AFTER
+    its own contract's expiry cannot be a trade in it, because the contract no
+    longer exists to trade. Anything that cannot be parsed as an expiring
+    symbol is graded normally.
+    """
+    sym = m.get("symbol") or ""
+    placed = m.get("created_ts")
+    if placed is None:
+        return False
+    parts = sym.split("-")
+    if len(parts) < 4:
+        return False                      # not an expiring contract
+    try:
+        exp = datetime.strptime(parts[-1], "%d%m%y").replace(
+            hour=_EXPIRY_UTC_HOUR, tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    try:
+        return (placed - exp).total_seconds() >= -_SETTLEMENT_GRACE_SEC and placed >= exp
+    except TypeError:
+        return False                      # naive vs aware: do not guess
 
 
 def _predates(m: dict, acc: dict) -> bool:
@@ -394,7 +439,13 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
                 _tol = max(SIZE_TOLERANCE,
                            abs(target or 0.0) * DERIVED_TOLERANCE_PCT / 100.0)
 
-            if _predates(m, acc):
+            if _settlement(m):
+                # The exchange closed an expired contract on both books. No
+                # copy was owed and none was made -- see _settlement.
+                verdict, note = "settled", (
+                    "the exchange settled this contract at expiry — not a copy")
+                f, link = None, None
+            elif _predates(m, acc):
                 # The account did not exist yet. Not a missing copy, and not
                 # scored in either direction -- see _predates.
                 verdict, note = "not_yet", (
@@ -505,7 +556,7 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
             # A group the follower was not alive for cannot be over or under
             # punched. Without this the LADDER total re-accuses what the
             # per-leg pass has just excused: "punched 0 against a target of N".
-            if all(l["verdict"] == "not_yet" for l in legs):
+            if all(l["verdict"] in ("not_yet", "settled") for l in legs):
                 continue
             placed_total = sum(l["placed_lots"] or 0 for l in legs)
             # WHAT THE ENGINE ASKED FOR, rung by rung, when every rung has it on

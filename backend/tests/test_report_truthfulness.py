@@ -359,6 +359,62 @@ def test_an_unknown_creation_date_is_graded_normally():
     check("graded, not excused", out["rows"][0]["legs"][0]["verdict"], "missing")
 
 
+def test_an_expiry_settlement_is_not_a_copy():
+    """THE OTHER 2026-11-26 CASE, and the larger one.
+
+    Delta's BTC options expire at 12:00 UTC on the date in the symbol, and at
+    that moment the exchange CLOSES every open position on the series itself.
+    Those closes land on the master's book and the follower's as ordinary
+    orders, so the report paired them and graded the sizes -- when neither
+    account placed either one and the engine was never involved.
+
+    Seven of them arrived between 12:00:00.18 and 12:00:02.47 on the -261126
+    series, each reading "punched 2939 against an estimated target of ~2652".
+    They were most of what put that desk at 75%. The sizes were simply the
+    positions the two accounts held, opened in proportion hours earlier.
+
+    Told apart by the CONTRACT: an order stamped at or after its own
+    contract's expiry cannot be a trade in it, because the contract no longer
+    exists to trade.
+    """
+    print("\n12. the exchange settling an expired contract")
+    expiring = "C-BTC-63000-261126"          # expires 2026-11-26 12:00 UTC
+    settle_at = datetime(2026, 11, 26, 12, 0, 2, tzinfo=timezone.utc)
+    m = [order("981", expiring, "buy", 3000, settle_at, filled=3000)]
+    f = [order("591", expiring, "buy", 2939, settle_at, filled=2939)]
+    out = run(m, f)                           # no engine leg: nothing copied it
+    l = out["rows"][0]["legs"][0]
+    check("not graded as a copy", l["verdict"], "settled")
+    check("and not counted as an error", out["summary"]["errors"], 0)
+    check_true("the note says what it was",
+               "settled this contract" in (l["note"] or ""), l["note"])
+
+
+def test_a_real_trade_before_expiry_is_still_graded():
+    """Narrow. The same contract, traded EIGHT MINUTES before it expires, is an
+    ordinary trade and a bad copy of it is still a finding."""
+    print("\n13. a real trade earlier the same day")
+    expiring = "C-BTC-63000-261126"
+    before = datetime(2026, 11, 26, 11, 52, 0, tzinfo=timezone.utc)
+    m = [order("982", expiring, "buy", 3000, before, filled=3000)]
+    f = [order("592", expiring, "buy", 5884, before + timedelta(seconds=1), filled=5884)]
+    out = run(m, f)
+    l = out["rows"][0]["legs"][0]
+    check("still graded", l["verdict"], "oversized")
+    check_true("and still names the multiple", "2.0x" in (l["note"] or ""), l["note"])
+
+
+def test_a_symbol_with_no_expiry_is_graded_normally():
+    """A perpetual, or anything whose tail will not parse as a date, is not
+    excused -- a symbol we cannot read is not evidence of anything."""
+    print("\n14. a non-expiring symbol at the same instant")
+    settle_at = datetime(2026, 11, 26, 12, 0, 2, tzinfo=timezone.utc)
+    m = [order("983", "BTCUSD", "buy", 3000, settle_at, filled=3000)]
+    f = [order("593", "BTCUSD", "buy", 5884, settle_at + timedelta(seconds=1), filled=5884)]
+    out = run(m, f)
+    check("graded, not excused", out["rows"][0]["legs"][0]["verdict"], "oversized")
+
+
 if __name__ == "__main__":
     for t in (test_separate_trades_are_not_one_ladder,
               test_a_real_ladder_is_still_grouped,
@@ -370,7 +426,10 @@ if __name__ == "__main__":
               test_a_linked_order_on_a_skipped_leg_is_still_graded,
               test_a_follower_added_today_is_not_blamed_for_yesterday,
               test_a_follower_that_existed_is_still_blamed,
-              test_an_unknown_creation_date_is_graded_normally):
+              test_an_unknown_creation_date_is_graded_normally,
+              test_an_expiry_settlement_is_not_a_copy,
+              test_a_real_trade_before_expiry_is_still_graded,
+              test_a_symbol_with_no_expiry_is_graded_normally):
         t()
     print("\n" + ("ALL PASS" if not FAILURES
                   else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))
