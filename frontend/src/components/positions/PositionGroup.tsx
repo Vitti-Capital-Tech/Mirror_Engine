@@ -45,13 +45,24 @@ const pnlClass = (v: number) =>
  *  columns. */
 const MAX_MISSING = 3;
 
+// From sm: up, a fixed width, so the four columns line up down the page
+// regardless of how long each number happens to be. Wide enough to spell the
+// group labels out -- "Grp realised" saved twelve pixels and made the reader
+// decode an abbreviation on a column of money.
+//
+// ON A PHONE THEY SHARE WHATEVER ROOM THERE IS. Fixed widths did not fit: four
+// columns at 4.75rem, three 12px gaps and a 24-32px indent come to ~364px of
+// content inside a 375px screen that has already spent 32px on its own
+// padding. The fourth column -- Today, the number the page exists to show --
+// was simply off the right edge, and `shrink-0` is what made it impossible for
+// the row to do anything about it. basis-0 + flex-1 + min-w-0 divides the real
+// width four ways instead, so the row fits every phone rather than one.
+const PCOL_BASE = 'basis-0 flex-1 min-w-0 sm:basis-auto sm:flex-none sm:w-[6.75rem] text-right';
 export const PCOL = {
-  // Wide enough to spell the group labels out. "Grp realised" saved twelve
-  // pixels and made the reader decode an abbreviation on a column of money.
-  balance: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
-  realised: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
-  unreal: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
-  today: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
+  balance: PCOL_BASE,
+  realised: PCOL_BASE,
+  unreal: PCOL_BASE,
+  today: PCOL_BASE,
 };
 
 function AccountRow({ acc, legs, missing, isMaster, defaultOpen, rung = null }: {
@@ -169,7 +180,7 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen, rung = null }: 
 
         {/* Three figures do not fit beside a name on a phone, so there they
             take a line of their own rather than crushing it. */}
-        <span className="basis-full sm:basis-auto ml-auto sm:ml-0 shrink-0 flex items-center justify-end gap-3 sm:gap-6 pl-6 sm:pl-0">
+        <span className="basis-full sm:basis-auto ml-auto sm:ml-0 w-full sm:w-auto sm:shrink-0 flex items-center justify-end gap-2 sm:gap-6 pl-0 sm:pl-0">
           <span className={PCOL.balance}>
             {/* On the number itself, always. A single header at the top of
                 the page stops explaining anything once the tables are open —
@@ -276,27 +287,27 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
           </div>
         </div>
 
-        <div className="basis-full sm:basis-auto shrink-0 flex items-center justify-end gap-3 sm:gap-6 pl-8 sm:pl-0">
+        <div className="basis-full sm:basis-auto w-full sm:w-auto sm:shrink-0 flex items-center justify-end gap-2 sm:gap-6 pl-0 sm:pl-0">
           {/* The page labels the COLUMNS once, above. This labels the SCOPE,
               which is a different thing and the one that was missing: expanded,
               these totals sat directly on top of the master's own pair with
               nothing to say which was which. */}
           <div className={PCOL.balance}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group balance</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-tight sm:leading-none mb-0.5 sm:whitespace-nowrap">Group balance</div>
             <div className="text-[13px] font-mono font-bold text-text-primary">{money(groupBalance)}</div>
           </div>
           <div className={PCOL.realised}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group realised</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-tight sm:leading-none mb-0.5 sm:whitespace-nowrap">Group realised</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupRealised)}`}>{signed(groupRealised)}</div>
           </div>
           <div className={PCOL.unreal}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group unreal.</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-tight sm:leading-none mb-0.5 sm:whitespace-nowrap">Group unreal.</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupUnreal)}`}>
               {groupLegs.length ? signed(groupUnreal) : '—'}
             </div>
           </div>
           <div className={PCOL.today}>
-            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-none mb-0.5 whitespace-nowrap">Group today</div>
+            <div className="text-[8px] uppercase tracking-wider text-text-muted/70 leading-tight sm:leading-none mb-0.5 sm:whitespace-nowrap">Group today</div>
             <div className={`text-[13px] font-mono font-bold ${pnlClass(groupToday)}`}>{signed(groupToday)}</div>
           </div>
         </div>
