@@ -132,18 +132,24 @@ def run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def build(mark=100.0):
-    """A PaperClient with both remote calls stubbed. Nothing here is online."""
-    pc._marks.clear()
+def build(mark=100.0, spot=None):
+    """A PaperClient with both remote calls stubbed. Nothing here is online.
+
+    The ticker is stubbed rather than `_mark`, so the real _mark and
+    _trigger_px run — they are the pair that has to keep a contract's own
+    price apart from the underlying a stop is measured against.
+    """
+    pc._quotes.clear()
     pc._symbols.clear()
 
-    async def fake_mark(_symbol):
-        return mark
+    async def fake_quote(_symbol):
+        return {"mark_price": mark, "close": mark,
+                "spot_price": mark if spot is None else spot}
 
     async def fake_symbol(product_id):
         return SYM if str(product_id) == str(PRODUCT_ID) else None
 
-    pc._mark = fake_mark
+    pc._quote = fake_quote
     pc._symbol_for = fake_symbol
     return PaperClient(dict(ACC), DB())
 
@@ -304,6 +310,30 @@ def test_editing_a_stop_actually_moves_it():
     check("the trigger method moved too", after.get("stop_trigger_method"), "spot_price")
 
 
+def test_get_ticker_is_unwrapped_and_carries_the_underlying():
+    """DeltaClient.get_ticker returns `data.get("result", data)` -- UNWRAPPED --
+    and CopyEngine._trigger_reference reads the field straight off it.
+
+    Paper returned {"result": {...}}, so the engine asked for "spot_price", got
+    None, and placed the follower's stop AT the master's own price instead of a
+    ladder rung beyond it. The deployed stops showed it exactly: Mini 1 @
+    61284.0 against a master at 61284.0. Paper also reported the option's
+    premium as its own spot_price, which is the underlying's number.
+    """
+    print("\n8. get_ticker is shaped the way the engine reads it")
+    c = build(mark=38.0, spot=60500.0)
+    t = run(c.get_ticker(SYM))
+    check_true("not wrapped in a 'result' envelope", "result" not in t, sorted(t))
+    check("the engine can read mark_price off it", t.get("mark_price"), 38.0)
+    check("and spot_price is the UNDERLYING, not the premium",
+          t.get("spot_price"), 60500.0)
+    # The field names the engine actually asks for, from its own map.
+    for method, field in (("spot_price", "spot_price"), ("mark_price", "mark_price"),
+                          ("last_traded_price", "close")):
+        check_true("trigger method %s -> readable %s" % (method, field),
+                   t.get(field) is not None, t.get(field))
+
+
 def test_a_bracket_on_a_flat_leg_is_a_no_op_not_a_crash():
     print("\n7. a bracket on a flat leg is a harmless no-op")
     c = build()
@@ -322,6 +352,7 @@ if __name__ == "__main__":
               test_place_bracket_returns_the_shape_the_caller_reads,
               test_an_unresolvable_product_is_loud_not_silent,
               test_editing_a_stop_actually_moves_it,
+              test_get_ticker_is_unwrapped_and_carries_the_underlying,
               test_a_bracket_on_a_flat_leg_is_a_no_op_not_a_crash):
         t()
     print("\n" + ("ALL PASS" if not FAILURES

@@ -80,8 +80,14 @@ _TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
 # One shared mark cache across every paper client: the price of a contract does
 # not depend on who is asking, and two paper followers on one master would
 # otherwise each pay their own round trip inside the same leg lock.
-_marks: dict = {}                    # symbol -> (price, fetched_at)
-_MARK_TTL = 2.0
+_quotes: dict = {}                   # symbol -> (quote dict, fetched_at)
+_QUOTE_TTL = 2.0
+
+# Which ticker field a stop's trigger method is measured against. Must stay in
+# step with CopyEngine._TRIGGER_FIELD: the engine picks the follower's trigger
+# off one of these, so paper has to evaluate it against the same one.
+_TRIGGER_FIELD = {"spot_price": "spot_price", "mark_price": "mark_price",
+                  "last_traded_price": "close"}
 
 # Public, unauthenticated, and ONE product at a time (~0.5s) rather than the
 # whole catalogue: /v2/products with a large page_size does not return inside
@@ -132,30 +138,70 @@ def _now_us() -> int:
     return int(time.time() * 1_000_000)
 
 
-async def _mark(symbol: str) -> Optional[float]:
-    """The contract's mark price, or None.
+async def _quote(symbol: str) -> dict:
+    """The contract's public ticker: its own price AND the underlying's.
 
-    None is a real answer and callers must handle it: an unreadable price is
-    never treated as a price. Cached briefly and shared across paper clients.
+    TWO DIFFERENT PRICES, AND CONFUSING THEM IS A DISASTER ON OPTIONS. For
+    C-BTC-62400-271126 the ticker reports mark_price 38.2 -- the premium, what
+    one contract costs -- and spot_price 60501.6, which is BTC. A stop on that
+    option triggers off the UNDERLYING, so its trigger is a number like 61284.
+
+    This used to collapse the two into a single float ("mark_price or close or
+    spot_price"), which made a stop impossible to evaluate: comparing a premium
+    of 38.2 against a trigger of 61284 says "already through it" for every sell
+    that ever rests. See _trigger_px and _sweep.
+
+    An empty dict is a real answer; callers must not treat a missing price as a
+    price. Cached briefly and shared across paper clients.
     """
-    hit = _marks.get(symbol)
-    if hit and (time.time() - hit[1]) < _MARK_TTL:
+    hit = _quotes.get(symbol)
+    if hit and (time.time() - hit[1]) < _QUOTE_TTL:
         return hit[0]
     try:
         async with httpx.AsyncClient(timeout=MARK_TIMEOUT_SEC) as c:
             r = await c.get(_TICKER_URL.format(symbol=symbol))
         if r.status_code != 200:
-            return hit[0] if hit else None
+            return hit[0] if hit else {}
         res = (r.json() or {}).get("result") or {}
-        px = res.get("mark_price") or res.get("close") or res.get("spot_price")
-        px = float(px) if px is not None else None
-        if px:
-            _marks[symbol] = (px, time.time())
-            return px
+        q = {}
+        for k in ("mark_price", "spot_price", "close"):
+            v = res.get(k)
+            try:
+                q[k] = float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                q[k] = None
+        if q.get("mark_price") or q.get("close"):
+            _quotes[symbol] = (q, time.time())
+            return q
     except Exception as e:
-        logger.debug("paper: mark read failed for %s: %s", symbol, e)
+        logger.debug("paper: ticker read failed for %s: %s", symbol, e)
     # Stale is better than nothing, and nothing is better than a guess.
-    return hit[0] if hit else None
+    return hit[0] if hit else {}
+
+
+async def _mark(symbol: str) -> Optional[float]:
+    """What one contract is worth now -- the price a FILL happens at.
+
+    Deliberately never falls back to spot_price. On an option that is the
+    underlying, so a missing premium would have filled a paper order at ~60,000
+    instead of ~38 and poisoned every number built on it. None is the honest
+    answer, and place_order already refuses to fill without a price.
+    """
+    q = await _quote(symbol)
+    return q.get("mark_price") or q.get("close")
+
+
+async def _trigger_px(symbol: str, method: Optional[str]) -> Optional[float]:
+    """The price a stop with this trigger method is compared against.
+
+    Mirrors CopyEngine._TRIGGER_FIELD, because the follower's trigger was
+    computed against that reference and has to be evaluated against the same
+    one. None when the reference cannot be read -- and a stop whose reference
+    is unreadable must WAIT, never fire: firing on an unknown price is how a
+    whole paper book got closed in one sweep.
+    """
+    q = await _quote(symbol)
+    return q.get(_TRIGGER_FIELD.get(method or "mark_price", "mark_price"))
 
 
 async def _symbol_for(product_id) -> Optional[str]:
@@ -682,8 +728,25 @@ class PaperClient:
         return []
 
     async def get_ticker(self, symbol: str) -> dict:
-        px = await _mark(symbol)
-        return {"result": {"mark_price": px, "close": px, "symbol": symbol}}
+        """The public ticker, UNWRAPPED — DeltaClient returns
+        `data.get("result", data)`, and the engine reads the fields straight
+        off what it gets back.
+
+        This used to return {"result": {...}}, so CopyEngine._trigger_reference
+        asked the dict for "spot_price", got None, and placed the follower's
+        stop AT the master's own price instead of a ladder rung beyond it. The
+        log said so every time -- "could not read the current price ... placed
+        AT the master's" -- and the deployed stops showed it: Mini 1 @ 61284.0
+        against master 61284.0, no offset at all.
+
+        It also reported the option's premium as its own `spot_price`, which is
+        the underlying. Both fields are now whatever the exchange says they are.
+        """
+        q = await _quote(symbol)
+        return {"symbol": symbol,
+                "mark_price": q.get("mark_price"),
+                "spot_price": q.get("spot_price"),
+                "close": q.get("close")}
 
     # -------------------------------------------------------- "websocket"
 
@@ -729,8 +792,24 @@ class PaperClient:
                 # A stop triggers when price moves THROUGH it, which is the
                 # opposite sense to a limit: a sell stop fires below, a buy stop
                 # above. Then it becomes a market order.
+                #
+                # IT IS COMPARED AGAINST THE TRIGGER REFERENCE, NOT AGAINST THE
+                # CONTRACT'S OWN PRICE. On an option those are different numbers
+                # by three orders of magnitude -- a premium of 38 against a
+                # trigger of 61284 -- and comparing them fired every resting
+                # sell stop the instant it was placed. On 2026-11-26 that closed
+                # Mini 1's and Mini 2's entire books within a second of their
+                # protection finally being placed.
+                #
+                # It FILLS at the contract's own price, which is the premium.
+                # Two prices, two jobs.
+                ref = await _trigger_px(row["symbol"], row.get("stop_trigger_method"))
+                if ref is None:
+                    # Unreadable reference: wait. Never fire on a price we do
+                    # not have -- that is the bug above, with extra steps.
+                    continue
                 level = float(row["stop_price"])
-                fired = px <= level if row["side"] == "sell" else px >= level
+                fired = ref <= level if row["side"] == "sell" else ref >= level
                 if fired:
                     await self._fill(row, px)
                 continue

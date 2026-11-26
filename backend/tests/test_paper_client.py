@@ -126,20 +126,28 @@ class DB:
 FILLS, POSITIONS = [], []
 
 
-def build(mark=10.0, account=None, slow=False, unpriced=False):
-    """A PaperClient with the mark price stubbed. `slow`/`unpriced` stand in for
-    a dead ticker endpoint."""
-    pc._marks.clear()
+def build(mark=10.0, account=None, slow=False, unpriced=False, spot=None):
+    """A PaperClient with the public ticker stubbed. `slow`/`unpriced` stand in
+    for a dead ticker endpoint.
+
+    The TICKER is stubbed, not `_mark`, so the real _mark and _trigger_px run:
+    they are the two that have to keep the contract's own price and the
+    underlying apart, and a stub in front of them would hide it. `spot` is the
+    underlying -- what a stop on an option is actually measured against.
+    Defaults to the mark so the plain futures-shaped cases read unchanged.
+    """
+    pc._quotes.clear()
     FILLS.clear()
     POSITIONS.clear()
 
-    async def fake_mark(symbol):
+    async def fake_quote(_symbol):
         if slow:
             await asyncio.sleep(5)      # longer than any caller should tolerate
         if unpriced:
-            return None
-        return mark
-    pc._mark = fake_mark
+            return {}
+        return {"mark_price": mark, "close": mark,
+                "spot_price": mark if spot is None else spot}
+    pc._quote = fake_quote
 
     db = DB([dict(account or ACC)])
     c = PaperClient(dict(account or ACC), db)
@@ -196,9 +204,11 @@ def test_a_limit_order_rests_until_the_mark_reaches_it():
         r = await c.place_order(symbol=SYM, side="buy", size=50,
                                 order_type="limit_order", limit_price=10.0)
         resting = await c.get_open_orders("open")
-        # price falls to the limit
-        async def reached(_s): return 9.0
-        pc._mark = reached
+        # price falls to the limit. Stub the TICKER, never _mark: assigning
+        # pc._mark here left it replaced for every later test in the file.
+        async def reached(_s):
+            return {"mark_price": 9.0, "close": 9.0, "spot_price": 9.0}
+        pc._quote = reached
         await c._sweep()
         return r, resting, await c.get_positions()
 
@@ -248,8 +258,15 @@ def test_a_stop_rests_as_pending_and_fires_when_crossed():
                                 order_type="market_order", reduce_only=True,
                                 stop_price=15.0, stop_order_type="stop_loss_order")
         pending = await c.get_open_orders("pending")
-        async def moved(_s): return 16.0        # through the stop
-        pc._mark = moved
+        # Stub the TICKER, not _mark. This line used to assign pc._mark, which
+        # is a module global: it stayed replaced for every test that ran after
+        # this one, and only went unnoticed because build() happened to
+        # overwrite _mark each time. The moment build() stopped doing that,
+        # test 10 started seeing this 16.0 and "never invents a price" passed a
+        # price it had invented here.
+        async def moved(_s):
+            return {"mark_price": 16.0, "close": 16.0, "spot_price": 16.0}
+        pc._quote = moved
         await c._sweep()
         return r, pending, await c.get_positions()
 
@@ -257,6 +274,69 @@ def test_a_stop_rests_as_pending_and_fires_when_crossed():
     check("it rests as pending, like Delta's", r["state"], "pending")
     check("one pending order", len(pending), 1)
     check("and the stop closed the leg", pos, [])
+
+
+def test_an_option_stop_triggers_off_the_underlying_not_the_premium():
+    """The 2026-11-26 book-wipe, in one test.
+
+    A stop on C-BTC-62400 is a BTC level (61284). The contract's own price is
+    the premium (~38). Comparing those says "already through it" for every
+    resting sell, so the instant Mini 1 and Mini 2 finally had protection, the
+    first sweep closed every leg they held.
+    """
+    print("\n6b. an option stop reads the underlying, not its own premium")
+    # Premium 38, BTC at 60500, and a protective sell stop at 59900.
+    c, _ = build(mark=38.0, spot=60500.0)
+
+    async def go():
+        await c.place_order(symbol=SYM, side="buy", size=10,
+                            order_type="market_order")           # long 10
+        await c.place_order(symbol=SYM, side="sell", size=10,
+                            order_type="market_order", reduce_only=True,
+                            stop_price=59900.0, stop_order_type="stop_loss_order",
+                            stop_trigger_method="spot_price")
+        await c._sweep()
+        return await c.get_positions()
+
+    pos = run(go())
+    check_true("BTC is above the stop, so the leg is untouched", len(pos) == 1, pos)
+
+    # Now BTC falls through it. The premium is irrelevant either way.
+    c2, _ = build(mark=38.0, spot=59800.0)
+
+    async def go2():
+        await c2.place_order(symbol=SYM, side="buy", size=10,
+                             order_type="market_order")
+        await c2.place_order(symbol=SYM, side="sell", size=10,
+                             order_type="market_order", reduce_only=True,
+                             stop_price=59900.0, stop_order_type="stop_loss_order",
+                             stop_trigger_method="spot_price")
+        await c2._sweep()
+        return await c2.get_positions()
+
+    check("BTC through the stop closes it", run(go2()), [])
+
+
+def test_a_stop_whose_reference_cannot_be_read_waits():
+    """Firing on a price we do not have is the same bug wearing a hat."""
+    print("\n6c. an unreadable trigger reference does not fire the stop")
+    c, _ = build(mark=38.0, spot=60500.0)
+
+    async def go():
+        await c.place_order(symbol=SYM, side="buy", size=10,
+                            order_type="market_order")
+        await c.place_order(symbol=SYM, side="sell", size=10,
+                            order_type="market_order", reduce_only=True,
+                            stop_price=59900.0, stop_order_type="stop_loss_order",
+                            stop_trigger_method="spot_price")
+
+        async def no_spot(_s):          # premium readable, underlying missing
+            return {"mark_price": 38.0, "close": 38.0, "spot_price": None}
+        pc._quote = no_spot
+        await c._sweep()
+        return await c.get_positions()
+
+    check_true("the leg is still held", len(run(go())) == 1)
 
 
 def test_cancel_and_edit_behave_like_the_real_thing():
@@ -378,6 +458,8 @@ if __name__ == "__main__":
               test_reduce_only_is_clamped_and_never_flips,
               test_reduce_only_on_a_flat_leg_is_a_no_op_not_a_crash,
               test_a_stop_rests_as_pending_and_fires_when_crossed,
+              test_an_option_stop_triggers_off_the_underlying_not_the_premium,
+              test_a_stop_whose_reference_cannot_be_read_waits,
               test_cancel_and_edit_behave_like_the_real_thing,
               test_the_balance_is_whatever_the_row_says,
               test_a_paper_account_can_never_be_a_master,
