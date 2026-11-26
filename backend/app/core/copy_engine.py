@@ -14,6 +14,7 @@ from app.core import order_ledger as ledger
 from app.core import ladder
 from app.core import order_history as oh
 from app.services.delta_client import DeltaClient
+from app.services.paper_client import is_paper
 from app.services import telegram_client as tg
 
 logger = logging.getLogger(__name__)
@@ -1353,6 +1354,19 @@ class CopyEngine:
         Keyed on api_key too, so rotating credentials transparently builds a new
         client rather than reusing a stale one."""
         if not master_row:
+            return None
+        # THE SECOND AND LAST PLACE A CLIENT IS BUILT — and here paper is
+        # REFUSED, not branched. A paper master would drive real followers off
+        # invented trades, which is the one thing in this system that could lose
+        # somebody else's money. The API refuses to create one and PaperClient
+        # refuses to be constructed for one; this is the third guard, on the
+        # path that would actually do the damage.
+        if is_paper(master_row):
+            logger.error(
+                "%s is a PAPER account and cannot act as a master — refusing to "
+                "build a client for it. Its followers will not be copied.",
+                master_row.get("name"),
+            )
             return None
         key = (master_row.get("id"), master_row.get("api_key"))
         client = self._master_clients.get(key)

@@ -61,7 +61,7 @@ from app.core.fill_compare import (  # shared primitives — same window, same m
     _iso,
     _num,
 )
-from app.services.delta_client import DeltaClient
+from app.services.client_factory import client_for
 
 logger = logging.getLogger(__name__)
 
@@ -181,11 +181,7 @@ async def fetch_account_orders(acc: dict, start: datetime, end: datetime) -> dic
     an explicit error — "this follower placed nothing" and "we could not read
     this follower" must never look the same.
     """
-    client = DeltaClient(
-        api_key=acc["api_key"],
-        api_secret=acc["api_secret"],
-        environment=acc.get("environment", "demo"),
-    )
+    client = client_for(acc)
     try:
         raw_orders = await client.get_order_history_range(to_us(start), to_us(end))
         orders = [normalise_order(o) for o in raw_orders if o.get("id") is not None]

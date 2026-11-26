@@ -50,7 +50,7 @@ import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from app.services.delta_client import DeltaClient
+from app.services.client_factory import client_for
 
 logger = logging.getLogger(__name__)
 
@@ -210,11 +210,7 @@ async def fetch_account_fills(acc: dict, start: datetime, end: datetime) -> dict
     reporting the second as the first would state that the accounts match when
     nobody actually checked.
     """
-    client = DeltaClient(
-        api_key=acc["api_key"],
-        api_secret=acc["api_secret"],
-        environment=acc.get("environment", "demo"),
-    )
+    client = client_for(acc)
     try:
         raw = await client.get_fills_range(to_us(start), to_us(end))
         return {"groups": group_fills(raw), "raw_count": len(raw), "error": None}

@@ -7,6 +7,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.services.paper_client import is_paper
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,19 @@ _owner_by_id: dict = {}       # account id   -> owner_id
 _owner_of_ts: float = 0.0
 _OWNER_TTL = 60.0
 
+# PAPER ACCOUNTS DO NOT TELEGRAM. A paper follower is a testing instrument and
+# its failures are expected and frequent -- they are the point. Letting them into
+# the desk's group would mix invented problems with real ones in the one channel
+# that has to stay worth reading. Desk call: paper appears in the daily REPORT,
+# where it can be looked at deliberately, and nowhere else.
+#
+# Filled from the same 60s account read the routing already does, so this costs
+# no extra round trip. Both sets start empty, which means nothing is suppressed
+# until the first read -- erring towards saying too much rather than silently
+# swallowing a real alert.
+_paper_names: set = set()
+_paper_ids: set = set()
+
 
 def _routes() -> dict:
     global _routes_cache
@@ -128,9 +142,17 @@ async def _chat_for(account: str | None = None, account_id: str | None = None) -
     try:
         if time.time() - _owner_of_ts > _OWNER_TTL:
             from app.database import db
-            rows = (db.table("accounts").select("id,name,owner_id").execute().data) or []
+            rows = (db.table("accounts")
+                    .select("id,name,owner_id,environment").execute().data) or []
             _owner_of = {r["name"]: str(r.get("owner_id") or "") for r in rows}
             _owner_by_id = {str(r["id"]): str(r.get("owner_id") or "") for r in rows}
+            # Same trip, no extra round trip: which of these are paper.
+            _paper_names.clear()
+            _paper_ids.clear()
+            for r in rows:
+                if is_paper(r):
+                    _paper_names.add(r.get("name"))
+                    _paper_ids.add(str(r.get("id")))
             _owner_of_ts = time.time()
         owner = (_owner_by_id.get(str(account_id)) if account_id
                  else _owner_of.get(account, ""))
@@ -141,11 +163,36 @@ async def _chat_for(account: str | None = None, account_id: str | None = None) -
         return _chat_id()
 
 
+def _is_paper_account(account: str | None, account_id: str | None) -> bool:
+    """Is this message about a paper account?
+
+    Reads the cache the routing lookup already maintains. Never raises, and
+    never refreshes on its own: if the cache has not been filled yet this
+    returns False, so an unknown account is treated as real and its alert is
+    sent. The two failure modes are not symmetrical -- a paper alert that slips
+    into the group is noise, a real alert suppressed by mistake is a position
+    nobody hears about.
+    """
+    try:
+        if account_id is not None and str(account_id) in _paper_ids:
+            return True
+        return account is not None and account in _paper_names
+    except Exception:
+        return False
+
+
 async def send_message(text: str, account: str | None = None,
                        account_id: str | None = None) -> bool:
     """Send a plain-text message to the chat this account belongs to."""
     if not telegram_enabled():
         return False
+    # THE ONE GATE. Every notify_* in this module ends in send_message, so
+    # suppressing paper here covers all of them -- including any added later,
+    # which a per-function check would not.
+    if _is_paper_account(account, account_id):
+        logger.info("paper account %s - alert not sent to Telegram: %s",
+                    account or account_id, text.replace(chr(10), " | ")[:160])
+        return True
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
     async def _post(chat_id):
@@ -459,7 +506,9 @@ async def notify_correction(
     # every "Reconciler corrected" went to the main chat instead of the owner's
     # -- the one alert that reports the engine having got something WRONG,
     # routed away from the desk it happened on. Every other notify_* in this
-    # file passes it. Found 2026-11-26 while auditing the send paths.
+    # file passes it. Found 2026-11-26 while auditing the send paths. It would
+    # also have slipped past the paper gate in send_message, which keys off the
+    # same argument.
     await send_message("\n".join(lines), account=account)
 
 

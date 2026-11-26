@@ -1,12 +1,19 @@
 from datetime import datetime
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AccountEnvironment(str, Enum):
     demo = "demo"
     live = "live"
+    # A FOLLOWER that trades nothing: a name and a balance, no credentials. It
+    # mirrors a real master so the copy path can be exercised against live
+    # master flow with no money at risk. `environment` is the single source of
+    # truth for this -- see app/services/paper_client.is_paper -- because a
+    # separate boolean would have been a second source of truth for one fact,
+    # which is how the two disagree later.
+    paper = "paper"
 
 
 class AccountStatus(str, Enum):
@@ -25,13 +32,23 @@ class AllocationMode(str, Enum):
 
 class AccountCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
-    api_key: str = Field(..., min_length=1)
-    api_secret: str = Field(..., min_length=1)
+    # OPTIONAL ONLY FOR PAPER. A paper account has no credentials to give, so
+    # these cannot be required outright -- but a REAL account saved without
+    # them fails later, at connect time, far from the form that caused it. The
+    # validator below enforces the actual rule: keys unless paper, balance if
+    # paper, and never a paper master.
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
     is_master: bool = Field(default=False)
     environment: AccountEnvironment = Field(default=AccountEnvironment.demo)
     allocation_mode: Optional[AllocationMode] = None
     allocation_value: Optional[float] = Field(default=None, gt=0)
     allocated_balance: Optional[float] = Field(default=None, gt=0)
+    # THE PAPER FORM'S ONE REQUIRED NUMBER. For a demo or live account the
+    # balance is read from the exchange wallet and anything set here is
+    # overwritten within seconds, so it is only meaningful for paper -- where
+    # there is no wallet to read and this IS the wallet.
+    balance: Optional[float] = Field(default=None, gt=0)
     max_position_size: Optional[float] = Field(default=None, gt=0)
     leverage_limit: int = Field(default=10, ge=1, le=200)
     # MASTER accounts only: how far a follower's SL/TP sits from the master's.
@@ -62,6 +79,57 @@ class AccountCreate(BaseModel):
     # its own with no master to mirror — a follower that could never copy
     # anything. Omitted means "mine", which is what a normal user always gets.
     owner_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_credentials_and_balance(self):
+        """What an account needs depends on what KIND of account it is.
+
+        api_key/api_secret cannot be required outright any more, because a paper
+        account has none to give. But a REAL account saved without them does not
+        fail here — it fails much later, at connect time, far from the form that
+        caused it, as "Failed to connect client". So the rule moves here, where
+        it can say which field is missing and why.
+
+        Three rules, in the order they matter:
+
+        1. A PAPER ACCOUNT IS NEVER A MASTER. A fake master would drive real
+           followers off invented trades, which is the one thing in this system
+           that could lose somebody else's money. Refused here, again in
+           PaperClient's constructor, and again in CopyEngine._get_master_client.
+        2. A real account needs its credentials.
+        3. A paper account needs a balance, because the whole point of it is the
+           ratio it produces — and auto_ratio divides by it. A paper follower
+           with no balance would size every copy at zero and look like a bug.
+        """
+        paper = self.environment == AccountEnvironment.paper
+        if paper and self.is_master:
+            raise ValueError(
+                "A paper account cannot be a master — it would drive real "
+                "followers off trades that never happened. Make it a follower "
+                "of a real master instead."
+            )
+        if not paper and not (self.api_key and self.api_secret):
+            raise ValueError(
+                "api_key and api_secret are required for a demo or live "
+                "account. Choose the 'paper' environment for an account that "
+                "trades nothing."
+            )
+        # `balance` SPECIFICALLY, not allocated_balance. PaperClient.get_wallet
+        # reports `balance` -- it is the wallet -- while allocated_balance is a
+        # separate allocation override the sizing code applies on top. Accepting
+        # the override as a substitute would create a paper account whose wallet
+        # reads zero, which sizes every copy at zero and looks exactly like a bug.
+        if paper and not (self.balance or 0):
+            raise ValueError(
+                "A paper account needs a balance — it is what the copy ratio is "
+                "worked out from."
+            )
+        if paper and (self.api_key or self.api_secret):
+            raise ValueError(
+                "A paper account must not carry API credentials — it never "
+                "reaches an exchange, so keys here would only be a liability."
+            )
+        return self
 
 
 class AccountUpdate(BaseModel):
