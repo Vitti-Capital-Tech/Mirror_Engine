@@ -1,5 +1,6 @@
 'use client';
 import React, { useState } from 'react';
+import { followerRungs } from '@/context/AccountScopeContext';
 import {
   usePauseAccount, useResumeAccount, useDeleteAccount,
   useTestAccount, usePromoteAccount,
@@ -283,22 +284,10 @@ export function AccountGroupCard({
   const { master, followers } = group;
   const email = master?.owner_email || followers[0]?.owner_email;
 
-  // THE STOP-LOSS LADDER, mirrored from the backend so the badges tell the
-  // truth. CopyEngine._tp_sl_params gives each follower a rung among its
-  // master's ACTIVE followers, OLDEST FIRST, and the engine places that
-  // follower's SL/TP (rung + 1) offsets beyond the master's -- so they exit in
-  // order behind him instead of sharing a price.
-  //
-  // Two details are load-bearing, and getting either wrong prints a confident
-  // lie next to somebody's live position:
-  //   * paused followers are skipped, and everything behind them moves up.
-  //   * the order is created_at, NOT whatever order the API happened to return
-  //     (groupByMaster preserves the response order and does not sort).
-  const rungs: Record<string, number> = {};
-  [...followers]
-    .filter((f) => f.status === 'active')
-    .sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
-    .forEach((f, i) => { rungs[String(f.id)] = i + 1; });
+  // Which rung of the stop-loss ladder each follower sits on. One shared
+  // implementation (see followerRungs) because the positions page shows the
+  // same badge, and the rule has to keep agreeing with the engine.
+  const rungs = followerRungs(followers);
 
   const full = followers.length >= maxFollowers;
   const paused = master ? master.status !== 'active' : false;

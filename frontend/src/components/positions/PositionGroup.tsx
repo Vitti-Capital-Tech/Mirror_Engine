@@ -1,5 +1,6 @@
 'use client';
 import React, { useState } from 'react';
+import { followerRungs } from '@/context/AccountScopeContext';
 import { ChevronDown, Crown, AlertTriangle } from 'lucide-react';
 import { AccountPositionCard } from './AccountPositionCard';
 import { useAccountLiveView } from '@/hooks/usePositions';
@@ -53,8 +54,11 @@ export const PCOL = {
   today: 'w-[4.75rem] sm:w-[6.75rem] shrink-0 text-right',
 };
 
-function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
+function AccountRow({ acc, legs, missing, isMaster, defaultOpen, rung = null }: {
   acc: any; legs: any[]; missing: string[]; isMaster: boolean; defaultOpen: boolean;
+  // Which rung of the stop-loss ladder this follower sits on, or null for a
+  // master and for a paused follower (which holds no rung -- see followerRungs).
+  rung?: number | null;
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
@@ -130,7 +134,12 @@ function AccountRow({ acc, legs, missing, isMaster, defaultOpen }: {
               name read as something that fell off another element. */}
           {isMaster
             ? <span className="shrink-0 inline-flex items-center rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-amber-300/90">Master</span>
-            : <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">Follower</span>}
+            : <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted"
+                title={rung
+                  ? `Follower ${rung} — its stop-loss and take-profit sit ${rung}x the master's SL/TP offset beyond his, so it exits after him and after any follower ahead of it.`
+                  : 'Paused — it holds no place in the stop-loss ladder while it is not running.'}>
+                Follower{rung ? ` ${rung}` : ''}
+              </span>}
         </span>
 
         {/* What it is holding, without expanding anything. */}
@@ -210,6 +219,9 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const { master, followers } = group;
+  // Same ladder the accounts page shows, from the same helper, so the two
+  // screens can never disagree about which follower is which.
+  const rungs = followerRungs(followers);
   const email = master?.owner_email || followers[0]?.owner_email;
 
   const legsOf = (id: string) => positions.filter((p) => String(p.account_id) === String(id));
@@ -301,7 +313,7 @@ export function PositionGroup({ group, positions, showOwner = false, defaultOpen
             )}
           {followers.map((f) => (
             <AccountRow key={f.id} acc={f} legs={legsOf(f.id)} missing={missingFor(f)}
-              isMaster={false} defaultOpen />
+              isMaster={false} defaultOpen rung={rungs[String(f.id)] ?? null} />
           ))}
           {followers.length === 0 && master && (
             <div className="px-5 py-3 border-t border-bg-border text-[11.5px] text-text-muted">
