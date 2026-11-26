@@ -150,7 +150,7 @@ export function EditAccountModal({ account, onClose }: { account: any; onClose: 
 
           <div className="flex gap-3 pt-2">
             <button type="button" onClick={onClose} disabled={saving}
-              className="flex-1 py-2 bg-bg-secondary hover:bg-bg-border/60 text-text-primary rounded-lg border border-bg-border transition-all font-semibold">
+              className="flex-1 py-2 bg-bg-secondary hover:bg-bg-elevated text-text-primary rounded-lg border border-bg-border transition-all font-semibold">
               Cancel
             </button>
             <button type="submit" disabled={saving}

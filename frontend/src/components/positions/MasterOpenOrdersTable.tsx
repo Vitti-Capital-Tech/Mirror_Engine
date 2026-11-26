@@ -53,7 +53,7 @@ export function MasterOpenOrdersTable({ orders = [], isLoading }: { orders?: Ope
                 <th className="text-right py-3 pr-2">Created At</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-bg-border/50 font-medium">
+            <tbody className="divide-y divide-bg-border font-medium">
               {orders.map((order) => {
                 const isBuy = order.side?.toLowerCase() === 'buy';
                 const dateStr = order.created_at 

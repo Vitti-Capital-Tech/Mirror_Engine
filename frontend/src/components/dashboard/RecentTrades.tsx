@@ -72,7 +72,7 @@ export function RecentTrades({ trades = [], isLoading }: { trades?: any[]; isLoa
                 <th className="text-center py-2.5">Status</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-bg-border/50 font-medium">
+            <tbody className="divide-y divide-bg-border font-medium">
               {recent.map((trade) => {
                 const date = new Date(trade.created_at);
                 const timeStr = date.toLocaleString();

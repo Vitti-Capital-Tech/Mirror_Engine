@@ -1,5 +1,6 @@
 'use client';
 import React, { useState } from 'react';
+import { followerRungs } from '@/context/AccountScopeContext';
 import {
   usePauseAccount, useResumeAccount, useDeleteAccount,
   useTestAccount, usePromoteAccount,
@@ -282,6 +283,12 @@ export function AccountGroupCard({
 
   const { master, followers } = group;
   const email = master?.owner_email || followers[0]?.owner_email;
+
+  // Which rung of the stop-loss ladder each follower sits on. One shared
+  // implementation (see followerRungs) because the positions page shows the
+  // same badge, and the rule has to keep agreeing with the engine.
+  const rungs = followerRungs(followers);
+
   const full = followers.length >= maxFollowers;
   const paused = master ? master.status !== 'active' : false;
 
@@ -393,10 +400,21 @@ export function AccountGroupCard({
             </div>
           ) : (
             <>
-              <div className="divide-y divide-bg-border/70">
+              <div className="divide-y divide-bg-border">
                 {followers.map((f, i) => {
                   const last = i === followers.length - 1;
                   const off = f.status !== 'active';
+                  // WHICH RUNG THIS FOLLOWER'S STOPS SIT ON. The engine places
+                  // follower 1 at one SL/TP offset beyond the master, follower 2
+                  // at two, and so on, so they stop out in order behind him
+                  // rather than all on the same price.
+                  //
+                  // Worked out EXACTLY as CopyEngine._tp_sl_params does, or the
+                  // badge would be a confident lie: active followers only,
+                  // oldest first. A paused follower holds no rung at all -- the
+                  // engine skips it and everything behind it moves up -- so it
+                  // gets no number rather than a wrong one.
+                  const rung = off ? null : (rungs[String(f.id)] ?? null);
                   return (
                     <div key={f.id}
                       className={`flex items-stretch gap-3 px-4 sm:px-5 hover:bg-bg-secondary transition-colors ${
@@ -411,8 +429,11 @@ export function AccountGroupCard({
                       <div className="min-w-0 flex-1 py-3">
                         <div className="flex items-center gap-2">
                           <span className="text-[13px] font-semibold text-text-primary truncate">{f.name}</span>
-                          <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">
-                            Follower
+                          <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted"
+                            title={rung
+                              ? `Follower ${rung} — its stop-loss and take-profit sit ${rung}x the master's SL/TP offset beyond his, so it exits after him and after any follower ahead of it.`
+                              : 'Paused — it holds no place in the stop-loss ladder while it is not running.'}>
+                            Follower{rung ? ` ${rung}` : ''}
                           </span>
                           <RunState acc={f} />
                           <TestnetTag acc={f} />

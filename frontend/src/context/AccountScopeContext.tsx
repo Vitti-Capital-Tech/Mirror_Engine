@@ -143,6 +143,42 @@ export interface AccountGroup<T> {
  * Followers with no master yet are collected under an owner-level key so they
  * remain visible and obviously unassigned, rather than disappearing.
  */
+/**
+ * Which rung of the stop-loss ladder each follower sits on.
+ *
+ * The engine places follower 1's SL/TP one offset beyond its master's,
+ * follower 2's two offsets beyond, and so on, so they exit in order behind him
+ * instead of all on the same price. This is the UI's copy of that rule, and it
+ * must match CopyEngine._tp_sl_params exactly -- a rung shown next to somebody's
+ * live position is a statement about where their money comes off the table, so
+ * a plausible-looking wrong number is worse than none.
+ *
+ * Two details are load-bearing:
+ *
+ *   * ACTIVE followers only. The engine skips a paused one, and everything
+ *     behind it moves up. A paused follower therefore has NO rung, and callers
+ *     should show it as a plain follower rather than invent a number for it.
+ *   * ordered by created_at, NOT by the order the array happens to be in.
+ *     groupByMaster preserves the API's response order and does not sort, so
+ *     using the index would print the right numbers against the wrong names
+ *     whenever the rows came back differently.
+ *
+ * Lives here, beside groupByMaster, because two pages need it -- the accounts
+ * list and the positions page -- and two copies of a rule that has to agree
+ * with the backend is one copy too many.
+ */
+export function followerRungs<T extends { id: string; status?: string; created_at?: string }>(
+  followers: T[],
+): Record<string, number> {
+  const rungs: Record<string, number> = {};
+  [...followers]
+    .filter((f) => f.status === 'active')
+    .sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
+    .forEach((f, i) => { rungs[String(f.id)] = i + 1; });
+  return rungs;
+}
+
+
 export function groupByMaster<T extends { id: string; name?: string; is_master?: boolean; master_id?: string | null; owner_id?: string | null }>(
   accounts: T[],
 ): AccountGroup<T>[] {
