@@ -129,7 +129,13 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   const [name, setName] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
-  const [environment, setEnvironment] = useState<'demo' | 'live'>('live');
+  const [environment, setEnvironment] = useState<'demo' | 'live' | 'paper'>('live');
+  // A PAPER account has no credentials and no exchange. It mirrors a real
+  // master so the copy path can be watched against live master flow with
+  // nothing at risk, so what it needs is the opposite of what a real account
+  // needs: a balance (the ratio is worked out from it) and no keys at all.
+  const [paperBalance, setPaperBalance] = useState('');
+  const isPaper = environment === 'paper';
   const [showKey, setShowKey] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
 
@@ -192,7 +198,21 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
     if (!isMaster && followerLimitReached) return setError(`That master already has ${MAX_FOLLOWERS} followers.`);
     if (isMaster && masterLimitReached) return setError(`You already have ${MAX_MASTERS} master accounts.`);
 
-    const payload: any = { name, api_key: apiKey, api_secret: apiSecret, is_master: isMaster, environment };
+    if (isPaper && !(parseFloat(paperBalance) > 0)) {
+      return setError('Give the paper account a starting balance — the copy sizes are worked out from it.');
+    }
+
+    // KEYS OR BALANCE, NEVER BOTH. The backend refuses a paper account that
+    // carries credentials (it never reaches an exchange, so keys on it would
+    // only be a liability) and refuses a real one without them. Sending the
+    // empty strings this form holds would trip the first of those.
+    const payload: any = { name, is_master: isMaster, environment };
+    if (isPaper) {
+      payload.balance = parseFloat(paperBalance);
+    } else {
+      payload.api_key = apiKey;
+      payload.api_secret = apiSecret;
+    }
     if (isAdmin && ownerId) payload.owner_id = ownerId;
     if (!isMaster) {
       payload.master_id = effMasterId;
@@ -224,7 +244,9 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
     setError('');
     // Reached by pressing the greyed-out Add button, or by Enter. Say what is
     // missing rather than silently doing nothing.
-    if (!verified) {
+    // A paper account has no credentials, so there is nothing to verify and
+    // the check that guards a real account would block it forever.
+    if (!isPaper && !verified) {
       toast.error(
         canVerify
           ? 'Verify the keys first — press Verify keys above.'
@@ -237,6 +259,10 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
   const mode = COPY_MODES.find((m) => m.id === copyMode)!;
   const checking = verifyState === 'checking';
   const canVerify = !!apiKey.trim() && !!apiSecret.trim() && !checking;
+  // What "ready to save" means depends on the kind of account: a real one has
+  // to have had its credentials answered by Delta, a paper one has no
+  // credentials and needs the balance its copy sizes come from.
+  const ready = isPaper ? parseFloat(paperBalance) > 0 : verified;
 
   return (
     <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/70 backdrop-blur-sm overflow-y-auto p-4">
@@ -342,20 +368,49 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                 of this block has to be the last thing in it. */}
             <div className="flex flex-col gap-1.5">
               <label className={LABEL}>Environment</label>
-              <div className="grid grid-cols-2 gap-2">
-                {(['live', 'demo'] as const).map((env) => (
-                  <button key={env} type="button" onClick={() => { setEnvironment(env); unverify(); }}
+              <div className={`grid gap-2 ${isMaster ? 'grid-cols-2' : 'grid-cols-3'}`}>
+                {(isMaster ? ['live', 'demo'] : ['live', 'demo', 'paper']).map((env) => (
+                  <button key={env} type="button" onClick={() => { setEnvironment(env as any); unverify(); }}
                     className={`py-2 rounded-lg border text-[12px] font-semibold transition-colors ${
                       environment === env
                         ? 'border-blue-500/60 bg-blue-500/10 text-text-primary'
                         : 'border-bg-border text-text-muted hover:text-text-secondary'}`}>
-                    {env === 'live' ? 'Live' : 'Demo (testnet)'}
+                    {env === 'live' ? 'Live' : env === 'demo' ? 'Demo (testnet)' : 'Paper'}
                   </button>
                 ))}
               </div>
+              {/* PAPER IS NOT OFFERED FOR A MASTER, and the backend refuses it
+                  in four places besides this one. A fake master would drive
+                  REAL followers off trades that never happened. */}
+              {isPaper && (
+                <p className="text-[11px] text-text-muted mt-1">
+                  Trades nothing. It mirrors its master and fills at the real market price,
+                  so you can watch the copying without risking anything. It never reaches an
+                  exchange and never sends Telegram alerts.
+                </p>
+              )}
             </div>
 
-            {[
+            {/* A paper account is asked for the one number it needs instead of
+                for credentials it cannot have. The backend REJECTS a paper
+                account that carries keys, so these must not merely be
+                ignored — they must not be filled in. */}
+            {isPaper && (
+              <div className="flex flex-col gap-1.5">
+                <label className={LABEL}>Starting balance (USD)</label>
+                <input required type="number" min="1" step="any" value={paperBalance}
+                  onChange={(e) => setPaperBalance(e.target.value)}
+                  placeholder="e.g. 5000" className={`${INPUT} font-mono`} />
+                <p className="text-[11px] text-text-muted">
+                  What this account is treated as holding. Copy sizes come from the ratio
+                  between this and the master&apos;s balance, so it decides how big the copies
+                  are. It does not move with profit or loss — change it here to test a
+                  different ratio.
+                </p>
+              </div>
+            )}
+
+            {!isPaper && [
               { label: 'API key', v: apiKey, set: setApiKey, show: showKey, toggle: () => setShowKey((x) => !x) },
               { label: 'API secret', v: apiSecret, set: setApiSecret, show: showSecret, toggle: () => setShowSecret((x) => !x) },
             ].map((f) => (
@@ -378,7 +433,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                 button. Its result stays here as one quiet line — a filled
                 green panel on a form that has saved nothing reads as "this
                 account is live", which it is not. */}
-            <div className="flex items-center gap-3 flex-wrap">
+            {!isPaper && <div className="flex items-center gap-3 flex-wrap">
               <button type="button" onClick={runVerify} disabled={!canVerify || verified}
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[12px] font-semibold transition-colors ${
                   verified
@@ -402,7 +457,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                   <span>{verifyMsg}</span>
                 </span>
               )}
-            </div>
+            </div>}
           </div>
 
           {/* How much to copy (copies only) */}
@@ -488,19 +543,21 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                   disabled element: a disabled button fires no click at all, so
                   pressing it would do nothing and explain nothing. It stays
                   live, refuses the submit, and says why. */}
-              <button type="submit" disabled={saving} aria-disabled={!verified}
-                title={!verified ? 'Verify the keys first' : undefined}
+              <button type="submit" disabled={saving} aria-disabled={!ready}
+                title={!ready ? (isPaper ? 'Enter a starting balance' : 'Verify the keys first') : undefined}
                 className={`flex-1 py-2.5 rounded-lg text-[13px] font-semibold transition-colors inline-flex items-center justify-center gap-2 ${
-                  verified
+                  ready
                     ? 'bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-60'
                     : 'bg-bg-primary border border-bg-border text-text-muted hover:text-text-secondary cursor-not-allowed'}`}>
                 {saving && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
                 {isMaster ? 'Add master' : 'Add follower'}
               </button>
             </div>
-            {!verified && (
+            {!ready && (
               <p className={`${HINT} text-center`}>
-                Verify the keys above to enable this.
+                {isPaper
+                  ? 'Enter a starting balance to enable this.'
+                  : 'Verify the keys above to enable this.'}
               </p>
             )}
           </div>
