@@ -83,6 +83,17 @@ _TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
 _marks: dict = {}                    # symbol -> (price, fetched_at)
 _MARK_TTL = 2.0
 
+# Public, unauthenticated, and ONE product at a time (~0.5s) rather than the
+# whole catalogue: /v2/products with a large page_size does not return inside
+# 25s, which would be a guaranteed timeout in the follower loop.
+_PRODUCT_URL = "https://api.india.delta.exchange/v2/products/{product_id}"
+
+# product_id -> symbol, cached for the life of the process and never expired.
+# A product id at Delta is immutable: 167088 is C-XAUT-3480-281126 today and
+# forever. So the ONLY cost is the first bracket on a contract nobody has
+# touched yet, and every later one is a dict lookup with no network at all.
+_symbols: dict = {}
+
 
 PAPER_ENV = "paper"
 
@@ -145,6 +156,39 @@ async def _mark(symbol: str) -> Optional[float]:
         logger.debug("paper: mark read failed for %s: %s", symbol, e)
     # Stale is better than nothing, and nothing is better than a guess.
     return hit[0] if hit else None
+
+
+async def _symbol_for(product_id) -> Optional[str]:
+    """The contract symbol for a Delta product id, or None.
+
+    WHY THIS EXISTS. The engine attaches protection by product_id -- that is
+    what Delta's bracket endpoint takes -- while a paper book is keyed by
+    symbol, because that is what a position means here. Something has to
+    translate, and it has to be THIS side: the alternative was to make the
+    engine pass a symbol it does not otherwise need, which edits the live
+    copy path to accommodate a fake account. A real follower's order must
+    never route through code that exists for paper's benefit.
+
+    None is a real answer. The caller treats it as a failed placement and says
+    so, rather than guessing at a symbol and attaching a stop to the wrong leg.
+    """
+    key = str(product_id)
+    if key in _symbols:
+        return _symbols[key]
+    try:
+        async with httpx.AsyncClient(timeout=MARK_TIMEOUT_SEC) as c:
+            r = await c.get(_PRODUCT_URL.format(product_id=key))
+        if r.status_code != 200:
+            logger.warning("paper: product %s lookup returned %s", key, r.status_code)
+            return None
+        sym = ((r.json() or {}).get("result") or {}).get("symbol")
+        if sym:
+            _symbols[key] = sym
+            return sym
+        logger.warning("paper: product %s has no symbol in the response", key)
+    except Exception as e:
+        logger.warning("paper: product %s lookup failed: %s", key, e)
+    return None
 
 
 class PaperClient:
@@ -447,8 +491,24 @@ class PaperClient:
         return {"result": self._row(o), **self._row(o)}
 
     async def edit_order(self, order_id: str, product_id: Optional[int] = None,
+                         stop_price: Optional[float] = None,
                          limit_price: Optional[float] = None,
-                         size: Optional[int] = None, **_kw) -> dict:
+                         stop_trigger_method: Optional[str] = None,
+                         size: Optional[int] = None) -> dict:
+        """Edit a resting order's price, trigger and/or size. Delta's signature.
+
+        `stop_price` AND `stop_trigger_method` USED TO FALL INTO **_kw and be
+        thrown away. That is how the engine moves a follower's stop when the
+        master moves his, so a master who dragged his SL had the edit accepted,
+        logged as "Updated bracket ... @ <new price>", and applied to nothing.
+        The paper book kept the old trigger while the log said otherwise --
+        worse than the outright crash next door in place_bracket, because
+        nothing anywhere said it had not worked.
+
+        No **kwargs here any more, deliberately. An argument this client cannot
+        honour should fail at the call, where it is obvious, instead of being
+        swallowed into a silent no-op.
+        """
         o = self._fetch(order_id)
         if not o:
             raise RuntimeError(f"paper: no such order {order_id}")
@@ -457,6 +517,10 @@ class PaperClient:
         upd = dict(o, updated_at=_now_iso())
         if limit_price is not None:
             upd["limit_price"] = str(limit_price)
+        if stop_price is not None:
+            upd["stop_price"] = str(stop_price)
+        if stop_trigger_method is not None:
+            upd["stop_trigger_method"] = stop_trigger_method
         if size is not None:
             # Match the venue: resizing resets what is left to fill.
             upd["size"] = abs(float(size))
@@ -465,32 +529,79 @@ class PaperClient:
         await self._emit_order(self._row(upd))
         return {"result": self._row(upd), **self._row(upd)}
 
-    async def place_bracket(self, symbol: str, product_id: Optional[int] = None,
-                            stop_loss_price: Optional[float] = None,
-                            take_profit_price: Optional[float] = None,
-                            size: Optional[int] = None,
-                            stop_trigger_method: Optional[str] = None,
-                            **_kw) -> dict:
-        """Attach SL/TP to the held position, as two pending reduce-only stops."""
+    async def place_bracket(
+        self,
+        product_id: int,
+        stop_loss: Optional[dict] = None,
+        take_profit: Optional[dict] = None,
+        trigger_method: str = "mark_price",
+    ) -> dict:
+        """Attach SL/TP to the held position, as pending reduce-only stops.
+
+        THIS SIGNATURE IS NOT A CHOICE. It is DeltaClient.place_bracket's, down
+        to the parameter names, because the engine calls both through the same
+        line and names every argument. The first version of this method invented
+        its own shape -- `symbol`, `stop_loss_price`, `take_profit_price` -- and
+        the engine's call did not match it, so every paper bracket died on
+
+            place_bracket() missing 1 required positional argument: 'symbol'
+
+        for a whole session. Mini 1 and Mini 2 carried open positions with no
+        protection at all while the log said a stop had been requested. The
+        failure was caught by the per-follower guard, which is why the real
+        followers beside them were untouched -- but a paper account that silently
+        has no stops is worthless as a test instrument, because the one thing it
+        is there to prove is that the engine asked for the right protection.
+
+        A leg is Delta's dict: {"order_type", "stop_price", optional
+        "limit_price"}. The return is Delta's shape too -- a dict KEYED BY LEG
+        TYPE, not a list -- because the caller reads
+        result["stop_loss_order"]["id"] to map the follower's order back to the
+        master's. A list there would have left the id unrecorded even once the
+        signature was right, and a later cancel or edit from the master would
+        not have found this order.
+        """
+        symbol = await _symbol_for(product_id)
+        if not symbol:
+            # Loud, not silent. The engine logs this as a failed placement and
+            # alerts; a quiet success would claim protection that is not there.
+            raise RuntimeError(
+                f"paper: cannot resolve product {product_id} to a symbol — bracket not placed")
         held, _ = self._held(symbol)
-        qty = abs(float(size if size is not None else held))
+        qty = abs(float(held))
         if qty <= 0:
-            return {"result": [], "success": True}
+            return {"result": {}, "success": True}
+        # Protection closes the position, so it sits on the opposite side.
         side = "sell" if held > 0 else "buy"
-        out = []
-        for px, kind in ((stop_loss_price, "stop_loss_order"),
-                         (take_profit_price, "take_profit_order")):
+        out: dict = {}
+        for leg, kind in ((stop_loss, "stop_loss_order"),
+                          (take_profit, "take_profit_order")):
+            if not leg:
+                continue
+            px = leg.get("stop_price")
             if px is None:
                 continue
+            lim = leg.get("limit_price")
             r = await self.place_order(
-                symbol=symbol, side=side, size=int(qty), order_type="market_order",
+                symbol=symbol, side=side, size=int(qty),
+                order_type=leg.get("order_type") or "market_order",
+                limit_price=float(lim) if lim is not None else None,
                 reduce_only=True, stop_price=float(px), stop_order_type=kind,
-                stop_trigger_method=stop_trigger_method)
-            out.append(r.get("result") or r)
+                stop_trigger_method=trigger_method)
+            out[kind] = r.get("result") or r
         return {"result": out, "success": True}
 
-    async def edit_bracket_order(self, *a, **k) -> dict:
-        return {"result": [], "success": True}
+    async def edit_bracket_order(self, order_id: str,
+                                 sl_price: Optional[float] = None,
+                                 tp_price: Optional[float] = None) -> dict:
+        """Move an existing bracket leg's trigger.
+
+        Delta's signature. Nothing calls this on either client today, but a
+        stub that took `*a, **k` and returned success was a lie waiting for the
+        first caller: it would have reported a moved stop that never moved.
+        """
+        return await self.edit_order(
+            order_id, stop_price=(sl_price if sl_price is not None else tp_price))
 
     async def get_order(self, order_id: str) -> dict:
         o = self._fetch(order_id)
@@ -523,14 +634,25 @@ class PaperClient:
         return self._history(page_size)
 
     async def get_order_history_range(self, start_time_us: int, end_time_us: int,
-                                      page_size: int = 200, **_kw) -> list:
+                                      page_size: int = 200,
+                                      max_pages: int = 25) -> list:
+        """Every order in a window. Delta's signature, including `max_pages`.
+
+        `max_pages` USED TO FALL INTO **_kw, and the limit here was `page_size`
+        alone -- one page, 200 orders, where the caller had asked for up to 25
+        pages of them. The daily report reads exactly this range, so a busy
+        paper day would have been silently truncated and every order past the
+        200th read as never placed. There is no paging to do against a table,
+        so the ceiling the caller asked for is simply applied in one go.
+        """
         lo = datetime.fromtimestamp(start_time_us / 1_000_000, timezone.utc).isoformat()
         hi = datetime.fromtimestamp(end_time_us / 1_000_000, timezone.utc).isoformat()
+        cap = max(1, int(page_size)) * max(1, int(max_pages))
         try:
             rows = (self._orders().select("*")
                     .eq("account_id", self.account_id)
                     .gte("created_at", lo).lte("created_at", hi)
-                    .order("created_at").limit(page_size).execute().data) or []
+                    .order("created_at").limit(cap).execute().data) or []
         except Exception as e:
             logger.warning("paper: history range read failed for %s: %s", self.name, e)
             return []
@@ -540,8 +662,9 @@ class PaperClient:
         return [o for o in self._history(page_size) if o.get("reason") == "fill"]
 
     async def get_fills_range(self, start_time_us: int, end_time_us: int,
-                              page_size: int = 200, **_kw) -> list:
-        rows = await self.get_order_history_range(start_time_us, end_time_us, page_size)
+                              page_size: int = 200, max_pages: int = 25) -> list:
+        rows = await self.get_order_history_range(
+            start_time_us, end_time_us, page_size, max_pages)
         return [o for o in rows if o.get("reason") == "fill"]
 
     # ----------------------------------------------------------------- money

@@ -316,17 +316,34 @@ def test_it_never_invents_a_price():
     check("and no position invented", run(c.get_positions()), [])
 
 
-def test_the_one_remote_call_is_bounded():
+def test_every_remote_call_is_bounded():
     """Rule 1. A paper follower sits in the same follower loop, under the same
-    leg lock, as the real ones."""
-    print("\n11. the mark fetch cannot hang a real follower")
+    leg lock, as the real ones, so an unbounded wait here delays a REAL
+    follower's copy.
+
+    This used to assert there was exactly ONE remote call. That counted the
+    wrong thing: when a second one was added (the product_id -> symbol lookup
+    a bracket needs) the check went red on a change that was perfectly safe,
+    which teaches you to edit the number and move on -- and the day the number
+    is bumped past something genuinely unbounded, nothing says so.
+
+    What actually matters is that EVERY remote call carries the timeout. So
+    that is what is counted: one `timeout=MARK_TIMEOUT_SEC` per client opened.
+    A new fetch without the bound fails this; a new fetch with it does not.
+    """
+    print("\n11. no remote call can hang a real follower")
     src = inspect.getsource(pc)
-    check_true("the ticker fetch has a timeout",
-               "timeout=MARK_TIMEOUT_SEC" in src, True)
+    clients = src.count("httpx.AsyncClient(")
+    bounded = src.count("timeout=MARK_TIMEOUT_SEC")
+    check_true("there is at least one remote call to bound", clients >= 1, clients)
+    check_true("every remote call carries the timeout (%d client(s), %d bounded)"
+               % (clients, bounded), clients == bounded, (clients, bounded))
     check_true("well under the live leg-lock wait",
                pc.MARK_TIMEOUT_SEC < 30.0, pc.MARK_TIMEOUT_SEC)
-    check_true("and nothing else in the class is remote",
-               src.count("httpx.AsyncClient(") == 1, src.count("httpx.AsyncClient("))
+    # The product lookup is cached for the life of the process -- ids at Delta
+    # are immutable -- so it is paid once per contract, not once per bracket.
+    check_true("the product lookup is cached, not repeated per call",
+               "_symbols[key] = sym" in src and "if key in _symbols:" in src)
 
 
 def test_every_local_call_answers_immediately():
@@ -365,7 +382,7 @@ if __name__ == "__main__":
               test_the_balance_is_whatever_the_row_says,
               test_a_paper_account_can_never_be_a_master,
               test_it_never_invents_a_price,
-              test_the_one_remote_call_is_bounded,
+              test_every_remote_call_is_bounded,
               test_every_local_call_answers_immediately,
               test_paper_order_ids_cannot_collide_with_real_ones):
         t()
