@@ -270,7 +270,7 @@ export function AddAccountModal({ isOpen, onClose, presetMasterId }: {
                   className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors ${
                     isMaster === v
                       ? 'border-blue-500/60 bg-blue-500/10'
-                      : 'border-bg-border hover:border-bg-border/80 bg-bg-primary/40'}`}>
+                      : 'border-bg-border hover:border-text-muted bg-bg-primary/40'}`}>
                   <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${isMaster === v ? 'text-blue-400' : 'text-text-muted'}`} />
                   <span className="min-w-0">
                     <span className="block text-[12.5px] font-semibold text-text-primary">{t}</span>

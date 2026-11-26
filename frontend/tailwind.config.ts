@@ -32,6 +32,24 @@ const config: Config = {
           muted: 'var(--text-muted)',
         }
       },
+      // THE DEFAULT BORDER COLOUR, or Tailwind's preflight uses its own
+      // #e5e7eb — a near-white grey that is invisible on a light theme and
+      // glaring on a dark one.
+      //
+      // That is not hypothetical. `divide-bg-border/70` generated NO rule at
+      // all (the colours here are raw `var()` strings, which Tailwind v3
+      // cannot apply an opacity modifier to), so `divide-y` set only the
+      // border WIDTH and the colour fell through to #e5e7eb. The result was a
+      // bright white line between two follower rows on an otherwise dark
+      // page — visible in the UI on 2026-11-26, and present in six other
+      // places written the same way.
+      //
+      // The broken classes are fixed at their call sites. This is the net
+      // underneath them: any border whose colour is missing for any reason
+      // now lands on the theme's own border instead of on white.
+      borderColor: {
+        DEFAULT: 'var(--bg-border)',
+      },
       animation: {
         'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
         'slide-in': 'slideIn 0.3s ease-out',

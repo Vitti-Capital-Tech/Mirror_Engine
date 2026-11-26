@@ -282,6 +282,24 @@ export function AccountGroupCard({
 
   const { master, followers } = group;
   const email = master?.owner_email || followers[0]?.owner_email;
+
+  // THE STOP-LOSS LADDER, mirrored from the backend so the badges tell the
+  // truth. CopyEngine._tp_sl_params gives each follower a rung among its
+  // master's ACTIVE followers, OLDEST FIRST, and the engine places that
+  // follower's SL/TP (rung + 1) offsets beyond the master's -- so they exit in
+  // order behind him instead of sharing a price.
+  //
+  // Two details are load-bearing, and getting either wrong prints a confident
+  // lie next to somebody's live position:
+  //   * paused followers are skipped, and everything behind them moves up.
+  //   * the order is created_at, NOT whatever order the API happened to return
+  //     (groupByMaster preserves the response order and does not sort).
+  const rungs: Record<string, number> = {};
+  [...followers]
+    .filter((f) => f.status === 'active')
+    .sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
+    .forEach((f, i) => { rungs[String(f.id)] = i + 1; });
+
   const full = followers.length >= maxFollowers;
   const paused = master ? master.status !== 'active' : false;
 
@@ -393,10 +411,21 @@ export function AccountGroupCard({
             </div>
           ) : (
             <>
-              <div className="divide-y divide-bg-border/70">
+              <div className="divide-y divide-bg-border">
                 {followers.map((f, i) => {
                   const last = i === followers.length - 1;
                   const off = f.status !== 'active';
+                  // WHICH RUNG THIS FOLLOWER'S STOPS SIT ON. The engine places
+                  // follower 1 at one SL/TP offset beyond the master, follower 2
+                  // at two, and so on, so they stop out in order behind him
+                  // rather than all on the same price.
+                  //
+                  // Worked out EXACTLY as CopyEngine._tp_sl_params does, or the
+                  // badge would be a confident lie: active followers only,
+                  // oldest first. A paused follower holds no rung at all -- the
+                  // engine skips it and everything behind it moves up -- so it
+                  // gets no number rather than a wrong one.
+                  const rung = off ? null : (rungs[String(f.id)] ?? null);
                   return (
                     <div key={f.id}
                       className={`flex items-stretch gap-3 px-4 sm:px-5 hover:bg-bg-secondary transition-colors ${
@@ -411,8 +440,11 @@ export function AccountGroupCard({
                       <div className="min-w-0 flex-1 py-3">
                         <div className="flex items-center gap-2">
                           <span className="text-[13px] font-semibold text-text-primary truncate">{f.name}</span>
-                          <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted">
-                            Follower
+                          <span className="shrink-0 inline-flex items-center rounded border border-bg-border bg-bg-primary/60 px-1.5 py-px text-[9px] font-bold uppercase tracking-wider text-text-muted"
+                            title={rung
+                              ? `Follower ${rung} — its stop-loss and take-profit sit ${rung}x the master's SL/TP offset beyond his, so it exits after him and after any follower ahead of it.`
+                              : 'Paused — it holds no place in the stop-loss ladder while it is not running.'}>
+                            Follower{rung ? ` ${rung}` : ''}
                           </span>
                           <RunState acc={f} />
                           <TestnetTag acc={f} />

@@ -258,17 +258,28 @@ export default function GuidePage() {
 
       <Section id="stops" n={next()}>
         <p>
-          Your followers get your stop-loss and take-profit, but placed <B>50 points further away</B> than
-          yours. So <B>you always exit first</B>, and the followers exit just after you.
+          Your followers get your stop-loss and take-profit, but placed <B>further away</B> than yours —
+          and each follower sits a step further out than the one before. So <B>you always exit first</B>,
+          then follower 1, then follower 2.
         </p>
-        <Table head={['You set', 'Follower gets', 'Why']} rows={[
-          ['Take-profit 61,850 (above price)', <><B>61,900</B> — 50 higher</>, 'Triggers when price rises — the follower’s is reached after yours'],
-          ['Stop-loss 60,000 (below price)', <><B>59,950</B> — 50 lower</>, 'Triggers when price falls — the follower’s is reached after yours'],
+        <p className="mt-2">
+          The step is your <B>SL/TP offset</B> (50 by default). Follower 1 is one step beyond you,
+          follower 2 is two steps. They are never on the same price as each other, because identical
+          stops all fire in the same instant and each one makes the others’ fill worse.
+        </p>
+        <Table head={['You set', 'Follower 1 gets', 'Follower 2 gets']} rows={[
+          ['Take-profit 61,850 (above price)', <><B>61,900</B> — 50 higher</>, <><B>61,950</B> — 100 higher</>],
+          ['Stop-loss 60,000 (below price)', <><B>59,950</B> — 50 lower</>, <><B>59,900</B> — 100 lower</>],
         ]} />
         <Points>
-          <P>If you <B>move</B> your stop, the followers’ stops move with it and stay 50 behind.</P>
-          <P><B>On a stop-loss</B>, the follower loses slightly more than you — its stop is 50 points further.</P>
-          <P><B>On a take-profit</B>, price must go 50 points past your target for the follower to exit. If price touches your target and turns back, <B>you exit and the follower may not.</B></P>
+          <P>If you <B>move</B> your stop, the followers’ stops move with it and keep their spacing.</P>
+          <P><B>On a stop-loss</B>, each follower loses slightly more than the one ahead of it.</P>
+          <P><B>On a take-profit</B>, price must go past your target for a follower to exit — one step for
+            follower 1, two for follower 2. If price touches your target and turns back, <B>you exit and
+            the followers may not.</B></P>
+          <P>A <B>smaller offset</B> keeps them closer behind you, so they are likelier to be filled. A
+            larger one spreads them further apart. Change it on the master account.</P>
+          <P>A <B>paused</B> follower holds no place in the queue — the ones behind it move up.</P>
         </Points>
         <h3 className="pt-1 text-[13px] font-bold text-text-primary">The two situations you’ll see</h3>
         <Table head={['', 'Your stop hits, follower still in', 'Follower’s stop hits, you still in']} rows={[

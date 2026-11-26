@@ -46,7 +46,7 @@ export function PositionsTable({ positions = [], isLoading }: { positions?: any[
                 <th className="py-3 text-right pr-2">Last Synced</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-bg-border/50 font-medium">
+            <tbody className="divide-y divide-bg-border font-medium">
               {positions.map((pos) => {
                 const isOutOfSync = pos.sync_status === 'out_of_sync';
                 const pnl = Number(pos.unrealized_pnl || 0);
