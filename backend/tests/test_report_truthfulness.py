@@ -281,6 +281,84 @@ def test_a_linked_order_on_a_skipped_leg_is_still_graded():
                l["verdict"] in oc.MISMATCH_VERDICTS, l["verdict"])
 
 
+def test_a_follower_added_today_is_not_blamed_for_yesterday():
+    """THE 2026-11-26 CASE. A follower cannot have copied an order placed
+    before it existed, and saying it is missing one is an accusation about a
+    period it was not present for.
+
+    Dhwani2 was added mid-afternoon and the day's report graded it against
+    every master order back to 18:55 the previous evening: 36 "missing" legs,
+    taking that desk from clean to 39%. Two paper followers added at 15:36 the
+    same day contributed 40 each, putting a third desk at 28%. Three desks
+    would have been reported as broken for behaving perfectly.
+    """
+    print("\n9. a follower added after the master's order")
+    # The master trades at T0; the follower is created an hour later.
+    born = (T0 + timedelta(hours=1)).isoformat()
+    newbie = dict(FOLLOWER, id="f2", name="Dhwani2", created_at=born)
+    m = [order("971", "C-BTC-64600-261126", "sell", 3000, T0, filled=3000)]
+    original = oc.fetch_account_orders
+
+    async def fake(acc, start, end):
+        raw = m if acc["id"] == "m1" else []
+        return {"orders": [oc.normalise_order(o) for o in raw], "error": None}
+
+    oc.fetch_account_orders = fake
+    try:
+        out = asyncio.run(oc.compare([MASTER, newbie], START, END, db=FakeDB()))
+    finally:
+        oc.fetch_account_orders = original
+    l = out["rows"][0]["legs"][0]
+    check("not reported as missing", l["verdict"], "not_yet")
+    check("and not counted as an error", out["summary"]["errors"], 0)
+    check_true("the note says why",
+               "added after" in (l["note"] or ""), l["note"])
+
+
+def test_a_follower_that_existed_is_still_blamed():
+    """Narrow. The same shape with the follower created BEFORE the order is a
+    genuine missing copy and must still be reported -- that is the finding this
+    report exists for."""
+    print("\n10. and one that was already there")
+    born = (T0 - timedelta(hours=1)).isoformat()
+    old = dict(FOLLOWER, id="f3", name="Dhwani1", created_at=born)
+    m = [order("972", "C-BTC-64600-261126", "sell", 3000, T0, filled=3000)]
+    original = oc.fetch_account_orders
+
+    async def fake(acc, start, end):
+        raw = m if acc["id"] == "m1" else []
+        return {"orders": [oc.normalise_order(o) for o in raw], "error": None}
+
+    oc.fetch_account_orders = fake
+    try:
+        out = asyncio.run(oc.compare([MASTER, old], START, END, db=FakeDB()))
+    finally:
+        oc.fetch_account_orders = original
+    check("still missing", out["rows"][0]["legs"][0]["verdict"], "missing")
+    check("and still an error", out["summary"]["errors"], 1)
+
+
+def test_an_unknown_creation_date_is_graded_normally():
+    """An unparseable or absent date is not evidence of anything. Excusing a
+    leg on a guess would be the same mistake in the other direction."""
+    print("\n11. no creation date on the account")
+    nodate = dict(FOLLOWER, id="f4", name="NoDate")
+    nodate.pop("created_at", None)
+    m = [order("973", "C-BTC-64600-261126", "sell", 3000, T0, filled=3000)]
+    original = oc.fetch_account_orders
+
+    async def fake(acc, start, end):
+        raw = m if acc["id"] == "m1" else []
+        return {"orders": [oc.normalise_order(o) for o in raw], "error": None}
+
+    oc.fetch_account_orders = fake
+    try:
+        out = asyncio.run(oc.compare([MASTER, nodate], START, END, db=FakeDB()))
+    finally:
+        oc.fetch_account_orders = original
+    check("graded, not excused", out["rows"][0]["legs"][0]["verdict"], "missing")
+
+
 if __name__ == "__main__":
     for t in (test_separate_trades_are_not_one_ladder,
               test_a_real_ladder_is_still_grouped,
@@ -289,7 +367,10 @@ if __name__ == "__main__":
               test_a_derived_target_is_not_compared_to_the_lot,
               test_a_derived_target_still_catches_a_real_miss,
               test_a_skipped_copy_is_not_graded_on_a_nearby_order,
-              test_a_linked_order_on_a_skipped_leg_is_still_graded):
+              test_a_linked_order_on_a_skipped_leg_is_still_graded,
+              test_a_follower_added_today_is_not_blamed_for_yesterday,
+              test_a_follower_that_existed_is_still_blamed,
+              test_an_unknown_creation_date_is_graded_normally):
         t()
     print("\n" + ("ALL PASS" if not FAILURES
                   else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))

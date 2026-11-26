@@ -127,13 +127,41 @@ PASS_VERDICTS = {"matched", "ladder", "cancelled_ok"}
 
 # Genuinely ungradable — we cannot say whether these were right or wrong, so they
 # are left out of the rate in either direction rather than scored as a guess.
-NEUTRAL_VERDICTS = {"skipped", "unsized", "unreadable"}
+NEUTRAL_VERDICTS = {"skipped", "unsized", "unreadable", "not_yet"}
 
 # Worst-first, so a master order's row takes its worst leg.
 _SEVERITY = {
-    "matched": 0, "cancelled_ok": 1, "ladder": 2, "skipped": 3, "unsized": 4,
-    "extra": 5, "cancel_missed": 6, "undersized": 7, "oversized": 8, "missing": 9,
+    "matched": 0, "cancelled_ok": 1, "ladder": 2, "not_yet": 3, "skipped": 4,
+    "unsized": 5, "extra": 6, "cancel_missed": 7, "undersized": 8,
+    "oversized": 9, "missing": 10,
 }
+
+
+def _predates(m: dict, acc: dict) -> bool:
+    """Was this master order placed BEFORE the follower account existed?
+
+    A follower cannot have copied an order that was placed before it was
+    created, and reporting that as a missing leg is an accusation about a
+    period the account was not present for.
+
+    2026-11-26: Dhwani2 was added mid-afternoon and the day's report graded it
+    against every master order back to 18:55 the previous evening -- 36
+    "missing" legs, enough to take that desk from a clean report to 39%. Two
+    paper followers added at 15:36 the same day contributed 40 each. Tonight's
+    report would have raised the alarm on two desks for accounts behaving
+    perfectly.
+
+    Both timestamps or nothing: an unparseable date is not evidence of
+    anything, so the leg is graded normally rather than excused on a guess.
+    """
+    born = parse_ts(acc.get("created_at"))
+    placed = m.get("created_ts")
+    if born is None or placed is None:
+        return False
+    try:
+        return placed < born
+    except TypeError:
+        return False          # one side naive, one aware: do not guess
 
 
 def _is_open_state(state: str) -> bool:
@@ -366,8 +394,15 @@ def compare_orders(master_orders: list, f_state: list, legs: dict) -> list:
                 _tol = max(SIZE_TOLERANCE,
                            abs(target or 0.0) * DERIVED_TOLERANCE_PCT / 100.0)
 
-            verdict, note = _grade(m, f, target, leg, bool(st["error"]),
-                                   tol=_tol, approx=_approx, link=link or "")
+            if _predates(m, acc):
+                # The account did not exist yet. Not a missing copy, and not
+                # scored in either direction -- see _predates.
+                verdict, note = "not_yet", (
+                    "this follower was added after the master placed this order")
+                f, link = None, None
+            else:
+                verdict, note = _grade(m, f, target, leg, bool(st["error"]),
+                                       tol=_tol, approx=_approx, link=link or "")
             if verdict == "skipped":
                 # _grade disowned the inferred order (see the skipped-leg note
                 # there). Drop it from the row too, so the report does not print
@@ -467,6 +502,11 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
             legs = [l for r in grp for l in r["legs"] if l["account_id"] == acc_id]
             if not legs:
                 continue
+            # A group the follower was not alive for cannot be over or under
+            # punched. Without this the LADDER total re-accuses what the
+            # per-leg pass has just excused: "punched 0 against a target of N".
+            if all(l["verdict"] == "not_yet" for l in legs):
+                continue
             placed_total = sum(l["placed_lots"] or 0 for l in legs)
             # WHAT THE ENGINE ASKED FOR, rung by rung, when every rung has it on
             # record. Deriving the group's target from today's balance ratio
@@ -508,6 +548,9 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
                 note = (f"part of a {len(grp)}-rung ladder on {symbol} {side} — the "
                         f"total is right ({placed_total:g} of {target_total:g})")
             for l in legs:
+                # `not_yet` and the other neutral verdicts are statements about
+                # whether the leg can be judged AT ALL, which a group total has
+                # no standing to overrule.
                 if l["verdict"] in MISMATCH_VERDICTS or l["verdict"] == "matched":
                     l["verdict"] = verdict
                     l["note"] = note
