@@ -415,6 +415,50 @@ def test_a_symbol_with_no_expiry_is_graded_normally():
     check("graded, not excused", out["rows"][0]["legs"][0]["verdict"], "oversized")
 
 
+def test_a_ladder_does_not_charge_for_a_rung_it_was_never_asked_to_copy():
+    """A rung the engine deliberately SKIPPED owed this follower nothing, so
+    counting the master's lots for it inflates the group's target and reports a
+    shortfall that never existed.
+
+    2026-11-26, C-BTC-66800: the master sold 1034 and then 238 two seconds
+    later. Dhwani1 mirrored the first exactly -- 1014 of a recorded 1014 -- and
+    the engine skipped the second, recording "already at target 1014 (holds
+    1014)". The group charged it for all 1272 and reported "punched 1014
+    against a target of 1125", against a perfect leg and a rung it was never
+    asked to copy. The skipped rung also carries a recorded target of 0, which
+    forced the group onto a DERIVED total as well.
+    """
+    print("\n15. a ladder containing a deliberately skipped rung")
+    t0 = T0
+    m = [order("991", "C-BTC-66800-261126", "sell", 1034, t0, filled=1034),
+         order("992", "C-BTC-66800-261126", "sell", 238,
+               t0 + timedelta(seconds=2), filled=238)]
+    f = [order("601", "C-BTC-66800-261126", "sell", 1014,
+               t0 + timedelta(seconds=1), filled=1014)]
+    legs = [leg("991", "601", 1014),
+            leg("992", None, 0.0, status="skipped",
+                reason="already at target 1014 (holds 1014)")]
+    out = run(m, f, legs)
+    verds = sorted(l["verdict"] for r in out["rows"] for l in r["legs"])
+    check("the copied rung is not blamed", verds, ["ladder", "skipped"])
+    check("and nothing is counted as an error", out["summary"]["errors"], 0)
+
+
+def test_a_ladder_with_a_genuine_shortfall_is_still_caught():
+    """Narrow. The same two rungs, both genuinely owed, with the follower short
+    on the total -- still reported."""
+    print("\n16. and a ladder that really is short")
+    t0 = T0
+    m = [order("993", "C-BTC-66800-261126", "sell", 1034, t0, filled=1034),
+         order("994", "C-BTC-66800-261126", "sell", 1000,
+               t0 + timedelta(seconds=2), filled=1000)]
+    f = [order("602", "C-BTC-66800-261126", "sell", 1014,
+               t0 + timedelta(seconds=1), filled=1014)]
+    out = run(m, f)        # no legs recorded: both rungs owed, total derived
+    verds = [l["verdict"] for r in out["rows"] for l in r["legs"]]
+    check_true("still reported short", "undersized" in verds, verds)
+
+
 if __name__ == "__main__":
     for t in (test_separate_trades_are_not_one_ladder,
               test_a_real_ladder_is_still_grouped,
@@ -429,7 +473,9 @@ if __name__ == "__main__":
               test_an_unknown_creation_date_is_graded_normally,
               test_an_expiry_settlement_is_not_a_copy,
               test_a_real_trade_before_expiry_is_still_graded,
-              test_a_symbol_with_no_expiry_is_graded_normally):
+              test_a_symbol_with_no_expiry_is_graded_normally,
+              test_a_ladder_does_not_charge_for_a_rung_it_was_never_asked_to_copy,
+              test_a_ladder_with_a_genuine_shortfall_is_still_caught):
         t()
     print("\n" + ("ALL PASS" if not FAILURES
                   else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))

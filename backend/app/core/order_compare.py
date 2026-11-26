@@ -547,17 +547,32 @@ def apply_ladder_context(rows: list, f_state: list) -> None:
     for symbol, side, grp in groups:
         if len(grp) < 2:
             continue                      # not a ladder — leave it alone
-        master_total = sum(r["master_lots"] for r in grp)
         for st in f_state:
             acc_id = st["account"]["id"]
             legs = [l for r in grp for l in r["legs"] if l["account_id"] == acc_id]
             if not legs:
                 continue
-            # A group the follower was not alive for cannot be over or under
-            # punched. Without this the LADDER total re-accuses what the
-            # per-leg pass has just excused: "punched 0 against a target of N".
-            if all(l["verdict"] in ("not_yet", "settled") for l in legs):
-                continue
+            # WHAT THIS ACCOUNT ACTUALLY OWED, which is not the same as what the
+            # master traded. A rung the engine deliberately SKIPPED -- or that
+            # predates the account, or that the exchange settled -- owed this
+            # follower nothing, so counting the master's lots for it inflates
+            # the target and reports a shortfall that was never a shortfall.
+            #
+            # 2026-11-26, C-BTC-66800: the master sold 1034 and then 238 two
+            # seconds later. Dhwani1 mirrored the first exactly (1014 of 1014,
+            # recorded) and the engine skipped the second with "already at
+            # target 1014 (holds 1014)". The group still charged it for all
+            # 1272 and reported "punched 1014 against a target of 1125" --
+            # against a leg that was perfect and a rung it was never asked to
+            # copy. It also forced the DERIVED total, because the skipped rung
+            # carries a recorded target of 0.
+            _owed = {id(l): r["master_lots"] for r in grp for l in r["legs"]
+                     if l["account_id"] == acc_id}
+            _live_legs = [l for l in legs if l["verdict"] not in NEUTRAL_VERDICTS]
+            if not _live_legs:
+                continue              # nothing in this group was owed at all
+            master_total = sum(_owed.get(id(l)) or 0 for l in _live_legs)
+            legs = _live_legs
             placed_total = sum(l["placed_lots"] or 0 for l in legs)
             # WHAT THE ENGINE ASKED FOR, rung by rung, when every rung has it on
             # record. Deriving the group's target from today's balance ratio
