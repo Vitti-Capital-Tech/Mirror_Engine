@@ -128,6 +128,53 @@ def _routes() -> dict:
     return _routes_cache
 
 
+async def _refresh_accounts(force: bool = False) -> None:
+    """Fill the account caches — owners AND which accounts are paper.
+
+    THIS USED TO LIVE INSIDE _chat_for, AND THAT WAS TWO BUGS.
+
+    1. The paper gate in send_message runs BEFORE _chat_for, so on a cold cache
+       it checked an empty set, found nothing, and sent. One paper alert into
+       the desk's group per backend restart — and per newly created or renamed
+       paper account, because the name is the key.
+    2. _chat_for returns early at `if not routes`, BEFORE the fill. With
+       TELEGRAM_CHAT_ROUTES unset -- its default -- the paper sets would never
+       have been filled at all, and every paper alert would have gone to the
+       group forever. Routes happen to be configured today, so this one was
+       latent rather than live, but it made the paper gate silently depend on
+       an unrelated setting.
+
+    So the fill is its own function, called by both, and does not care whether
+    any routing is configured.
+
+    Never raises. On a failed read the caches keep their previous contents and
+    the caller behaves as it would have: an unknown account is treated as real
+    and its alert is sent. That asymmetry is deliberate — a paper alert in the
+    group is noise, a real alert suppressed by mistake is a position nobody
+    hears about.
+    """
+    global _owner_of, _owner_by_id, _owner_of_ts
+    if not force and (time.time() - _owner_of_ts) <= _OWNER_TTL:
+        return
+    try:
+        from app.database import db
+        rows = (db.table("accounts")
+                .select("id,name,owner_id,environment").execute().data) or []
+    except Exception as e:
+        logger.warning("Account cache refresh failed (%s) — "
+                       "routing and the paper gate use the previous read", e)
+        return
+    _owner_of = {r["name"]: str(r.get("owner_id") or "") for r in rows}
+    _owner_by_id = {str(r["id"]): str(r.get("owner_id") or "") for r in rows}
+    _paper_names.clear()
+    _paper_ids.clear()
+    for r in rows:
+        if is_paper(r):
+            _paper_names.add(r.get("name"))
+            _paper_ids.add(str(r.get("id")))
+    _owner_of_ts = time.time()
+
+
 async def _chat_for(account: str | None = None, account_id: str | None = None) -> str:
     """The chat this account's alerts belong in; the main chat by default.
 
@@ -138,22 +185,10 @@ async def _chat_for(account: str | None = None, account_id: str | None = None) -
     routes = _routes()
     if not routes or not (account or account_id):
         return _chat_id()
-    global _owner_of, _owner_by_id, _owner_of_ts
     try:
-        if time.time() - _owner_of_ts > _OWNER_TTL:
-            from app.database import db
-            rows = (db.table("accounts")
-                    .select("id,name,owner_id,environment").execute().data) or []
-            _owner_of = {r["name"]: str(r.get("owner_id") or "") for r in rows}
-            _owner_by_id = {str(r["id"]): str(r.get("owner_id") or "") for r in rows}
-            # Same trip, no extra round trip: which of these are paper.
-            _paper_names.clear()
-            _paper_ids.clear()
-            for r in rows:
-                if is_paper(r):
-                    _paper_names.add(r.get("name"))
-                    _paper_ids.add(str(r.get("id")))
-            _owner_of_ts = time.time()
+        # The cache is normally already warm: send_message refreshes it before
+        # the paper gate, which runs first. This is the belt to that braces.
+        await _refresh_accounts()
         owner = (_owner_by_id.get(str(account_id)) if account_id
                  else _owner_of.get(account, ""))
         return routes.get(owner or "", _chat_id())
@@ -189,6 +224,14 @@ async def send_message(text: str, account: str | None = None,
     # THE ONE GATE. Every notify_* in this module ends in send_message, so
     # suppressing paper here covers all of them -- including any added later,
     # which a per-function check would not.
+    #
+    # REFRESH FIRST. The gate reads a cache that used to be filled only by
+    # _chat_for, which runs AFTER this check — so on a cold cache the first
+    # alert after every restart, and the first for every newly created or
+    # renamed paper account, was checked against an empty set and sent to the
+    # group. Refreshing here costs one account read per 60s and closes it.
+    if account is not None or account_id is not None:
+        await _refresh_accounts()
     if _is_paper_account(account, account_id):
         logger.info("paper account %s - alert not sent to Telegram: %s",
                     account or account_id, text.replace(chr(10), " | ")[:160])
