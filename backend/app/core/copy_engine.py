@@ -1392,11 +1392,34 @@ class CopyEngine:
             hit = self._open_orders_cache.get(account_id)
             if hit and (time.time() - hit[1]) < self._OPEN_ORDERS_TTL:
                 return hit[0]
-        ids, ok, raw = set(), False, []
+        # ONE ENTRY PER ORDER ID. Delta returns the SAME order under both
+        # state filters, so this loop sees each resting order twice. `ids` is a
+        # set and never noticed; `raw` is a list and did.
+        #
+        # _follower_resting_cover sums `raw`, so every resting order counted
+        # double. 2026-11-27, JD algo3 on P-BTC-58000-271126: the master was
+        # working two exit rungs of 2750, the follower had ONE copy of 2749
+        # resting, and the cover came out as 5498 of a 5498 position. Fully
+        # covered, so the second rung was refused -- "wanted 2749 but 5498 of
+        # 5498 is already covered -- placing 0" -- every 30 seconds for hours.
+        # The follower would have exited half and then nothing, left holding
+        # 2749 against a flat master.
+        #
+        # The same overlap is already deduped in _master_exit_rungs (where the
+        # comment says it would be "double-weighted in the allocation"), in the
+        # protection sweep, in trade_listener and in the positions API. It was
+        # missed here, where it is summed rather than matched.
+        ids, ok, raw, seen = set(), False, [], set()
         for st in ("open", "pending"):
             try:
                 for o in await client.get_open_orders(state=st):
-                    ids.add(str(o.get("id")))
+                    oid = o.get("id")
+                    ids.add(str(oid))
+                    key = str(oid) if oid is not None else None
+                    if key is not None:
+                        if key in seen:
+                            continue
+                        seen.add(key)
                     raw.append(o)
                 ok = True
             except Exception:
@@ -1421,11 +1444,23 @@ class CopyEngine:
         Sizing from the position alone ("share minus what it holds") cannot see
         an order of ours that is placed but not yet filled — the copy of the
         master's previous order, still in its 5s window — and sizes that part
-        again."""
+        again.
+
+        ONE ENTRY PER ORDER ID, for the same reason as _live_order_ids: Delta
+        returns the same order under both state filters, and this SUMS what it
+        sees. Doubled here means the follower looks like it already has twice
+        the lots resting that it does, so the next entry is sized short or
+        skipped outright — the entry-side twin of the missing exit rung on
+        JD algo3 / P-BTC-58000-271126."""
         try:
-            total = 0
+            total, seen = 0, set()
             for st in ("open", "pending"):
                 for o in await client.get_open_orders(state=st) or []:
+                    oid = o.get("id")
+                    if oid is not None:
+                        if str(oid) in seen:
+                            continue
+                        seen.add(str(oid))
                     if (o.get("product_symbol") or o.get("symbol")) != symbol:
                         continue
                     if o.get("stop_order_type") or o.get("stop_price"):
