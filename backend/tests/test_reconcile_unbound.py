@@ -89,8 +89,25 @@ BASELINE = {
         # the function past the tracking limit for it; nothing about its binding
         # changed. Audited 2026-11-26.
         "_fid", "_fol", "_fol_by_id",
+        # 2026-11-27, same 64-local cause again. Adding ONE local to this
+        # function (`_seen_oids`, deduping the open+pending order listing)
+        # pushed these two past the tracking limit. Nothing about their
+        # binding changed, and both are straight-line:
+        #   hoff    assigned on the line directly above its only reads
+        #   missed  assigned unconditionally before the try: block that
+        #           reads it, with no branch in between
+        # Audited 2026-11-27.
+        "hoff", "missed",
     },
 }
+
+# NOTE for whoever adds the next local to _reconcile_positions: this list grows
+# by two or three names every time, not because anything got less safe but
+# because CPython stops flow-tracking after 64 locals and this function is well
+# past that. The real fix is to break it up, which is a refactor of the
+# reconciler's hot path and wants its own change rather than riding along with
+# a bug fix. Until then: verify the flagged name is genuinely dominated by an
+# assignment, say so here, and move on.
 
 SAFE = set(dir(__builtins__)) | {"self"}
 

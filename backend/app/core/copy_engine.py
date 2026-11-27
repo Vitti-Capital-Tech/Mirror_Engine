@@ -2568,12 +2568,24 @@ class CopyEngine:
                         fpos[s] = sz
                 resting = set()          # symbols with ANY resting order (incl. SL/TP)
                 resting_plain: dict = {}  # symbol -> [non-protective resting orders]
+                # One entry per order id: Delta lists the same order under both
+                # state filters, so resting_plain collected each of them twice
+                # and the stuck-close branch below would try to cancel the same
+                # order a second time. Harmless but noisy — the second cancel
+                # logs a warning about an order that is already gone. Same
+                # overlap as _live_order_ids; see the note there.
+                _seen_oids = set()
                 for st in ("open", "pending"):
                     try:
                         for o in await client.get_open_orders(state=st):
                             psym = o.get("product_symbol")
                             if not psym:
                                 continue
+                            _oid = o.get("id")
+                            if _oid is not None:
+                                if _oid in _seen_oids:
+                                    continue
+                                _seen_oids.add(_oid)
                             resting.add(psym)
                             if not o.get("stop_order_type"):
                                 resting_plain.setdefault(psym, []).append(o)
@@ -4468,6 +4480,19 @@ class CopyEngine:
                     # Re-stamp the master size this mirror now reflects, or the
                     # resize check above would keep firing on every reconcile.
                     await self.redis.hset(f"ordersize:{master_order_id}", follower["id"], str(master_qty))
+                    # And move the RECORDED TARGET with it. The ledger's
+                    # requested_quantity is what the daily report grades this
+                    # follower against, and it was written once at placement:
+                    # a master who edited his size left the report comparing
+                    # the follower's corrected order against a number from
+                    # before the edit, and calling a perfect copy wrong.
+                    # Dhwani, 2026-11-26, master order 1718356740 — see
+                    # order_history.record_leg_resize.
+                    if _resized and qty:
+                        asyncio.create_task(oh.record_leg_resize(
+                            self.db, master_order_id, follower["id"], int(qty),
+                            follower_order_id=new_id or existing_foid,
+                        ))
                     logger.info(
                         f"Updated order {master_order_id} -> {follower['name']} order "
                         f"{new_id or existing_foid} @ {limit_price} x "

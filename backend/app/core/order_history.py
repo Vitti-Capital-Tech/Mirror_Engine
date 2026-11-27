@@ -273,6 +273,62 @@ async def record_leg(
     await _run(_write)
 
 
+async def record_leg_resize(db, master_order_id, account_id, requested,
+                            follower_order_id=None) -> None:
+    """The master RESIZED his order and we resized the follower's copy to match.
+    Move the recorded target with it.
+
+    WHY THIS EXISTS. `requested_quantity` is what the engine asked for, written
+    once when the copy was placed, and the daily report grades the follower's
+    order against it. That is deliberate — deriving a target from today's
+    balance ratio measures the ratio's drift rather than the copy, which is
+    what produced thirteen false findings in one day on 2026-11-25.
+
+    But a number written once and never revisited goes stale the moment the
+    master EDITS his order. The engine edits the follower's copy to match and
+    says so in the log; the ledger went on holding the size from placement.
+
+    2026-11-26, Dhwani on master order 1718356740: he placed 1000, both
+    followers mirrored correctly at 981 and 867, then he edited his own order
+    down to 1. The engine tracked both followers to 1 — exactly right. The
+    report compared those 1-lot orders against the 981 and 867 still on record
+    and called them UNDER-SIZED. Two findings, on the only desk that had
+    nothing wrong with it, on copies that were perfect.
+
+    Deliberately NOT a tolerance. Any tolerance wide enough to absorb a
+    1000-to-1 edit is wide enough to hide the double-sizing bug the report
+    exists to catch. The engine knows the new number at the moment it sends the
+    edit; the fix is to write it down, not to stop looking.
+
+    Only ever UPDATES — never inserts. No row means the placement was not
+    recorded, and a row built from an edit alone would claim a copy whose
+    origin we cannot see. Status is not touched either: a leg that has since
+    filled stays filled.
+    """
+    if not master_order_id or not account_id or requested is None:
+        return
+    payload = {"requested_quantity": float(requested)}
+    if follower_order_id is not None:
+        # Delta's edits can cancel-and-replace, so the copy may now be a
+        # different order id. Keep the leg pointing at the live one or the
+        # report cannot link it and falls back to inferring.
+        payload["follower_order_id"] = str(follower_order_id)
+
+    def _write():
+        existing = (
+            db.table("trade_copies")
+            .select("id")
+            .eq("master_order_id", str(master_order_id))
+            .eq("account_id", account_id)
+            .execute()
+        )
+        if not existing.data:
+            return
+        db.table("trade_copies").update(payload).eq("id", existing.data[0]["id"]).execute()
+
+    await _run(_write)
+
+
 async def record_order_status(db, trade_uuid, status: str):
     """Roll the order-stage row up to a final status once its legs are known."""
     if not trade_uuid:
