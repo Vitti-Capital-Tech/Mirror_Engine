@@ -108,8 +108,14 @@ def render_telegram(cmp: dict, *, label: str = "") -> str:
         "",
         f"<b>Master</b> {escape(str(m.get('name') or '—'))}: "
         f"{m.get('order_count', 0)} orders, {_lots(m.get('lots'))} lots",
-        f"<b>Match rate</b> {s['match_rate_pct']}%  "
-        f"({s['matched']}/{s['legs']} order legs punched correctly)",
+        # "nothing to grade" rather than 100%. A day where every leg settled at
+        # expiry, or predates the follower, judged no copy at all — and a
+        # headline of 100% claims a verification that never happened.
+        (f"<b>Match rate</b> nothing to grade  "
+         f"({s['legs']} order leg{'' if s['legs'] == 1 else 's'}, none could be judged)"
+         if s["match_rate_pct"] is None else
+         f"<b>Match rate</b> {s['match_rate_pct']}%  "
+         f"({s['matched']}/{s['graded']} graded order legs punched correctly)"),
         f"<b>Unmatched</b> {s['errors']}"
         + ("  (" + ", ".join(
             f"{_VERDICT_LABEL.get(v, v).lower()} {s['by_verdict'][v]}"
@@ -297,14 +303,28 @@ def render_html(cmp: dict, *, label: str = "") -> str:
         "<div class='cards'>",
         _card("Master orders", str(s["master_orders"])),
         _card("Order legs", str(s["legs"])),
-        _card("Match rate", f"{s['match_rate_pct']}%",
-              "ok" if s["match_rate_pct"] >= 100 else "bad"),
+        # Neutral, not red: nothing graded is not a failure, it is an absence
+        # of evidence. Only a rate that exists can be good or bad.
+        _card("Match rate",
+              "&mdash;" if s["match_rate_pct"] is None
+              else f"{s['match_rate_pct']}%",
+              "" if s["match_rate_pct"] is None
+              else ("ok" if s["match_rate_pct"] >= 100 else "bad")),
         _card("Unmatched", str(s["errors"]), "bad" if s["errors"] else "ok"),
         _card("Median time diff", _ms(s["median_time_diff_ms"])),
         _card("p95 time diff", _ms(s["p95_time_diff_ms"])),
         _card("Max time diff", _ms(s["max_time_diff_ms"])),
         "</div>",
     ]
+
+    if s["match_rate_pct"] is None:
+        # The card shows a dash; say why, or a reader fills the blank in with
+        # "fine". Nothing graded is not a clean day, it is an unexamined one.
+        parts.append(
+            f"<div class='warn'>No order leg could be graded today: all "
+            f"{s['legs']} of them were settled at expiry, placed before their "
+            f"follower existed, or deliberately skipped. This is not a 100% "
+            f"match — there was nothing to judge.</div>")
 
     parts += ["<h2>Per follower</h2><div class='scroll'><table><thead><tr>",
               "<th>Follower</th><th class='n'>Ratio</th><th class='n'>Order legs</th>",

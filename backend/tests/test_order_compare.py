@@ -309,9 +309,18 @@ def test_ungradable_stays_out_of_the_rate():
     check("not counted as matched", s["matched"], 0)
     check("not counted as an error", s["errors"], 0)
     check("nothing gradable at all", s["graded"], 0)
-    # No gradable legs -> the rate is not a claim about anything, so it defaults
-    # to 100 rather than inventing a failure.
-    check("rate does not invent a failure", s["match_rate_pct"], 100.0)
+    # No gradable legs -> the rate is not a claim about anything. This used to
+    # read 100.0, on the reasoning that it must not invent a FAILURE — which is
+    # right, but 100 is not the neutral value. It is the best possible score,
+    # and the report printed it as one: Tushar's desk showed "100% match" on a
+    # day when every single leg had settled at expiry and nothing had been
+    # checked at all.
+    #
+    # None is the actual neutral. It still invents no failure — every renderer
+    # shows it as "nothing to grade" in neutral tone, not red, and `errors`
+    # stays 0 — it just stops claiming a verification that never happened.
+    check("rate makes no claim at all", s["match_rate_pct"], None)
+    check("and still invents no failure", s["errors"], 0)
 
 
 def test_time_diff_stats():

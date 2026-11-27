@@ -459,6 +459,38 @@ def test_a_ladder_with_a_genuine_shortfall_is_still_caught():
     check_true("still reported short", "undersized" in verds, verds)
 
 
+def test_a_day_with_nothing_graded_is_not_reported_as_100_percent():
+    """Tushar's desk, 2026-11-26: every leg settled at expiry, so NOTHING was
+    judged — and the headline read 100% match.
+
+    That is a claim the report cannot support. A rate over zero graded legs is
+    not perfect, it is absent, and the difference matters precisely on the days
+    nobody looked closely. The per-follower column has always rendered a dash
+    for this; only the headline rounded nothing up to perfect.
+    """
+    print("\n17. a day where nothing could be graded")
+    expiring = "C-BTC-63000-261126"
+    settle_at = datetime(2026, 11, 26, 12, 0, 2, tzinfo=timezone.utc)
+    m = [order("981", expiring, "buy", 3000, settle_at, filled=3000)]
+    f = [order("591", expiring, "buy", 2939, settle_at, filled=2939)]
+    out = run(m, f)
+    check("nothing was graded", out["summary"]["graded"], 0)
+    check("so there is no match rate", out["summary"]["match_rate_pct"], None)
+    check("and still no errors", out["summary"]["errors"], 0)
+
+
+def test_a_single_graded_leg_still_reports_a_rate():
+    """The boundary: one judged leg is enough to have a rate again."""
+    print("\n18. one graded leg is enough for a real rate")
+    sym = "C-BTC-63000-261126"
+    at = datetime(2026, 11, 26, 4, 0, tzinfo=timezone.utc)
+    m = [order("981", sym, "buy", 3000, at, filled=3000)]
+    f = [order("591", sym, "buy", 2942, at + timedelta(seconds=1), filled=2942)]
+    out = run(m, f, [leg("981", "591", 2942)])
+    check("graded", out["summary"]["graded"], 1)
+    check("and the rate is real", out["summary"]["match_rate_pct"], 100.0)
+
+
 if __name__ == "__main__":
     for t in (test_separate_trades_are_not_one_ladder,
               test_a_real_ladder_is_still_grouped,
@@ -475,7 +507,9 @@ if __name__ == "__main__":
               test_a_real_trade_before_expiry_is_still_graded,
               test_a_symbol_with_no_expiry_is_graded_normally,
               test_a_ladder_does_not_charge_for_a_rung_it_was_never_asked_to_copy,
-              test_a_ladder_with_a_genuine_shortfall_is_still_caught):
+              test_a_ladder_with_a_genuine_shortfall_is_still_caught,
+              test_a_day_with_nothing_graded_is_not_reported_as_100_percent,
+              test_a_single_graded_leg_still_reports_a_rate):
         t()
     print("\n" + ("ALL PASS" if not FAILURES
                   else "FAILURES: %d  %s" % (len(FAILURES), FAILURES)))

@@ -681,7 +681,13 @@ def summarise(rows: list, f_state: list, extra_orders: list) -> dict:
         "graded": sum(by_verdict.get(v, 0)
                       for v in PASS_VERDICTS | MISMATCH_VERDICTS),
         "errors": sum(by_verdict.get(v, 0) for v in MISMATCH_VERDICTS),
-        "match_rate_pct": 100.0 if r is None else r,
+        # None when NOTHING WAS GRADED, not 100. A desk whose every leg was
+        # settled at expiry, or placed before its follower existed, had no copy
+        # judged either way -- and reporting that as "100% match" is a claim the
+        # report cannot support. Tushar's desk read 100% on zero graded legs.
+        # The per-follower rate has always been honest about this (it renders
+        # "—"); only the headline was rounding nothing up to perfect.
+        "match_rate_pct": r,
         "avg_time_diff_ms": round(sum(diffs) / len(diffs), 1) if diffs else None,
         "median_time_diff_ms": pct(0.5),
         "p95_time_diff_ms": pct(0.95),

@@ -259,9 +259,19 @@ export function ComparisonView({ ownerId, ownerLabel }: { ownerId?: string; owne
 
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             <Stat label="Master orders" value={s.master_orders} sub={`${lots(data.master?.lots)} lots`} />
-            <Stat label="Match rate" value={`${s.match_rate_pct}%`}
-              tone={s.match_rate_pct >= 100 ? 'good' : s.match_rate_pct >= 95 ? 'warn' : 'bad'}
-              sub={`${s.matched} of ${s.legs} order legs correct`} />
+            {/* null means NOTHING WAS GRADED — every leg settled at expiry, or
+                predates its follower. That is not 100%, and it is not a
+                failure either: it is an absence of evidence, so the tone stays
+                neutral. The denominator is `graded`, not `legs`, because that
+                is what the percentage is actually over — "34 of 80" beside
+                "100%" was its own small lie. */}
+            <Stat label="Match rate"
+              value={s.match_rate_pct === null ? '—' : `${s.match_rate_pct}%`}
+              tone={s.match_rate_pct === null ? undefined
+                : s.match_rate_pct >= 100 ? 'good' : s.match_rate_pct >= 95 ? 'warn' : 'bad'}
+              sub={s.match_rate_pct === null
+                ? `${s.legs} order leg${s.legs === 1 ? '' : 's'}, none could be judged`
+                : `${s.matched} of ${s.graded} graded order legs correct`} />
             <Stat label="Unmatched" value={s.errors} tone={s.errors === 0 ? 'good' : 'bad'}
               sub={['oversized', 'undersized', 'missing', 'cancel_missed']
                 .filter(k => s.by_verdict?.[k])
